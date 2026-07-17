@@ -1,0 +1,102 @@
+# CI cho repo con `agentcore-studio-app` — PHƯƠNG ÁN B (reconstruct workspace) + CÁCH B (fine-grained PAT read-only).
+#
+# Repo con KHÔNG test đứng một mình được: đơn vị test thật là cả uv-workspace (import
+# agentcore-studio-contracts, cần uv.lock + docker/postgres-init của repo cha, và Postgres
+# pgvector còn sống). Workflow này dựng lại full workspace:
+#   1. checkout code PR của chính repo này (GITHUB_TOKEN mặc định — cùng repo)
+#   2. clone repo cha private + TẤT CẢ submodule bằng PAT read-only
+#   3. đắp code PR đè lên apps/studio trong workspace
+#   4. uv sync --frozen → bật pgvector → pytest apps/studio/tests
+#
+# KHÔNG LỘ TOKEN: PAT chỉ trong Secret (mask khỏi log), chỉ nhét vào git config header
+# (không echo), unset ngay sau clone; fine-grained Contents=Read-only + có hạn; fork-PR
+# không được cấp secret nên suy biến thành lint-nông. Secret cần set: STUDIO_CI_READ_PAT.
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+env:
+  UV_VERSION: "0.11.19"
+  PARENT_REPO: hieubui2409/agentcore-studio-kit
+  DOMAIN_PATH: apps/studio
+  DOMAIN_PACKAGE: agentcore-studio-app
+
+jobs:
+  test-reconstructed:
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: ubuntu-latest
+    env:
+      STUDIO_DATABASE_URL: postgresql://studio_app:changeme@localhost:5433/studio_test
+      STUDIO_DATABASE_URL_ADMIN: postgresql://studio_owner:changeme@localhost:5433/studio_test
+    steps:
+      - name: Checkout domain (PR head)
+        uses: actions/checkout@v4
+        with:
+          path: _pr
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Reconstruct workspace (private parent + submodules)
+        env:
+          GH_PAT: ${{ secrets.STUDIO_CI_READ_PAT }}
+        run: |
+          if [ -z "${GH_PAT}" ]; then
+            echo "::error::Thiếu secret STUDIO_CI_READ_PAT — xem hướng dẫn ở đầu file ci.yml."
+            exit 1
+          fi
+          BASE="https://x-access-token:${GH_PAT}@github.com/"
+          git config --global url."${BASE}".insteadOf "https://github.com/"
+          git config --global --add url."${BASE}".insteadOf "git@github.com:"
+          git config --global --add url."${BASE}".insteadOf "ssh://git@github.com/"
+          git clone --recursive "https://github.com/${PARENT_REPO}.git" workspace
+          git config --global --remove-section url."${BASE}" || true
+
+      - name: Overlay PR code into workspace
+        run: |
+          rm -rf "workspace/${DOMAIN_PATH}"
+          mkdir -p "workspace/${DOMAIN_PATH}"
+          cp -a _pr/. "workspace/${DOMAIN_PATH}/"
+          rm -rf "workspace/${DOMAIN_PATH}/.git"
+
+      - name: uv sync (frozen)
+        working-directory: workspace
+        run: uv sync --frozen
+
+      - name: Start pgvector test DB
+        working-directory: workspace
+        run: |
+          docker run -d --name studio-ci-pg \
+            -p 5433:5432 \
+            -e POSTGRES_DB=studio_test -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+            -v "$PWD/docker/postgres-init:/docker-entrypoint-initdb.d:ro" \
+            pgvector/pgvector:pg17
+          for i in $(seq 1 30); do
+            docker exec studio-ci-pg pg_isready -U postgres -d studio_test && break
+            sleep 2
+          done
+
+      - name: Run domain tests
+        working-directory: workspace
+        run: uv run --package "${DOMAIN_PACKAGE}" pytest "${DOMAIN_PATH}/tests" -q
+
+      - name: Stop pgvector test DB
+        if: always()
+        run: docker rm -f studio-ci-pg
+
+  lint-shallow:
+    if: github.event.pull_request.head.repo.fork == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+      - run: uvx ruff check src tests
+      - run: uvx ruff format --check src tests
