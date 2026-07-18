@@ -43,6 +43,12 @@ def _resolve_tenant_id(request: Request) -> str | None:
     real auth-derived resolution (session/JWT claim) is out of this phase's scope. Returns None
     when no tenant is resolvable; the caller MUST NOT set `app.tenant_id` in that case
     (fail-closed, Decision #3)."""
+    # !!! DEV-TIME STUB — NOT production-grade. This trusts a client-supplied `x-tenant-id`
+    # header verbatim: any caller can send `x-tenant-id: <victim>` and be labelled as that
+    # tenant. The RLS fence (schema.py) still isolates DATA per tenant regardless, so this is
+    # an AUTHENTICATION gap (who gets labelled what), NOT a data-isolation gap — but it MUST be
+    # replaced before production with an auth-derived source (verified JWT/session claim),
+    # never a raw request header. Keep the fail-closed contract: return None when unresolved.
     tenant_id = request.headers.get("x-tenant-id")
     return tenant_id or None
 
