@@ -1,7 +1,7 @@
 # CI repo con — STUB: chỉ gọi reusable workflow ở repo cha. Toàn bộ logic reconstruct nằm 1 chỗ:
 #   agentcore-studio-kit/.github/workflows/reusable-domain-ci.yml
 # Muốn đổi quy trình CI (bước test, DB, token...) thì sửa file đó, cả 6 repo con ăn theo.
-# secrets: inherit truyền STUDIO_CI_READ_PAT (đã set ở repo con) sang reusable workflow.
+# secrets: inherit truyền PAT (đã set ở repo con) sang reusable workflow.
 name: ci
 
 on:
