@@ -11,7 +11,7 @@ on:
 
 jobs:
   ci:
-    uses: hieubui2409/agentcore-studio-kit/.github/workflows/reusable-domain-ci.yml@main
+    uses: AI20K-VGR/agentcore-studio-kit/.github/workflows/reusable-domain-ci.yml@main
     with:
       domain_path: apps/studio
       domain_package: agentcore-studio-app
