@@ -57,9 +57,12 @@ async def _resolve_tenant_id(request: Request, conn: AsyncConnection[Any]) -> st
     raw = request.headers.get("x-tenant-id")
     if not raw:
         return None
+    # Prefer an exact id match over a name match, and `LIMIT 1`, so resolution is deterministic
+    # even in the pathological case where one tenant's `name` equals another tenant's `id` string.
     cur = await conn.execute(
-        "SELECT id FROM core.tenants WHERE name = %s OR id::text = %s",
-        (raw, raw),
+        "SELECT id FROM core.tenants WHERE id::text = %s OR name = %s "
+        "ORDER BY (id::text = %s) DESC LIMIT 1",
+        (raw, raw, raw),
     )
     row = await cur.fetchone()
     return str(row[0]) if row is not None else None

@@ -47,3 +47,18 @@ async def test_resolve_tenant_header_name_or_uuid_to_immutable_uuid(admin_pool: 
         # No header at all → None.
         absent: Any = await _resolve_tenant_id(_FakeRequest({}), conn)  # type: ignore[arg-type]
         assert absent is None
+
+
+async def test_resolve_tenant_runs_on_non_owner_app_pool(admin_pool: Pool, pool: Pool) -> None:
+    """Production resolves on the `studio_app` (non-owner) request connection, NOT the owner pool.
+    This proves `grant_app_privileges` actually gave studio_app SELECT on `core.tenants` — the
+    resolver would silently fail-closed (None) for every request if that grant were missing."""
+    async with admin_pool.connection() as admin_conn:
+        cur = await admin_conn.execute("INSERT INTO core.tenants (name) VALUES (%s) RETURNING id", ("borea",))
+        row = await cur.fetchone()
+        assert row is not None
+        borea_id = row[0]
+
+    async with pool.connection() as app_conn:
+        resolved = await _resolve_tenant_id(_FakeRequest({"x-tenant-id": "borea"}), app_conn)  # type: ignore[arg-type]
+        assert resolved == str(borea_id)
