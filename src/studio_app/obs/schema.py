@@ -7,7 +7,7 @@ the TABLES, and joins `core.schema._QUADRANT_SCHEMA_MODULES` here at P4 (direct-
 same antichain pattern as kb/engine/workbench/evalhub).
 
 `obs.trace_events` columns match `TraceEvent` (studio_contracts.trace, R-SPEC A1#2): event_id,
-run_id, agent_id, tenant (NOT NULL, INV-1), node_id, node_type, ts, inputs_hash, outputs jsonb,
+run_id, agent_id, tenant_id (UUID NOT NULL, INV-1 / D-13), node_id, node_type, ts, inputs_hash, outputs jsonb,
 tokens jsonb, cost numeric, citations jsonb. `obs.costs`/`obs.golden_sets` are shells only — DE
 fills their real columns + cost-aggregation logic later; NONE of that logic belongs in
 `obs/trace_writer.py::write()` (F15 — that stays a single plain INSERT).
@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS obs.trace_events (
     event_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL,
     agent_id TEXT NOT NULL,
-    tenant TEXT NOT NULL,
+    tenant_id UUID NOT NULL,
     node_id TEXT NOT NULL,
     node_type TEXT NOT NULL,
     ts TEXT NOT NULL,

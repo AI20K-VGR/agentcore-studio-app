@@ -4,10 +4,14 @@ apps/studio/tests/test_schema.py module docstring for the fixture-skip behavior.
 
 from __future__ import annotations
 
+from uuid import UUID
+
 from studio_app.core._db import Pool
 from studio_app.obs.trace_writer import PgTraceWriter
 from studio_contracts.nodes import NodeType
 from studio_contracts.trace import Tokens, TraceEvent
+
+TENANT_ID = UUID("a0000000-0000-0000-0000-000000000001")
 
 
 def _sample_event(event_id: str) -> TraceEvent:
@@ -15,7 +19,7 @@ def _sample_event(event_id: str) -> TraceEvent:
         event_id=event_id,
         run_id="run-1",
         agent_id="agent-1",
-        tenant="tenant-1",
+        tenant_id=TENANT_ID,
         node_id="node-1",
         node_type=NodeType.LLM_STEP,
         ts="2026-07-17T00:00:00Z",
@@ -39,7 +43,7 @@ async def test_pg_trace_writer_single_insert_roundtrip(admin_pool: Pool, pool: P
 
     async with pool.connection() as conn:
         cur = await conn.execute(
-            "SELECT event_id, run_id, agent_id, tenant, node_id, node_type, ts, inputs_hash, "
+            "SELECT event_id, run_id, agent_id, tenant_id, node_id, node_type, ts, inputs_hash, "
             "outputs, tokens, cost, citations FROM obs.trace_events WHERE event_id = %s",
             (event.event_id,),
         )
@@ -48,7 +52,7 @@ async def test_pg_trace_writer_single_insert_roundtrip(admin_pool: Pool, pool: P
     assert row[0] == event.event_id
     assert row[1] == event.run_id
     assert row[2] == event.agent_id
-    assert row[3] == event.tenant
+    assert row[3] == event.tenant_id
     assert row[4] == event.node_id
     assert row[5] == event.node_type.value
     assert row[6] == event.ts

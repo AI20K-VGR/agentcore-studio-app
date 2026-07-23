@@ -38,19 +38,31 @@ def get_request_connection() -> AsyncConnection[Any]:
     return conn
 
 
-def _resolve_tenant_id(request: Request) -> str | None:
+async def _resolve_tenant_id(request: Request, conn: AsyncConnection[Any]) -> str | None:
     """Server-side tenant resolution seam. P3 stub: header-based, for wiring/tests only — the
     real auth-derived resolution (session/JWT claim) is out of this phase's scope. Returns None
     when no tenant is resolvable; the caller MUST NOT set `app.tenant_id` in that case
-    (fail-closed, Decision #3)."""
+    (fail-closed, Decision #3).
+
+    D-13 / F3: the tenant identity is an immutable `core.tenants.id` UUID, so the header (which may
+    carry a human NAME like "ankor" or a raw UUID) is resolved to that UUID via `core.tenants`. This
+    is what keeps `SET LOCAL app.tenant_id` a valid UUID — setting a slug would make the RLS policy's
+    `::uuid` cast crash the request. An unknown header resolves to None (fail-closed), never a slug."""
     # !!! DEV-TIME STUB — NOT production-grade. This trusts a client-supplied `x-tenant-id`
     # header verbatim: any caller can send `x-tenant-id: <victim>` and be labelled as that
     # tenant. The RLS fence (schema.py) still isolates DATA per tenant regardless, so this is
     # an AUTHENTICATION gap (who gets labelled what), NOT a data-isolation gap — but it MUST be
     # replaced before production with an auth-derived source (verified JWT/session claim),
     # never a raw request header. Keep the fail-closed contract: return None when unresolved.
-    tenant_id = request.headers.get("x-tenant-id")
-    return tenant_id or None
+    raw = request.headers.get("x-tenant-id")
+    if not raw:
+        return None
+    cur = await conn.execute(
+        "SELECT id FROM core.tenants WHERE name = %s OR id::text = %s",
+        (raw, raw),
+    )
+    row = await cur.fetchone()
+    return str(row[0]) if row is not None else None
 
 
 async def tenant_context_middleware(
@@ -58,7 +70,7 @@ async def tenant_context_middleware(
 ) -> Response:
     pool = await get_pool()
     async with pool.connection() as conn:
-        tenant_id = _resolve_tenant_id(request)
+        tenant_id = await _resolve_tenant_id(request, conn)
         if tenant_id is not None:
             # SET LOCAL does not accept bind parameters over the wire protocol (it is a utility
             # statement, not a DML query) — sql.Literal safely inline-quotes the value instead.
