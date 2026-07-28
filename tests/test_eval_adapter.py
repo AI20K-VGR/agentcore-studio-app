@@ -32,9 +32,9 @@ from studio_contracts import LLM, Recipe, TraceEvent
 from studio_contracts.kb import KbSearchResultItem
 from studio_engine import interpreter as engine_interpreter
 from studio_engine.interpreter import RunResult
-from studio_workbench.builder_d4 import create_recipe_d4
+from studio_workbench import create_recipe_d4
 
-# CỐ Ý khác builder_d4.ANKOR_ID default (a0…01) — nếu adapter "quên" thread tenant_id xuống
+# CỐ Ý khác `ANKOR_ID` default của workbench (a0…01) — nếu adapter "quên" thread tenant_id xuống
 # create_recipe_d4 và rơi về default thì A2/B8a phải ĐỎ (mutation-check T-1).
 TENANT_ID = UUID("b0000000-0000-0000-0000-000000000002")
 # Chuỗi KHÔNG mang `[chunk_id]` nào đã truy xuất → engine (mọi phiên bản tới nay) kết luận

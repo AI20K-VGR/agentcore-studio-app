@@ -23,7 +23,7 @@ from uuid import UUID
 from studio_contracts import LLM, EmbeddingService, KbSearch, TraceWriter
 from studio_engine import interpreter
 from studio_evalhub.agent_runner import AgentAnswer, CaseRun
-from studio_workbench.builder_d4 import create_recipe_d4
+from studio_workbench import create_recipe_d4
 
 
 def _llm_answer(final_state: dict[str, object]) -> dict[str, object]:
