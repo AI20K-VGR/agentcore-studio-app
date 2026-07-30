@@ -46,7 +46,7 @@ from studio_app.obs.trace_writer import PgTraceWriter
 from studio_app.providers.fakes import ExtractiveFakeLLM
 from studio_evalhub.agent_runner import CaseRun
 from studio_evalhub.cli import _demo_golden_set
-from studio_evalhub.harness import _retrieved_citations, score_case
+from studio_evalhub.harness import citations_from_trace, score_case
 from studio_kb.doc_factory import TENANT_IDS
 from studio_kb.static_search import StaticKbSearch
 from studio_kb.trace_reader import PgTraceReader
@@ -92,7 +92,7 @@ async def test_score_from_postgres_matches_score_from_memory(admin_pool: Pool, p
     So `SmokeResult` bằng `==` (pydantic `frozen=True`, bao mọi field) chứ không so từng field: field
     thêm vào model sau này tự động được so.
 
-    Cũng assert `_retrieved_citations` của hai nguồn bằng nhau — tách được "payload citation sống sót
+    Cũng assert `citations_from_trace` của hai nguồn bằng nhau — tách được "payload citation sống sót
     round-trip" khỏi "điểm tình cờ giống nhau". Hai case khác nhau vẫn có thể ra cùng điểm; hai danh
     sách citation bằng nhau thì cụ thể hơn nhiều.
     """
@@ -100,21 +100,21 @@ async def test_score_from_postgres_matches_score_from_memory(admin_pool: Pool, p
     case = next(c for c in _demo_golden_set().cases if c.case_id == "SC-01")
     case_run, tenant_id, run_id = await _run_case_through_postgres(pool)
 
-    from_memory = score_case(case, case_run.answer, _retrieved_citations(case_run.events))
+    from_memory = score_case(case, case_run.answer, citations_from_trace(case_run.events))
 
     db_events = await PgTraceReader(pool).read_run(run_id, tenant_id)
     assert db_events, "reader không thấy event nào — sink không ghi, hoặc run_id/tenant lệch"
     assert len(db_events) == len(case_run.events)
 
-    assert _retrieved_citations(db_events) == _retrieved_citations(case_run.events)
-    assert score_case(case, case_run.answer, _retrieved_citations(db_events)) == from_memory
+    assert citations_from_trace(db_events) == citations_from_trace(case_run.events)
+    assert score_case(case, case_run.answer, citations_from_trace(db_events)) == from_memory
 
 
 async def test_the_score_really_comes_from_postgres_not_from_memory(admin_pool: Pool, pool: Pool) -> None:
     """KHÓA P2 (negative control): sửa `citations` TRONG BẢNG → điểm chấm từ DB phải ĐỔI.
 
     Không có test này thì P1 rỗng nghĩa: nó vẫn xanh nếu reader lặng lẽ trả về đúng thứ đang nằm
-    trong RAM, hoặc nếu `_retrieved_citations(db_events)` tình cờ ra cùng kết quả vì cả hai đều rỗng.
+    trong RAM, hoặc nếu `citations_from_trace(db_events)` tình cờ ra cùng kết quả vì cả hai đều rỗng.
     Ở đây bơm một citation SAI vào `obs.trace_events`, đọc lại, rồi đòi điểm **khác** điểm bộ nhớ —
     tức chứng minh đường DB thật sự nằm trên đường chấm, không phải đồ trang trí.
 
@@ -125,7 +125,7 @@ async def test_the_score_really_comes_from_postgres_not_from_memory(admin_pool: 
     case = next(c for c in _demo_golden_set().cases if c.case_id == "SC-01")
     case_run, tenant_id, run_id = await _run_case_through_postgres(pool)
 
-    from_memory = score_case(case, case_run.answer, _retrieved_citations(case_run.events))
+    from_memory = score_case(case, case_run.answer, citations_from_trace(case_run.events))
     assert from_memory.citation_accuracy == 1.0, "SC-01 phải grounded đúng chunk kỳ vọng trước khi phá"
 
     async with pool.connection() as conn:
@@ -135,8 +135,8 @@ async def test_the_score_really_comes_from_postgres_not_from_memory(admin_pool: 
         )
 
     db_events = await PgTraceReader(pool).read_run(run_id, tenant_id)
-    tampered = score_case(case, case_run.answer, _retrieved_citations(db_events))
+    tampered = score_case(case, case_run.answer, citations_from_trace(db_events))
 
-    assert _retrieved_citations(db_events) == ["chunk-khong-ton-tai#c999"]
+    assert citations_from_trace(db_events) == ["chunk-khong-ton-tai#c999"]
     assert tampered != from_memory, "sửa bảng mà điểm không đổi ⇒ điểm KHÔNG đến từ Postgres"
     assert tampered.citation_accuracy == 0.0
