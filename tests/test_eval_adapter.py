@@ -33,10 +33,14 @@ from studio_contracts.kb import KbSearchResultItem
 from studio_engine import interpreter as engine_interpreter
 from studio_engine.interpreter import RunResult
 from studio_workbench import create_recipe_d4
+from studio_workbench.tenant_wall import resolve_session
 
 # CỐ Ý khác `ANKOR_ID` default của workbench (a0…01) — nếu adapter "quên" thread tenant_id xuống
 # create_recipe_d4 và rơi về default thì A2/B8a phải ĐỎ (mutation-check T-1).
 TENANT_ID = UUID("b0000000-0000-0000-0000-000000000002")
+# Tenant mà "client khai" trong recipe ở bài INV-1 dưới. Cố ý khác `TENANT_ID` (tenant server resolve)
+# để hai đường đi được phân biệt: nếu run rơi về giá trị này thì client đã tự chọn được phạm vi đọc.
+CLIENT_CLAIMED_TENANT_ID = UUID("c0000000-0000-0000-0000-000000000003")
 # Chuỗi KHÔNG mang `[chunk_id]` nào đã truy xuất → engine (mọi phiên bản tới nay) kết luận
 # `refused=True`: trước #10 vì khớp `REFUSAL_SENTINEL`, sau #10 vì `not citations` (ngoặc `[REFUSED]`
 # có parse ra nhưng bị lọc do không nằm trong `retrieved_chunks`). Đây CHỈ là cách *kích* nhánh từ
@@ -120,6 +124,56 @@ async def test_run_case_threads_tenant_uuid_and_roles() -> None:
     assert len({e.run_id for e in case_run.events}) == 1
 
 
+async def test_inv1_recipe_khai_tenant_khac_thi_session_thang() -> None:
+    """KHÓA INV-1 Tenant-Wall tại COMPOSITION ROOT: recipe khai một tenant, session resolve tenant
+    khác ⇒ run chạy dưới tenant của **session**, không của recipe.
+
+    Vì sao bài này phải ở `studio_app` chứ không ở engine hay workbench: mỗi bên chỉ kiểm được nửa của
+    mình. `studio_engine/session.py` khai Protocol `SessionContext` và test rằng interpreter đọc
+    `session_context.tenant_id`; `studio_workbench/tenant_wall.py` test rằng `resolve_session` fail-closed.
+    Chỗ *hai nửa ráp vào nhau* — `ResolvedContext` của SWE thoả Protocol của AIE-1, và interpreter thật
+    thắng recipe thật — không thuộc quadrant nào (`.importlinter` cấm hai bên import nhau), nên chỉ
+    composition root kiểm được. Trước bài này chỗ đó trống.
+
+    Chạy `interpreter.run` TRỰC TIẾP, không qua `run_case`: adapter dựng recipe *từ* cùng `tenant_id` mà
+    nó đưa vào `resolve_session`, nên qua đường đó hai giá trị luôn khớp và không tạo ra được thế lệch
+    cần kiểm. Thế lệch là điều kiện thí nghiệm, không phải cách adapter được gọi thật.
+
+    Ba assert, và assert đầu là cầu chì:
+
+    1. recipe **thật sự** khai `CLIENT_CLAIMED_TENANT_ID`. Không có vế này, bài sẽ xanh rỗng-nghĩa nếu
+       `create_recipe_d4` lặng lẽ bỏ qua tham số `tenant_id` — lúc đó "session thắng" chỉ vì recipe chưa
+       bao giờ tuyên bố gì để mà thua.
+    2. `kb.search` nhận tenant của session. Đây là hàng rào có hệ quả: nó quyết định đọc được chunk của ai.
+    3. mọi `TraceEvent` mang tenant của session. Nếu trace ghi nhãn client-khai thì bộ chấm của evalhub
+       (`tenant_scope_ok`, `citations_from_trace`) sẽ chấm trên một danh tính sai."""
+    kb = _RecordingKbSearch([_item("ankor-leave-001#c1")])
+    writer = _CollectingTraceWriter()
+    recipe = create_recipe_d4(
+        agent_id="agent-callisto-d4",
+        tenant_id=CLIENT_CLAIMED_TENANT_ID,  # ← client khai
+        scope="t/public",
+        query="nghỉ phép?",
+    )
+
+    assert recipe.tenant_id == CLIENT_CLAIMED_TENANT_ID, "recipe phải thật sự khai tenant kia"
+
+    raw = await engine_interpreter.run(
+        recipe,
+        kb_search=kb,
+        llm=_ScriptedLLM("Cần báo trước 3 ngày [ankor-leave-001#c1]."),
+        embedding=FakeEmbedding(),
+        trace_writer=writer,
+        session_context=resolve_session(  # ← server resolve, khác recipe
+            {"tenant_id": TENANT_ID, "user": "eval-harness", "roles": ["public"]}
+        ),
+    )
+
+    assert kb.calls[0][1] == TENANT_ID, "kb.search phải nhận tenant của SESSION"
+    assert kb.calls[0][1] != CLIENT_CLAIMED_TENANT_ID, "tenant client khai không được tới kb.search"
+    assert {e.tenant_id for e in raw.events} == {TENANT_ID}, "mọi TraceEvent mang tenant của SESSION"
+
+
 async def test_run_case_events_passthrough_from_trace() -> None:
     """KHÓA A3: CaseRun.events == events đã emit qua trace_writer, nguyên vẹn cùng thứ tự —
     đây là nguồn chấm citation của evalhub, adapter không được tự chế/lọc."""
@@ -154,13 +208,19 @@ async def test_run_case_surfaces_engine_refusal_faithfully(llm_text: str) -> Non
     engine#10 (#27) bỏ sentinel."""
     query, roles = "nghỉ phép?", ["public"]
 
-    # (1) Sự thật gốc — engine tự quyết
+    # (1) Sự thật gốc — engine tự quyết.
+    # `session_context` dựng bằng CHÍNH `resolve_session` mà adapter dùng, cùng dict đầu vào: so hai
+    # bên chỉ có nghĩa khi danh tính hai lượt giống nhau. Tự dựng `ResolvedContext` tay ở đây sẽ mở ra
+    # khả năng lượt (1) và lượt (2) chạy dưới hai danh tính khác nhau mà test vẫn xanh.
     raw = await engine_interpreter.run(
         create_recipe_d4(agent_id="agent-callisto-d4", tenant_id=TENANT_ID, scope="t/public", query=query),
         kb_search=_RecordingKbSearch([_item("ankor-leave-001#c1")]),
         llm=_ScriptedLLM(llm_text),
         embedding=FakeEmbedding(),
         trace_writer=_CollectingTraceWriter(),
+        session_context=resolve_session(
+            {"tenant_id": TENANT_ID, "user": "eval-harness", "roles": roles}
+        ),
     )
     engine_out = _llm_answer(raw.final_state)
 

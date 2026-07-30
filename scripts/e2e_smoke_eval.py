@@ -101,7 +101,7 @@ from studio_app.providers.fakes import ExtractiveFakeLLM
 from studio_contracts import KbSearchResultItem, TraceEvent
 from studio_evalhub import GoldenCase
 from studio_evalhub.cli import _demo_golden_set
-from studio_evalhub.harness import _retrieved_citations, score_case
+from studio_evalhub.harness import citations_from_trace, score_case
 from studio_kb.doc_factory import TENANT_IDS
 from studio_kb.static_search import StaticKbSearch
 
@@ -253,13 +253,13 @@ async def run_one(
         section_roles=case.section_roles,
     )
 
-    grounded = _retrieved_citations(case_run.events)
+    grounded = citations_from_trace(case_run.events)
     result = score_case(case, case_run.answer, grounded)
     events = case_run.events
 
     # CHẨN ĐOÁN: chunk ĐÃ TRUY XUẤT — nguồn khác `grounded`. Lý do khác nhau: node `kb-retrieve`
     # trả `list` nên interpreter đặt `TraceEvent.citations = None`; chunk thật nằm ở
-    # `outputs["chunks"]`. Còn `grounded` (`_retrieved_citations`) gom `.citations` mọi event, nên
+    # `outputs["chunks"]`. Còn `grounded` (`citations_from_trace`) gom `.citations` mọi event, nên
     # thực chất là citations của `llm-step` = LLM-trích ∩ retrieved.
     # `outputs` khai là `dict[str, object]` nên phải narrow từng tầng, không `.get(..., [])` suông.
     retrieved_ids: set[str] = set()
