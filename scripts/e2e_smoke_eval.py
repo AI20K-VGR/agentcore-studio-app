@@ -11,7 +11,7 @@ tên phải nói đúng việc. Bản Day-5 nguyên trạng nằm ở commit tr�
 
     workbench.create_recipe_d4        form → Recipe (tenant_id UUID)
       → engine.interpreter.run        walk theo dag.edges, inject recipe.tenant_id, emit TraceEvent
-        → kb.StaticKbSearch           fence RLS tenant_id UUID + section_role, chunk Callisto thật
+        → kb.PgKbSearch                fence RLS tenant_id UUID + section_role, Postgres/pgvector thật
         → engine.build_prompt         render `[chunk_id]\\ntext` vào prompt  ← engine#10
       → RunResult{final_state, events}
       → studio_app.EngineAgentRunner  adapter RunResult → CaseRun            (#29, co-author AIE-1)
@@ -19,8 +19,11 @@ tên phải nói đúng việc. Bản Day-5 nguyên trạng nằm ở commit tr�
 
 ## THẬT vs FIXTURE — nói thẳng, đây là chỗ dễ tự lừa nhất
 
-**THẬT**: recipe · interpreter · `kb.search` (fence tenant/role) · trace 4 event · `build_prompt` ·
-luật grounding citation · adapter · scorecard.
+**THẬT**: recipe · interpreter · `kb.search` (fence tenant/role, `PgKbSearch` trên Postgres/pgvector
+thật — D13, không còn corpus in-memory) · trace 4 event · `build_prompt` · luật grounding citation ·
+adapter · scorecard. Cần `docker compose -f docker-compose.test.yml up -d` + 2 biến DSN
+(`STUDIO_DATABASE_URL`, `STUDIO_DATABASE_URL_ADMIN`) trước khi chạy — script fail loud, không tự
+lùi về in-memory, nếu thiếu.
 
 **FIXTURE**: `ExtractiveFakeLLM` (`studio_app.providers.fakes`) — double CHỈ đọc prompt, không bao
 giờ thấy `expected`/`expected_citation`. Nó chép đoạn trích ĐẦU TIÊN và trích đúng `chunk_id` của
@@ -96,32 +99,46 @@ import sys
 from dataclasses import dataclass
 from uuid import UUID
 
+from studio_app.core._db import Pool, close_pools, get_admin_pool, get_pool
+from studio_app.core.schema import ensure_all_schemas, grant_app_privileges
 from studio_app.eval_adapter import EngineAgentRunner
 from studio_app.providers.fakes import ExtractiveFakeLLM
-from studio_contracts import KbSearchResultItem, TraceEvent
+from studio_contracts import EmbeddingService, KbSearchResultItem, TraceEvent
 from studio_evalhub import GoldenCase
 from studio_evalhub.cli import _demo_golden_set
 from studio_evalhub.harness import citations_from_trace, score_case
-from studio_kb.doc_factory import TENANT_IDS
-from studio_kb.static_search import StaticKbSearch
+from studio_kb.doc_factory import TENANT_IDS, load_callisto
+from studio_kb.embeddings import derive_vector
+from studio_kb.postgres import KbIngest, PgKbSearch
 
 
-class _CountingKb(StaticKbSearch):
-    """`StaticKbSearch` THẬT + đếm số chunk trả về (evidence cột `#chunk`)."""
+class _CallistoEmbedding:
+    """`EmbeddingService` cho seed + query của `PgKbSearch` — cùng không gian với `derive_vector`
+    (SSOT `studio_kb.embeddings`). Bản trùng thứ ba của cùng adapter (đã có ở
+    `test_kb_search_live_readiness.py` và `test_spine_scored_from_postgres.py`) — trùng có chủ đích
+    (DRY note, plan D13): cả ba đều gọi cùng SSOT, chỗ trùng chỉ là lớp vỏ 2 dòng, không phải công
+    thức. Khác `_StubEmbedding` dưới đây, vốn phục vụ khe `EngineAgentRunner(embedding=...)` (trơ)."""
 
-    def __init__(self) -> None:
-        super().__init__()
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        return [derive_vector(text) for text in texts]
+
+
+class _CountingKb:
+    """`PgKbSearch` THẬT (Postgres/pgvector) + đếm số chunk trả về (evidence cột `#chunk`)."""
+
+    def __init__(self, pool: Pool, embedding: EmbeddingService) -> None:
+        self._inner = PgKbSearch(pool, embedding)
         self.last_count = 0
 
     async def search(
         self, query: str, tenant_id: UUID, section_roles: list[str], top_k: int
     ) -> list[KbSearchResultItem]:
-        result = await super().search(query, tenant_id, section_roles, top_k)
+        result = await self._inner.search(query, tenant_id, section_roles, top_k)
         self.last_count = len(result)
         return result
 
 
-class _LeakyKb(StaticKbSearch):
+class _LeakyKb:
     """KB **CỐ Ý HỎNG FENCE** — chỉ dùng cho RED-CHECK XF-02, không bao giờ cho case thật.
 
     Nó bỏ qua `tenant_id` được truyền vào và tra bằng tenant KHÁC, đúng như một lỗi RLS thật sẽ gây
@@ -130,8 +147,8 @@ class _LeakyKb(StaticKbSearch):
     bằng dữ liệu thật — phải dựng bằng KB hỏng.
     """
 
-    def __init__(self, leak_as: UUID) -> None:
-        super().__init__()
+    def __init__(self, pool: Pool, embedding: EmbeddingService, leak_as: UUID) -> None:
+        self._inner = PgKbSearch(pool, embedding)
         self._leak_as = leak_as
         self.last_count = 0
 
@@ -139,7 +156,7 @@ class _LeakyKb(StaticKbSearch):
         self, query: str, tenant_id: UUID, section_roles: list[str], top_k: int
     ) -> list[KbSearchResultItem]:
         del tenant_id  # ← chính là cái lỗi đang mô phỏng
-        result = await super().search(query, self._leak_as, section_roles, top_k)
+        result = await self._inner.search(query, self._leak_as, section_roles, top_k)
         self.last_count = len(result)
         return result
 
@@ -355,17 +372,24 @@ def _header() -> str:
     )
 
 
-async def main() -> int:
+async def _run(pool: Pool) -> int:
+    embedding = _CallistoEmbedding()
     golden = _demo_golden_set()
     bar = "=" * 100
 
     print(bar)
     print(f"E2E SMOKE-EVAL — {golden.golden_set_ref} ({len(golden.cases)} case) qua luồng thật")
-    print("THẬT: recipe · interpreter · kb.search (fence) · trace · build_prompt · grounding · adapter · scorer")
+    print(
+        "THẬT: recipe · interpreter · kb.search (PgKbSearch, Postgres/pgvector thật, fence) · "
+        "trace · build_prompt · grounding · adapter · scorer"
+    )
     print("FIXTURE: ExtractiveFakeLLM — chỉ đọc prompt, không thấy golden (ý @DongAnh2704)")
     print(bar)
 
-    rows = [await run_one(case, _CountingKb()) for case in golden.cases]
+    written = await KbIngest(pool, embedding).ingest(list(load_callisto()))
+    print(f"KB seed: {written} chunk nạp vào kb.chunks (idempotent — chạy lại không nhân đôi)\n")
+
+    rows = [await run_one(case, _CountingKb(pool, embedding)) for case in golden.cases]
 
     print("\n" + bar)
     print("RED-CHECK — 2 negative-control của BỘ CHẤM, PHẢI ĐỎ (không tính vào headline)")
@@ -380,10 +404,12 @@ async def main() -> int:
         print(f"BỎ RED-CHECK XF-02: case gốc {xf2.case_id} không có `expected_tenant`", file=sys.stderr)
         return 1
     xf_rows = [
-        await run_one(xf1, _CountingKb(), designed_red="nhãn golden cố ý sai (expected + #c999 bịa)"),
+        await run_one(
+            xf1, _CountingKb(pool, embedding), designed_red="nhãn golden cố ý sai (expected + #c999 bịa)"
+        ),
         await run_one(
             xf2,
-            _LeakyKb(leak_as=TENANT_IDS[leak_tenant]),
+            _LeakyKb(pool, embedding, leak_as=TENANT_IDS[leak_tenant]),
             designed_red="KB cố ý hỏng fence → conjunct no_leak bắt được",
         ),
     ]
@@ -436,5 +462,28 @@ async def main() -> int:
     return 0 if (all_thong and xf_all_fail) else 1
 
 
+async def main() -> int:
+    """Mở 2 pool (owner cho DDL/grant boot — cùng cách `studio_app.app.create_app()` làm ở lifespan;
+    non-owner cho DML/RLS thật), chạy `_run`, rồi đóng cả hai dù `_run` raise hay không.
+
+    Không tự dựng DSN thủ công: `get_admin_pool()`/`get_pool()` đọc qua `studio_app.settings.Settings`
+    (pydantic, `STUDIO_DATABASE_URL`/`STUDIO_DATABASE_URL_ADMIN`) — thiếu biến môi trường thì
+    pydantic tự raise `ValidationError` rõ ràng, không chạy câm rồi vỡ sâu trong pool."""
+    admin = await get_admin_pool()
+    await ensure_all_schemas(admin)
+    await grant_app_privileges(admin)
+    pool = await get_pool()
+    try:
+        return await _run(pool)
+    finally:
+        await close_pools()
+
+
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        # Windows defaults to `ProactorEventLoop`; psycopg async refuses it outright ("Psycopg
+        # cannot use the 'ProactorEventLoop' to run in async mode"). `Selector*` is the loop
+        # psycopg's own error message recommends, and it is stdlib on every platform this script
+        # runs on — no extra dependency.
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     sys.exit(asyncio.run(main()))
