@@ -101,9 +101,7 @@ class EngineAgentRunner:
             scope=scope,
             query=query,
         )
-        session_context = resolve_session(
-            {"tenant_id": tenant_id, "user": "eval-harness", "roles": section_roles}
-        )
+        session_context = resolve_session({"tenant_id": tenant_id, "user": "eval-harness", "roles": section_roles})
         result = await interpreter.run(
             recipe,
             kb_search=self._kb_search,

@@ -47,8 +47,9 @@ from studio_app.providers.fakes import ExtractiveFakeLLM
 from studio_evalhub.agent_runner import CaseRun
 from studio_evalhub.cli import _demo_golden_set
 from studio_evalhub.harness import citations_from_trace, score_case
-from studio_kb.doc_factory import TENANT_IDS
-from studio_kb.static_search import StaticKbSearch
+from studio_kb.doc_factory import TENANT_IDS, load_callisto
+from studio_kb.embeddings import derive_vector
+from studio_kb.postgres import KbIngest, PgKbSearch
 from studio_kb.trace_reader import PgTraceReader
 
 
@@ -60,18 +61,34 @@ class _StubEmbedding:
         return [[0.0, 0.0, 0.0] for _ in texts]
 
 
+class _CallistoEmbedding:
+    """`EmbeddingService` cho `PgKbSearch`/seed — CÙNG không gian với `derive_vector` (SSOT
+    `studio_kb.embeddings`). Không dùng `_StubEmbedding` ở đây: đó là khe của
+    `EngineAgentRunner(embedding=...)` (trơ, feed `LlmStepExecutor`), khác khe seed/query của
+    `PgKbSearch` — hai adapter phục vụ hai collaborator khác nhau."""
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        return [derive_vector(text) for text in texts]
+
+
 async def _run_case_through_postgres(pool: Pool) -> tuple[CaseRun, UUID, str]:
     """Chạy SC-01 qua luồng thật với `PgTraceWriter` → trả `(case_run, tenant_id, run_id)`.
 
     `ExtractiveFakeLLM` (không phải câu trả lời recorded): nó **chỉ đọc prompt**, không bao giờ thấy
     `expected`/`expected_citation`, nên citation nó trích đến từ dữ liệu KB vừa truy xuất. Fixture
     recorded sẽ cho điểm tuyệt đối bất kể KB làm gì và phép so ở đây mất nghĩa.
+
+    Seed corpus Callisto qua `KbIngest` trước khi chạy case: `conftest.py::_truncate_all` dọn
+    `kb.chunks` trước mỗi test, nên `PgKbSearch` cần dữ liệu thật mới trả kết quả (khác
+    `StaticKbSearch`, vốn có corpus in-memory sẵn không phụ thuộc DB).
     """
+    await KbIngest(pool, _CallistoEmbedding()).ingest(list(load_callisto()))
+
     case = next(c for c in _demo_golden_set().cases if c.case_id == "SC-01")
     tenant_id = TENANT_IDS[case.tenant]
 
     runner = EngineAgentRunner(
-        kb_search=StaticKbSearch(),
+        kb_search=PgKbSearch(pool, _CallistoEmbedding()),
         llm=ExtractiveFakeLLM(),
         embedding=_StubEmbedding(),
         trace_writer=PgTraceWriter(pool),

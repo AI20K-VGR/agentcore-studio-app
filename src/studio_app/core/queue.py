@@ -106,8 +106,7 @@ async def fail(pool: Pool, job_id: str, *, requeue: bool = True) -> None:
     async with pool.connection() as conn:
         next_status = "pending" if requeue else "dead_letter"
         cur = await conn.execute(
-            "UPDATE core.jobs SET status = %s, updated_at = now() "
-            "WHERE id = %s AND status = 'processing' RETURNING id",
+            "UPDATE core.jobs SET status = %s, updated_at = now() WHERE id = %s AND status = 'processing' RETURNING id",
             (next_status, job_id),
         )
         row = await cur.fetchone()

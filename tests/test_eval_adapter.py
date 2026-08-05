@@ -218,9 +218,7 @@ async def test_run_case_surfaces_engine_refusal_faithfully(llm_text: str) -> Non
         llm=_ScriptedLLM(llm_text),
         embedding=FakeEmbedding(),
         trace_writer=_CollectingTraceWriter(),
-        session_context=resolve_session(
-            {"tenant_id": TENANT_ID, "user": "eval-harness", "roles": roles}
-        ),
+        session_context=resolve_session({"tenant_id": TENANT_ID, "user": "eval-harness", "roles": roles}),
     )
     engine_out = _llm_answer(raw.final_state)
 
