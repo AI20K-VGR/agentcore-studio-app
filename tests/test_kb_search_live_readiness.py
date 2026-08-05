@@ -114,9 +114,13 @@ def _assert_scoped_to_ankor(items_or_ids: Iterable[dict[str, object] | str], see
 
     Kiểm đúng thứ hợp đồng hứa (QĐ-P5 — KHÔNG bám thứ hạng, `EMBEDDING_DIM=8` bag-of-words không
     chịu nổi kết luận về chất lượng retrieval):
-    - khác rỗng — **răng dương**, để một impl trả `[]` không false-pass vế loại trừ dưới;
-    - mọi `chunk_id` ∈ tập `ankor` đã seed;
-    - **không** `chunk_id` nào ∈ tập `borea` đã seed — **răng âm** (chéo tenant);
+    - khác rỗng — **răng dương**, để một impl trả `[]` không false-pass vế whitelist dưới;
+    - mọi `chunk_id` ∈ tập `ankor` đã seed — **whitelist**, đây là vế bắt rò rỉ chéo-tenant thật sự:
+      `ankor_ids`/`borea_ids` disjoint theo cấu trúc (mỗi chunk chỉ vào đúng 1 bucket theo
+      `chunk.tenant_id`), nên một chunk `borea` lọt vào kết quả sẽ FAIL ngay ở đây;
+    - `assert ... not in borea_ids` đi kèm là **hệ quả logic** của whitelist trên (do 2 tập disjoint),
+      không phải một răng độc lập thứ hai — giữ lại vì thông điệp lỗi rõ nghĩa hơn khi đọc output, đã
+      review và xác nhận không tạo false-negative (code-review 2026-08-05, finding S-1);
     - `tenant_id`/`section_role` (khi có, tức đầu vào là chunk-dict) so bằng `str(...)`.
 
     ⚠️ **Bắt buộc `str(...)`, KHÔNG so trực tiếp với object `UUID`**: `interpreter.py` dump chunk
@@ -185,13 +189,21 @@ async def test_composition_root_ready_for_live_kb(pool: Pool, seeded_corpus: See
 
 @pytest.mark.xfail(
     strict=False,
+    raises=NotImplementedError,
     reason="studio_kb.search.KbSearchService.search vẫn raise NotImplementedError (spec DE, issue "
     "#91) — dây bẫy chờ DE land; xem flip-checklist.md cho nội dung cú lật",
 )
 async def test_engine_agent_runner_with_kb_search_service(pool: Pool, seeded_corpus: SeededCorpus) -> None:
     """T3 (F3) — giống hệt T2 trừ đúng một thứ: `kb_search=KbSearchService(pool)`. Ngày DE land,
     test này tự XPASS mà AIE-1 không sửa dòng nào (QĐ-U1). `xfail(strict=False)` để một impl land
-    một phần không phạt cả suite; twin T2 + drift-guard T4 chống mù cho marker này (R2)."""
+    một phần không phạt cả suite; twin T2 chống mù seed/wiring/assertion (R2).
+
+    `raises=NotImplementedError` (thêm sau code-review 2026-08-05, finding I-2) là lưới bắt đường
+    DE land bằng `classmethod` factory (R1b, plan.md): nếu DE giữ nguyên `__init__(self, pool)`
+    nhưng đường vào chính thức là factory tiêm resolver, gọi thẳng `KbSearchService(pool)` như dòng
+    dưới thiếu resolver → lỗi thật (`AttributeError`/`TypeError` tuỳ cách DE hiện thực), KHÔNG khớp
+    `NotImplementedError` → pytest báo **FAIL thật**, không bị `strict=False` nuốt câm. T4 chỉ pin
+    hình dạng `__init__`/`search`, không tự bắt được đường này — xem docstring T4."""
     case = next(c for c in _demo_golden_set().cases if c.case_id == "SC-01")
     runner = EngineAgentRunner(
         kb_search=KbSearchService(pool),
@@ -211,16 +223,20 @@ async def test_engine_agent_runner_with_kb_search_service(pool: Pool, seeded_cor
 
 
 def test_kb_search_service_seam_shape_unchanged() -> None:
-    """T4 (F5) — drift-guard cho 2 hình dạng DE có thể land (plan.md R1/R1b), hai vế so khác nhau
-    có chủ đích:
+    """T4 (F5) — drift-guard cho hình dạng R1 (plan.md), hai vế so khác nhau có chủ đích:
 
     - `__init__` (KHÔNG frozen) → **bind-check**, không so danh sách tham số: so danh sách sẽ báo
       động giả khi DE thêm một tham số có-default hoặc `**kwargs` (không phá call-site
-      `KbSearchService(pool)` nào), mà vẫn không bắt được đường DE land bằng `classmethod` factory.
-      Bind-check bắt đúng thứ thật sự phá lời gọi hiện tại: **tham số bắt buộc mới**.
+      `KbSearchService(pool)` nào). Bind-check bắt đúng thứ thật sự phá lời gọi hiện tại: **tham số
+      bắt buộc mới** trên `__init__`.
     - `search` (ĐÃ frozen, `kb-search.v0.md:24-32`) → so **chính xác** danh sách tham số. Chữ ký
-      frozen thì so chính xác mới đúng nghĩa; đây cũng là vế bắt được đường "DE land bằng factory,
-      không đụng `__init__`" mà bind-check bỏ lọt (R1b).
+      frozen thì so chính xác mới đúng nghĩa.
+
+    ⚠️ **T4 KHÔNG bắt được đường DE land bằng `classmethod` factory giữ nguyên `__init__(self, pool)`
+    (R1b, plan.md)** — sửa sau code-review 2026-08-05 (finding I-2): factory không đổi tham số
+    `__init__` lẫn `search`, nên cả hai vế trên vẫn xanh dù call-site `KbSearchService(pool)` (T3)
+    thực ra thiếu resolver. Lưới bắt R1b nằm ở `raises=NotImplementedError` trên marker `xfail` của
+    T3, không phải ở đây — xem docstring T3.
     """
     sentinel_pool: object = object()
     inspect.signature(KbSearchService.__init__).bind(None, sentinel_pool)  # không raise = pass
