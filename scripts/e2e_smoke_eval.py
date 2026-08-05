@@ -404,9 +404,7 @@ async def _run(pool: Pool) -> int:
         print(f"BỎ RED-CHECK XF-02: case gốc {xf2.case_id} không có `expected_tenant`", file=sys.stderr)
         return 1
     xf_rows = [
-        await run_one(
-            xf1, _CountingKb(pool, embedding), designed_red="nhãn golden cố ý sai (expected + #c999 bịa)"
-        ),
+        await run_one(xf1, _CountingKb(pool, embedding), designed_red="nhãn golden cố ý sai (expected + #c999 bịa)"),
         await run_one(
             xf2,
             _LeakyKb(pool, embedding, leak_as=TENANT_IDS[leak_tenant]),

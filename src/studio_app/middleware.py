@@ -60,17 +60,14 @@ async def _resolve_tenant_id(request: Request, conn: AsyncConnection[Any]) -> st
     # Prefer an exact id match over a name match, and `LIMIT 1`, so resolution is deterministic
     # even in the pathological case where one tenant's `name` equals another tenant's `id` string.
     cur = await conn.execute(
-        "SELECT id FROM core.tenants WHERE id::text = %s OR name = %s "
-        "ORDER BY (id::text = %s) DESC LIMIT 1",
+        "SELECT id FROM core.tenants WHERE id::text = %s OR name = %s ORDER BY (id::text = %s) DESC LIMIT 1",
         (raw, raw, raw),
     )
     row = await cur.fetchone()
     return str(row[0]) if row is not None else None
 
 
-async def tenant_context_middleware(
-    request: Request, call_next: Callable[[Request], Awaitable[Response]]
-) -> Response:
+async def tenant_context_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
     pool = await get_pool()
     async with pool.connection() as conn:
         tenant_id = await _resolve_tenant_id(request, conn)
