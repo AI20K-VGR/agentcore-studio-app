@@ -76,7 +76,9 @@ async def obs_trace_events_rls(admin_pool: Pool) -> AsyncIterator[None]:
         yield
     finally:
         async with admin_pool.connection() as conn:
-            await conn.execute(sql.SQL("DROP POLICY IF EXISTS {} ON obs.trace_events").format(sql.Identifier(_POLICY_NAME)))
+            await conn.execute(
+                sql.SQL("DROP POLICY IF EXISTS {} ON obs.trace_events").format(sql.Identifier(_POLICY_NAME))
+            )
             await conn.execute("ALTER TABLE obs.trace_events DISABLE ROW LEVEL SECURITY")
 
 
@@ -122,15 +124,16 @@ async def test_write_local_tenant_isolated_between_two_events(
     await writer.write(_sample_event("evt-rls-b1", TENANT_A))
     await writer.write(_sample_event("evt-rls-b2", TENANT_B))
 
+    ids = ("evt-rls-b1", "evt-rls-b2")
     async with pool.connection() as conn:
         await conn.execute(sql.SQL("SET LOCAL app.tenant_id = {}").format(sql.Literal(str(TENANT_A))))
-        cur = await conn.execute("SELECT event_id FROM obs.trace_events WHERE event_id IN (%s, %s)", ("evt-rls-b1", "evt-rls-b2"))
+        cur = await conn.execute("SELECT event_id FROM obs.trace_events WHERE event_id IN (%s, %s)", ids)
         rows_a = await cur.fetchall()
     assert [row[0] for row in rows_a] == ["evt-rls-b1"]
 
     async with pool.connection() as conn:
         await conn.execute(sql.SQL("SET LOCAL app.tenant_id = {}").format(sql.Literal(str(TENANT_B))))
-        cur = await conn.execute("SELECT event_id FROM obs.trace_events WHERE event_id IN (%s, %s)", ("evt-rls-b1", "evt-rls-b2"))
+        cur = await conn.execute("SELECT event_id FROM obs.trace_events WHERE event_id IN (%s, %s)", ids)
         rows_b = await cur.fetchall()
     assert [row[0] for row in rows_b] == ["evt-rls-b2"]
 
@@ -149,5 +152,14 @@ async def test_local_rls_setup_genuinely_enforces_with_check(admin_pool: Pool, o
                 "INSERT INTO obs.trace_events "
                 "(event_id, run_id, agent_id, tenant_id, node_id, node_type, ts, inputs_hash) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                ("evt-cross-write", "run-x", "agent-x", TENANT_B, "node-1", "llm_step", "2026-08-12T00:00:00Z", "deadbeef"),
+                (
+                    "evt-cross-write",
+                    "run-x",
+                    "agent-x",
+                    TENANT_B,
+                    "node-1",
+                    "llm_step",
+                    "2026-08-12T00:00:00Z",
+                    "deadbeef",
+                ),
             )
