@@ -87,7 +87,11 @@ def test_verify_rejects_missing_tenant_id_claim(monkeypatch: pytest.MonkeyPatch)
         jwt_auth.verify_token(token)
 
 
-def test_verify_rejects_malformed_token_string() -> None:
+def test_verify_rejects_malformed_token_string(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Thiếu monkeypatch này (khác các bài hàng xóm) làm `Settings()` validate từ ENV THẬT thay vì
+    # `_settings()` cố định — đỏ ở CI (`database_url`/`database_url_admin`/`jwt_secret` không set)
+    # dù verify_token() không hề chạm DB — phát hiện qua review AIE-2 (PR#23 workbench, N-4).
+    monkeypatch.setattr(jwt_auth, "get_settings", _settings)
     with pytest.raises(jwt_auth.InvalidTokenError):
         jwt_auth.verify_token("not-a-real-jwt-at-all")
 
