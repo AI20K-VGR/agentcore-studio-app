@@ -21,12 +21,13 @@ from uuid import UUID
 import studio_kb
 from fastapi import APIRouter, HTTPException
 from pydantic import ValidationError
-from studio_contracts import Edge, Node
+from studio_contracts import Edge, Node, Recipe, Scorecard
 from studio_evalhub.harness import EvalHarness
 from studio_kb.doc_factory import TENANT_IDS
 from studio_kb.postgres import PgKbSearch
 from studio_workbench.builder import create_dynamic_recipe
 from studio_workbench.publish import publish
+from studio_workbench.tenant_wall import ResolvedContext
 from studio_workbench.validator import graph_lint
 
 from studio_app.core._db import get_pool
@@ -42,10 +43,12 @@ router = APIRouter(prefix="/api/agents", tags=["publish"])
 _GOLDEN_SET_DIR = Path(studio_kb.__file__).resolve().parent.parent.parent / "golden"
 
 
-@router.post("/{agent_id}/publish")
-async def publish_agent(agent_id: str, body: RunRequest) -> dict[str, object]:
-    session = get_request_session()
-
+async def _evaluate(agent_id: str, body: RunRequest, session: ResolvedContext) -> tuple[Recipe, Scorecard]:
+    """Dựng recipe từ canvas + chạy NGUYÊN golden_set_ref qua `EvalHarness.run()` thật — dùng chung
+    cho cả `/evaluate` (chỉ xem điểm, KHÔNG ghi DB) lẫn `/publish` (chấm rồi ghi DB nếu đạt). Mỗi
+    lần gọi route nào cũng chấm LẠI TỪ ĐẦU — route `/publish` không tin bất kỳ Scorecard nào UI đã
+    thấy trước đó qua `/evaluate` (tag vs fence: UI chỉ gợi ý nút sáng/tắt, server luôn tự verify
+    lại, không bao giờ nhận thẳng verdict client tự khai)."""
     if body.agent_id != agent_id:
         raise HTTPException(
             status_code=400,
@@ -98,15 +101,47 @@ async def publish_agent(agent_id: str, body: RunRequest) -> dict[str, object]:
     )
 
     tenant_ids: dict[str, UUID] = dict(TENANT_IDS)
-    scorecard = await EvalHarness().run(
-        recipe.agent_id,
-        recipe.golden_set_ref,
-        golden_set_path=golden_set_path,
-        runner=runner,
-        tenant_ids=tenant_ids,
-        threshold_success=recipe.scorecard_threshold.success,
-        threshold_citation_accuracy=recipe.scorecard_threshold.citation_accuracy,
-    )
+    try:
+        scorecard = await EvalHarness().run(
+            recipe.agent_id,
+            recipe.golden_set_ref,
+            golden_set_path=golden_set_path,
+            runner=runner,
+            tenant_ids=tenant_ids,
+            threshold_success=recipe.scorecard_threshold.success,
+            threshold_citation_accuracy=recipe.scorecard_threshold.citation_accuracy,
+        )
+    except ValueError as exc:
+        # `load_golden_set` (evalhub) raise ValueError khi file không khớp `golden_set_ref` khai
+        # trong recipe (DEC-D16-01: ref là khoá, tên file chỉ là đường dẫn) — lỗi INPUT của
+        # client (chọn sai `golden_set_ref`), không phải lỗi hệ thống. Phát hiện thật lúc test tay
+        # route này: trước bản vá này, lỗi rơi thẳng thành 500 không kiểm soát.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return recipe, scorecard
+
+
+@router.post("/{agent_id}/evaluate")
+async def evaluate_agent(agent_id: str, body: RunRequest) -> dict[str, object]:
+    """Chấm điểm NGUYÊN golden_set_ref qua `EvalHarness` thật, trả `Scorecard` — KHÔNG gọi
+    `publish()`, không ghi `wb.recipes`. Dùng cho UI hiện điểm TRƯỚC khi quyết bấm Publish, để nút
+    Publish có căn cứ bật/tắt mà không phải "bấm thử xem có được không"."""
+    session = get_request_session()
+    recipe, scorecard = await _evaluate(agent_id, body, session)
+    return {
+        "agent_id": recipe.agent_id,
+        "tenant_id": str(recipe.tenant_id),
+        "scorecard": scorecard.model_dump(mode="json"),
+    }
+
+
+@router.post("/{agent_id}/publish")
+async def publish_agent(agent_id: str, body: RunRequest) -> dict[str, object]:
+    """Sẽ LUÔN trả 409 cho tới khi AIE-2 xong `recipe_hash` producer (DEC-03):
+    `compute_scorecard()` (evalhub) hiện không có tham số nào để set `recipe_hash`, luôn `None` —
+    `publish()` fail-closed trên đúng field đó TRƯỚC CẢ khi đọc `gate.verdict`. Đây là hành vi
+    ĐÚNG, không phải bug của route này — xem kit#127 (rủi ro team-wide) để biết ai đang chặn."""
+    session = get_request_session()
+    recipe, scorecard = await _evaluate(agent_id, body, session)
 
     try:
         await publish(recipe, scorecard, conn=get_request_connection())
