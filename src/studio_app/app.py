@@ -21,10 +21,15 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from studio_app.core._db import close_pools, get_admin_pool
 from studio_app.core.schema import ensure_all_schemas, grant_app_privileges
 from studio_app.middleware import tenant_context_middleware
+from studio_app.routes import auth as auth_routes
+from studio_app.routes import chat as chat_routes
+from studio_app.routes import publish as publish_routes
+from studio_app.routes import runs as runs_routes
 
 
 @asynccontextmanager
@@ -43,5 +48,32 @@ def create_app() -> FastAPI:
     """Build the FastAPI app: lifespan boots DDL+grants via the admin pool; middleware holds one
     tenant-scoped connection per request via contextvar (F9)."""
     app = FastAPI(title="AgentCore Studio", lifespan=_lifespan)
+    # DEV-TIME — cho phép `apps/web` (Vite, cổng KHÁC — 5173 — nên trình duyệt coi là origin
+    # khác) gọi được API này. `dev_playground_server.py` (server tạm cũ) cũng tự set
+    # `Access-Control-Allow-Origin: *` cho đúng lý do này — không phải phát minh mới, chỉ là
+    # FastAPI cần khai qua middleware thay vì set header tay mỗi response như code cũ.
+    # `allow_credentials=False` (mặc định) vì luồng demo dùng `Authorization: Bearer <jwt>` tự
+    # đính vào header, KHÔNG dùng cookie trình duyệt tự quản — CORS spec cấm
+    # `allow_origins=["*"]` cùng `allow_credentials=True`, nên giữ mặc định là đúng, không phải
+    # thiếu sót.
+    # CORS thêm SAU tenant_context_middleware (review PR#5, DE, M2): Starlette xếp middleware
+    # thêm SAU CÙNG ra NGOÀI CÙNG — thêm CORS trước như bản cũ làm nó nằm TRONG
+    # tenant_context_middleware, nên response lỗi phát sinh ngay trong middleware đó (401/500)
+    # không bao giờ đi qua CORS để được gắn header — trình duyệt báo "CORS error", che mất lỗi
+    # 401/500 thật, ngược đúng mục đích thêm CORS (test được qua trình duyệt).
     app.middleware("http")(tenant_context_middleware)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    # Kế hoạch 2 (luồng demo login -> canvas -> publish -> chat) — mỗi router chỉ lắp ráp lời gọi
+    # tới seam các quadrant đã có sẵn (resolve_session, interpreter.run, publish, EvalHarness.run),
+    # không tự chứa business logic (F3, đúng nguyên tắc "composition root wires, không viết domain
+    # logic" đã ghi ở docstring module này).
+    app.include_router(auth_routes.router)
+    app.include_router(runs_routes.router)
+    app.include_router(publish_routes.router)
+    app.include_router(chat_routes.router)
     return app
