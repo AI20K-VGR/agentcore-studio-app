@@ -1,0 +1,108 @@
+"""`jwt_auth.py` — ký/verify JWT thật (Kế hoạch 2, A1/A2). Pure-Python, không cần DB thật: mọi
+test tự dựng `Settings` (pydantic thường, không qua biến môi trường/`@lru_cache`) rồi
+`monkeypatch` `get_settings` tại module `jwt_auth` — tránh phụ thuộc `STUDIO_DATABASE_URL` (bắt
+buộc, không default) hay đụng cache toàn-process của `get_settings()` thật.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from uuid import UUID, uuid4
+
+import jwt as pyjwt
+import pytest
+from studio_app import jwt_auth
+from studio_app.settings import Settings
+from studio_workbench.tenant_wall import ResolvedContext
+
+_TENANT_ID = UUID("a0000000-0000-0000-0000-000000000001")
+
+
+def _settings(*, secret: str = "test-secret", expire_minutes: int = 480) -> Settings:
+    return Settings(
+        database_url="postgresql://unused/unused",
+        database_url_admin="postgresql://unused/unused",
+        jwt_secret=secret,
+        jwt_expire_minutes=expire_minutes,
+    )
+
+
+def test_issue_then_verify_roundtrips_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """KHÓA: token ký ra bởi `issue_token()` phải verify được lại đúng CẢ 3 trường
+    (tenant_id/user/roles), không rơi rớt field nào qua vòng ký -> verify."""
+    monkeypatch.setattr(jwt_auth, "get_settings", _settings)
+    session = ResolvedContext(tenant_id=_TENANT_ID, user="dozyboy@ankor.vn", roles=["public", "hr"])
+
+    token = jwt_auth.issue_token(session)
+    resolved = jwt_auth.verify_token(token)
+
+    assert resolved.tenant_id == _TENANT_ID
+    assert resolved.user == "dozyboy@ankor.vn"
+    assert resolved.roles == ["public", "hr"]
+
+
+def test_verify_rejects_wrong_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    """KHÓA THẬT của "JWT thật": ký bằng khoá A, verify bằng khoá B (khác) -> PHẢI đỏ. Đây chính
+    là bằng chứng "không ai giả mạo được token nếu không có `jwt_secret`" — nếu test này xanh mà
+    lẽ ra phải đỏ, việc ký/verify không có tác dụng bảo vệ gì cả."""
+    monkeypatch.setattr(jwt_auth, "get_settings", lambda: _settings(secret="secret-A"))
+    session = ResolvedContext(tenant_id=_TENANT_ID, user="attacker", roles=[])
+    token = jwt_auth.issue_token(session)
+
+    monkeypatch.setattr(jwt_auth, "get_settings", lambda: _settings(secret="secret-B"))
+    with pytest.raises(jwt_auth.InvalidTokenError):
+        jwt_auth.verify_token(token)
+
+
+def test_verify_rejects_expired_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(jwt_auth, "get_settings", _settings)
+    settings = _settings()
+    now = datetime.now(UTC)
+    expired_claims = {
+        "tenant_id": str(_TENANT_ID),
+        "user": "dozyboy@ankor.vn",
+        "roles": [],
+        "iat": now - timedelta(minutes=10),
+        "exp": now - timedelta(minutes=1),  # hết hạn 1 phút trước
+    }
+    expired_token = pyjwt.encode(expired_claims, settings.jwt_secret, algorithm="HS256")
+
+    with pytest.raises(jwt_auth.InvalidTokenError):
+        jwt_auth.verify_token(expired_token)
+
+
+def test_verify_rejects_missing_tenant_id_claim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Token CÓ chữ ký hợp lệ (ký đúng khoá) nhưng THIẾU claim bắt buộc — vẫn phải fail-closed,
+    không được suy ra giá trị mặc định nào cho `tenant_id`."""
+    monkeypatch.setattr(jwt_auth, "get_settings", _settings)
+    settings = _settings()
+    now = datetime.now(UTC)
+    token = pyjwt.encode(
+        {"user": "dozyboy@ankor.vn", "roles": [], "iat": now, "exp": now + timedelta(hours=1)},
+        settings.jwt_secret,
+        algorithm="HS256",
+    )
+
+    with pytest.raises(jwt_auth.InvalidTokenError):
+        jwt_auth.verify_token(token)
+
+
+def test_verify_rejects_malformed_token_string(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Thiếu monkeypatch này (khác các bài hàng xóm) làm `Settings()` validate từ ENV THẬT thay vì
+    # `_settings()` cố định — đỏ ở CI (`database_url`/`database_url_admin`/`jwt_secret` không set)
+    # dù verify_token() không hề chạm DB — phát hiện qua review AIE-2 (PR#23 workbench, N-4).
+    monkeypatch.setattr(jwt_auth, "get_settings", _settings)
+    with pytest.raises(jwt_auth.InvalidTokenError):
+        jwt_auth.verify_token("not-a-real-jwt-at-all")
+
+
+def test_two_tenants_get_non_interchangeable_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sanity chống nhầm: token của tenant A không verify ra tenant B — tránh lỗi copy-paste kiểu
+    `issue_token` lờ đi `session` truyền vào mà ký hằng số."""
+    monkeypatch.setattr(jwt_auth, "get_settings", _settings)
+    other_tenant = uuid4()
+    token_a = jwt_auth.issue_token(ResolvedContext(tenant_id=_TENANT_ID, user="a", roles=[]))
+    token_b = jwt_auth.issue_token(ResolvedContext(tenant_id=other_tenant, user="b", roles=[]))
+
+    assert jwt_auth.verify_token(token_a).tenant_id == _TENANT_ID
+    assert jwt_auth.verify_token(token_b).tenant_id == other_tenant

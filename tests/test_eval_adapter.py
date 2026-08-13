@@ -158,6 +158,28 @@ async def test_inv1_recipe_khai_tenant_khac_thi_session_thang() -> None:
 
     assert recipe.tenant_id == CLIENT_CLAIMED_TENANT_ID, "recipe phải thật sự khai tenant kia"
 
+    # Cầu chì thứ hai, ở tầng NODE (review AIE-2 trên workbench#23). Từ workbench#23
+    # `create_recipe_d4` không còn ghi `tenant_id`/`section_roles` vào `node.params`, nên nếu chỉ
+    # dựa vào builder thì bài này sẽ XANH-RỖNG-NGHĨA đúng kiểu docstring cảnh báo ở trên: interpreter
+    # có thể bị đổi thành "bổ sung" thay vì "ghi đè" (client params thắng) mà bài vẫn xanh, vì không
+    # còn params nào để mà thắng (đã đo bằng mutant M3 thật — xem review PR#23). Thế lệch là ĐIỀU
+    # KIỆN THÍ NGHIỆM — dựng tại đây, không mượn của builder.
+    kb_node = recipe.dag.nodes[0]
+    spoofed = kb_node.model_copy(
+        update={
+            "params": {
+                **kb_node.params,
+                "tenant_id": CLIENT_CLAIMED_TENANT_ID,
+                "section_roles": ["finance"],
+            }
+        }
+    )
+    recipe = recipe.model_copy(
+        update={"dag": recipe.dag.model_copy(update={"nodes": [spoofed, *recipe.dag.nodes[1:]]})}
+    )
+    assert recipe.dag.nodes[0].params["tenant_id"] == CLIENT_CLAIMED_TENANT_ID
+    assert recipe.dag.nodes[0].params["section_roles"] == ["finance"]
+
     raw = await engine_interpreter.run(
         recipe,
         kb_search=kb,
@@ -171,6 +193,7 @@ async def test_inv1_recipe_khai_tenant_khac_thi_session_thang() -> None:
 
     assert kb.calls[0][1] == TENANT_ID, "kb.search phải nhận tenant của SESSION"
     assert kb.calls[0][1] != CLIENT_CLAIMED_TENANT_ID, "tenant client khai không được tới kb.search"
+    assert kb.calls[0][2] == ["public"], "section_roles phải là của SESSION, không phải node tự khai"
     assert {e.tenant_id for e in raw.events} == {TENANT_ID}, "mọi TraceEvent mang tenant của SESSION"
 
 
@@ -345,8 +368,11 @@ async def test_recipe_construction_via_real_builder(monkeypatch: pytest.MonkeyPa
     recipe = stub.recipes[0]
     assert recipe.tenant_id == TENANT_ID
     assert recipe.agent_id == "agent-callisto-d4"
+    # `section_roles` round-trip giờ quan sát được qua `kb_binding.scope` (builder KHÔNG còn ghi
+    # nó vào `node.params` — hardening #122, `interpreter.run()` luôn ghi đè bằng session).
+    assert recipe.kb_binding.scope == "t/public,finance"
     kb_node = next(n for n in recipe.dag.nodes if n.type.value == "kb-retrieve")
-    assert kb_node.params["section_roles"] == ["public", "finance"]
+    assert "section_roles" not in kb_node.params
     assert kb_node.params["query"] == "q?"
 
 
@@ -357,8 +383,9 @@ async def test_recipe_construction_empty_roles(monkeypatch: pytest.MonkeyPatch) 
     await runner.run_case(agent_id="a", query="q?", tenant_id=TENANT_ID, section_roles=[])
 
     assert stub.recipes[0].agent_id == "a"  # passthrough khi non-empty (mutation-check T-2)
+    assert stub.recipes[0].kb_binding.scope == "t/"
     kb_node = next(n for n in stub.recipes[0].dag.nodes if n.type.value == "kb-retrieve")
-    assert kb_node.params["section_roles"] == []
+    assert "section_roles" not in kb_node.params
 
 
 # ---------------------------------------------------------------------------

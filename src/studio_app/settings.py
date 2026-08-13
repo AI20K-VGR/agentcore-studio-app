@@ -19,6 +19,15 @@ class Settings(BaseSettings):
     enable_tracing: bool = False
     use_fake_providers: bool = True
 
+    # JWT ký/verify identity (Kế hoạch 2, A2/A1) — KHÔNG có provider identity thật đứng sau (không
+    # password/OAuth/IdP nào check `user`/`tenant`/`roles` trước khi ký): việc ký/verify chữ ký là
+    # THẬT (không ai giả mạo được token nếu không có `jwt_secret`), nhưng việc "ai được phép xin
+    # token cho tenant/roles nào" vẫn CHƯA được xác thực — đó là hệ thống identity provider riêng,
+    # ngoài phạm vi hiện tại. `jwt_secret` không có default: thiếu biến môi trường phải raise rõ
+    # ràng lúc khởi động (pydantic ValidationError), không được chạy với khoá rỗng/đoán được.
+    jwt_secret: str
+    jwt_expire_minutes: int = 480
+
     gemini_api_key: str | None = None
 
     langfuse_public_key: str | None = None
