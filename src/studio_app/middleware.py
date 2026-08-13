@@ -19,6 +19,7 @@ from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from typing import Any
 
+from fastapi import HTTPException
 from psycopg import AsyncConnection, sql
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -42,22 +43,26 @@ def get_request_connection() -> AsyncConnection[Any]:
 
 
 def get_request_session() -> ResolvedContext:
-    """Return the current request's resolved identity (tenant_id/user/roles) — the value
-    `x-demo-session` (see `_resolve_demo_session` below) produced via
-    `studio_workbench.tenant_wall.resolve_session`. Call ONLY from within a request scope that
-    actually carried `x-demo-session` — raises otherwise (fail-closed: a caller must never
-    silently fall back to an unauthenticated/empty session), same contract as
-    `get_request_connection()` above.
+    """Return the current request's resolved identity (tenant_id/user/roles) — the value a valid
+    `Authorization: Bearer <jwt>` header resolves to via `jwt_auth.verify_token` +
+    `studio_workbench.tenant_wall.resolve_session` (see `_resolve_jwt_session` below). Call ONLY
+    from within a request scope that actually carried a valid Bearer token — raises `HTTPException
+    401` otherwise (fail-closed: a caller must never silently fall back to an unauthenticated/empty
+    session), same contract as `get_request_connection()` above.
+
+    401, not a bare `RuntimeError` (review PR#5, DE, M1): this condition means "the CLIENT didn't
+    authenticate", not "the server is broken" — every route calling this needs the same status
+    code, so it belongs here once, not re-implemented per route via a try/except.
 
     Distinct from `get_request_connection()`'s tenant (which may come from the OLDER
-    `x-tenant-id` dev-stub path when `x-demo-session` is absent — see
-    `tenant_context_middleware`): routes that need `user`/`roles`, not just `tenant_id` for
-    `SET LOCAL`, must go through this function, never re-derive identity themselves."""
+    `x-tenant-id` dev-stub path when no Bearer token is present — see `tenant_context_middleware`):
+    routes that need `user`/`roles`, not just `tenant_id` for `SET LOCAL`, must go through this
+    function, never re-derive identity themselves."""
     session = _request_session.get()
     if session is None:
-        raise RuntimeError(
-            "no request-scoped session — request did not carry `x-demo-session` "
-            "(tenant_context_middleware only sets this when that header is present)"
+        raise HTTPException(
+            status_code=401,
+            detail="Thiếu hoặc sai `Authorization: Bearer <jwt>` — cần đăng nhập trước (`POST /api/auth/demo-login`).",
         )
     return session
 

@@ -3,7 +3,8 @@
 
 Khác `dev_playground_server.py` ở 3 điểm, đúng ý nghĩa "luồng thật" của GATE-2 (Day 20, #127):
 - `kb_search = PgKbSearch(...)` (Postgres/pgvector thật, fence RLS) thay `StaticKbSearch` (RAM).
-- `session = get_request_session()` (từ `x-demo-session`, qua `tenant_wall.resolve_session`) thay
+- `session = get_request_session()` (từ `Authorization: Bearer <jwt>`, qua `jwt_auth.verify_token`
+  + `tenant_wall.resolve_session`) thay
   session giả dựng từ `recipe.tenant_id` client tự khai.
 - `trace_writer = PgTraceWriter(...)` (ghi Postgres thật) thay `InMemoryTraceWriter`.
 

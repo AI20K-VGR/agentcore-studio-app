@@ -56,13 +56,18 @@ def create_app() -> FastAPI:
     # đính vào header, KHÔNG dùng cookie trình duyệt tự quản — CORS spec cấm
     # `allow_origins=["*"]` cùng `allow_credentials=True`, nên giữ mặc định là đúng, không phải
     # thiếu sót.
+    # CORS thêm SAU tenant_context_middleware (review PR#5, DE, M2): Starlette xếp middleware
+    # thêm SAU CÙNG ra NGOÀI CÙNG — thêm CORS trước như bản cũ làm nó nằm TRONG
+    # tenant_context_middleware, nên response lỗi phát sinh ngay trong middleware đó (401/500)
+    # không bao giờ đi qua CORS để được gắn header — trình duyệt báo "CORS error", che mất lỗi
+    # 401/500 thật, ngược đúng mục đích thêm CORS (test được qua trình duyệt).
+    app.middleware("http")(tenant_context_middleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    app.middleware("http")(tenant_context_middleware)
     # Kế hoạch 2 (luồng demo login -> canvas -> publish -> chat) — mỗi router chỉ lắp ráp lời gọi
     # tới seam các quadrant đã có sẵn (resolve_session, interpreter.run, publish, EvalHarness.run),
     # không tự chứa business logic (F3, đúng nguyên tắc "composition root wires, không viết domain
