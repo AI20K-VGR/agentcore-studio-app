@@ -345,8 +345,11 @@ async def test_recipe_construction_via_real_builder(monkeypatch: pytest.MonkeyPa
     recipe = stub.recipes[0]
     assert recipe.tenant_id == TENANT_ID
     assert recipe.agent_id == "agent-callisto-d4"
+    # `section_roles` round-trip giờ quan sát được qua `kb_binding.scope` (builder KHÔNG còn ghi
+    # nó vào `node.params` — hardening #122, `interpreter.run()` luôn ghi đè bằng session).
+    assert recipe.kb_binding.scope == "t/public,finance"
     kb_node = next(n for n in recipe.dag.nodes if n.type.value == "kb-retrieve")
-    assert kb_node.params["section_roles"] == ["public", "finance"]
+    assert "section_roles" not in kb_node.params
     assert kb_node.params["query"] == "q?"
 
 
@@ -357,8 +360,9 @@ async def test_recipe_construction_empty_roles(monkeypatch: pytest.MonkeyPatch) 
     await runner.run_case(agent_id="a", query="q?", tenant_id=TENANT_ID, section_roles=[])
 
     assert stub.recipes[0].agent_id == "a"  # passthrough khi non-empty (mutation-check T-2)
+    assert stub.recipes[0].kb_binding.scope == "t/"
     kb_node = next(n for n in stub.recipes[0].dag.nodes if n.type.value == "kb-retrieve")
-    assert kb_node.params["section_roles"] == []
+    assert "section_roles" not in kb_node.params
 
 
 # ---------------------------------------------------------------------------

@@ -21,11 +21,14 @@ from typing import Any
 
 from psycopg import AsyncConnection, sql
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
+from studio_workbench.tenant_wall import ResolvedContext
 
 from studio_app.core._db import get_pool
+from studio_app.jwt_auth import InvalidTokenError, verify_token
 
 _request_conn: ContextVar[AsyncConnection[Any] | None] = ContextVar("_request_conn", default=None)
+_request_session: ContextVar[ResolvedContext | None] = ContextVar("_request_session", default=None)
 
 
 def get_request_connection() -> AsyncConnection[Any]:
@@ -36,6 +39,27 @@ def get_request_connection() -> AsyncConnection[Any]:
     if conn is None:
         raise RuntimeError("no request-scoped connection — tenant_context_middleware did not run")
     return conn
+
+
+def get_request_session() -> ResolvedContext:
+    """Return the current request's resolved identity (tenant_id/user/roles) — the value
+    `x-demo-session` (see `_resolve_demo_session` below) produced via
+    `studio_workbench.tenant_wall.resolve_session`. Call ONLY from within a request scope that
+    actually carried `x-demo-session` — raises otherwise (fail-closed: a caller must never
+    silently fall back to an unauthenticated/empty session), same contract as
+    `get_request_connection()` above.
+
+    Distinct from `get_request_connection()`'s tenant (which may come from the OLDER
+    `x-tenant-id` dev-stub path when `x-demo-session` is absent — see
+    `tenant_context_middleware`): routes that need `user`/`roles`, not just `tenant_id` for
+    `SET LOCAL`, must go through this function, never re-derive identity themselves."""
+    session = _request_session.get()
+    if session is None:
+        raise RuntimeError(
+            "no request-scoped session — request did not carry `x-demo-session` "
+            "(tenant_context_middleware only sets this when that header is present)"
+        )
+    return session
 
 
 async def _resolve_tenant_id(request: Request, conn: AsyncConnection[Any]) -> str | None:
@@ -67,10 +91,43 @@ async def _resolve_tenant_id(request: Request, conn: AsyncConnection[Any]) -> st
     return str(row[0]) if row is not None else None
 
 
+def _resolve_jwt_session(request: Request) -> ResolvedContext | None:
+    """`Authorization: Bearer <token>` seam (Kế hoạch 2, A1) — the counterpart of
+    `_resolve_tenant_id`'s `x-tenant-id`, ADDED alongside it (not replacing it — the older path
+    stays intact for `tests/test_middleware.py`), so an existing caller sending only
+    `x-tenant-id` keeps working unchanged while a new caller carrying a token issued by `POST
+    /api/auth/demo-login` (`routes/auth.py::demo_login`) gets its FULL identity
+    ({tenant_id, user, roles}) verified in one step.
+
+    Delegates to `jwt_auth.verify_token` (real signature check, HS256 against
+    `settings.jwt_secret`) — no re-implementation of JWT verification here.
+
+    No `Authorization` header → `None` (fall through to the older `x-tenant-id` path, never an
+    error — a caller with no token at all is not the same failure mode as a caller with a BROKEN
+    token). A header that IS present but fails verification (bad signature, expired, malformed)
+    raises `InvalidTokenError`, caught by `tenant_context_middleware` below and turned into a
+    401 — "present but broken" must be loud, never silently fall back to a weaker path."""
+    raw = request.headers.get("authorization")
+    if not raw or not raw.lower().startswith("bearer "):
+        return None
+    token = raw[len("bearer ") :].strip()
+    return verify_token(token)
+
+
 async def tenant_context_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+    try:
+        session = _resolve_jwt_session(request)
+    except InvalidTokenError as exc:
+        return JSONResponse(status_code=401, content={"detail": str(exc)})
+
     pool = await get_pool()
     async with pool.connection() as conn:
-        tenant_id = await _resolve_tenant_id(request, conn)
+        if session is not None:
+            tenant_id: str | None = str(session.tenant_id)
+            session_token = _request_session.set(session)
+        else:
+            tenant_id = await _resolve_tenant_id(request, conn)
+            session_token = None
         if tenant_id is not None:
             # SET LOCAL does not accept bind parameters over the wire protocol (it is a utility
             # statement, not a DML query) — sql.Literal safely inline-quotes the value instead.
@@ -80,4 +137,6 @@ async def tenant_context_middleware(request: Request, call_next: Callable[[Reque
             response = await call_next(request)
         finally:
             _request_conn.reset(token)
+            if session_token is not None:
+                _request_session.reset(session_token)
     return response
