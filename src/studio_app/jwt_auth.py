@@ -17,6 +17,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
+import bcrypt
 import jwt
 from studio_workbench.tenant_wall import ResolvedContext
 
@@ -64,3 +65,16 @@ def verify_token(token: str) -> ResolvedContext:
         raise InvalidTokenError(f"JWT thiếu/sai claim bắt buộc: {exc}") from exc
 
     return ResolvedContext(tenant_id=tenant_id, user=user, roles=roles)
+
+
+def hash_password(plain: str) -> str:
+    """Băm mật khẩu bằng bcrypt (cost mặc định 12, đủ chậm chống brute-force mà không làm login
+    chậm cảm nhận được). Kết quả là chuỗi tự chứa salt — không cần lưu salt riêng."""
+    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(plain: str, password_hash: str) -> bool:
+    """So mật khẩu client gửi với hash đã lưu. Trả `bool` thuần (không raise) — sai mật khẩu là
+    kết quả BÌNH THƯỜNG của việc gõ nhầm, không phải lỗi hệ thống, khác hẳn `verify_token` (JWT
+    sai/hết hạn luôn là bất thường, phải raise `InvalidTokenError`)."""
+    return bcrypt.checkpw(plain.encode("utf-8"), password_hash.encode("utf-8"))

@@ -18,6 +18,7 @@ dependencies = [
     "loguru>=0.7",
     "httpx>=0.28",
     "pyjwt>=2.7",
+    "bcrypt>=4.1",
 ]
 
 # Declared now (F7) so P9's observability wiring and Gemini LLM-provider wiring never need

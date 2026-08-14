@@ -40,6 +40,30 @@ CREATE TABLE IF NOT EXISTS core.tenants (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Auth thật (Kế hoạch 3, kế bên _DEMO_ACCOUNTS — hai đường song song, không thay thế nhau, xem
+-- routes/auth.py). Không RLS theo tenant_id (khác wb.recipes/kb.chunks): bước LOGIN tra email
+-- xảy ra TRƯỚC KHI biết tenant nào (gà-trứng — chưa đăng nhập thì chưa có app.tenant_id để RLS
+-- lọc theo). Ranh giới "admin công ty chỉ quản được user tenant mình" enforce ở tầng application
+-- (routes/admin.py so session.tenant_id), không phải DB — cùng cách core.tenants đang xử lý.
+-- password_hash KHÔNG BAO GIỜ được đọc lại vào response (routes/admin.py, jwt_auth.py).
+--
+-- tenant_id CỐ Ý NOT NULL, kể cả cho superadmin — không nullable. ResolvedContext/tenant_wall.py/
+-- RLS ở MỌI bảng khác (wb.*, kb.*, eval.*) đều giả định tenant_id luôn có giá trị; nullable sẽ
+-- kéo theo sửa dây chuyền ra ngoài apps/studio, rủi ro cao cho lợi ích nhỏ. Thay vào đó, superadmin
+-- thuộc về 1 tenant HỆ THỐNG đặc biệt (core.tenants.name = '__system__', seed_superadmin.py tạo
+-- nếu chưa có) — không phải công ty thật, không route nghiệp vụ nào đọc dữ liệu dưới tenant này,
+-- nên `SET LOCAL app.tenant_id` = tenant hệ thống lúc superadmin đăng nhập là vô hại (RLS các bảng
+-- nghiệp vụ trả 0 dòng cho tenant đó — đúng, vì không có dữ liệu thật nào gắn tenant này).
+CREATE TABLE IF NOT EXISTS core.users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES core.tenants(id),
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    roles TEXT[] NOT NULL DEFAULT '{}',
+    created_by UUID NULL REFERENCES core.users(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS core.jobs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id UUID NOT NULL,
