@@ -28,7 +28,7 @@ from pydantic import BaseModel
 from studio_workbench.tenant_wall import resolve_session
 
 from studio_app.core._db import get_pool
-from studio_app.jwt_auth import issue_token, verify_password
+from studio_app.jwt_auth import DUMMY_PASSWORD_HASH, issue_token, verify_password
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -145,7 +145,14 @@ async def login(body: LoginRequest) -> LoginResponse:
 
     Không tiết lộ "email không tồn tại" vs "sai mật khẩu" qua status code khác nhau (cả hai đều
     401) — tránh cho kẻ tấn công dò được danh sách email tồn tại trong hệ thống bằng cách thử
-    từng email (user enumeration qua timing/status code)."""
+    từng email (user enumeration qua timing/status code).
+
+    **Cả hai nhánh (email tồn tại/không) LUÔN gọi `verify_password()` đúng 1 lần** — nếu để
+    `row is None` short-circuit trước khi gọi (như `or` thường làm), nhánh "không tồn tại" trả về
+    gần như tức thì trong khi nhánh "tồn tại nhưng sai mật khẩu" tốn ~1 lần bcrypt (~hàng trăm ms)
+    — thời gian phản hồi tự nó là oracle, độc lập với status code đã đóng ở trên (review `app#17`,
+    Chặn 2, nửa "timing"). Dùng `jwt_auth.DUMMY_PASSWORD_HASH` khi không tìm thấy email để giữ chi
+    phí bcrypt như nhau ở cả hai nhánh."""
     pool = await get_pool()
     async with pool.connection() as conn:
         cur = await conn.execute(
@@ -154,7 +161,9 @@ async def login(body: LoginRequest) -> LoginResponse:
         )
         row = await cur.fetchone()
 
-    if row is None or not verify_password(body.password, row[1]):
+    password_hash = row[1] if row is not None else DUMMY_PASSWORD_HASH
+    password_ok = verify_password(body.password, password_hash)
+    if row is None or not password_ok:
         raise HTTPException(status_code=401, detail="Email hoặc mật khẩu không đúng.")
 
     tenant_id, _password_hash, roles = row

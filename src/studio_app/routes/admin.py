@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import psycopg.errors
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from studio_kb.doc_factory import SECTION_VOCAB
 from studio_workbench.tenant_wall import ResolvedContext
 
@@ -30,6 +30,16 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 # `roles` hợp lệ khi COMPANY-ADMIN tạo user — KHÔNG có "superadmin" (chỉ superadmin mới phong
 # được superadmin, và hiện tại không route nào cho phép — cố tình, xem module docstring).
 _USER_ROLE_VOCAB: frozenset[str] = SECTION_VOCAB | {"admin"}
+
+
+def _reject_oversized_password(v: str) -> str:
+    """bcrypt chỉ băm được tối đa 72 BYTE (không phải 72 ký tự — 1 ký tự có dấu tiếng Việt có thể
+    chiếm 2-3 byte UTF-8), vượt quá sẽ raise `ValueError` bên trong `hash_password` -> 500 không
+    bắt được ở tầng route. Chặn ở Pydantic validator (422, không phải 500) — review `app#17`, nửa
+    "create" của Chặn 2 (nửa "login" đã chặn riêng ở `jwt_auth.verify_password`)."""
+    if len(v.encode("utf-8")) > 72:
+        raise ValueError("mật khẩu tối đa 72 byte (giới hạn bcrypt)")
+    return v
 
 
 def require_superadmin(session: ResolvedContext) -> None:
@@ -49,6 +59,8 @@ class CreateCompanyRequest(BaseModel):
     admin_email: str
     admin_password: str = Field(min_length=8)
 
+    _validate_admin_password = field_validator("admin_password")(_reject_oversized_password)
+
 
 class CreateCompanyResponse(BaseModel):
     tenant_id: str
@@ -63,10 +75,13 @@ async def create_company(body: CreateCompanyRequest) -> CreateCompanyResponse:
 
     pool = await get_pool()
     async with pool.connection() as conn:
-        cur = await conn.execute(
-            "INSERT INTO core.tenants (name) VALUES (%s) RETURNING id",
-            (body.company_name,),
-        )
+        try:
+            cur = await conn.execute(
+                "INSERT INTO core.tenants (name) VALUES (%s) RETURNING id",
+                (body.company_name,),
+            )
+        except psycopg.errors.UniqueViolation as exc:  # trùng company_name — 409, không 500
+            raise HTTPException(status_code=409, detail=f"công ty {body.company_name!r} đã tồn tại") from exc
         row = await cur.fetchone()
         assert row is not None
         tenant_id = row[0]
@@ -75,10 +90,14 @@ async def create_company(body: CreateCompanyRequest) -> CreateCompanyResponse:
         # (đúng mẫu admin@ankor.vn/borea.vn hiện có ở _DEMO_ACCOUNTS — admin công ty cần đọc
         # được mọi tài liệu để cấu hình agent, khác nhân viên phòng ban chỉ cần role của mình).
         admin_roles = ["admin", *sorted(SECTION_VOCAB)]
-        await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles, created_by) VALUES (%s, %s, %s, %s, %s)",
-            (tenant_id, body.admin_email, hash_password(body.admin_password), admin_roles, None),
-        )
+        try:
+            await conn.execute(
+                "INSERT INTO core.users (tenant_id, email, password_hash, roles, created_by) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (tenant_id, body.admin_email, hash_password(body.admin_password), admin_roles, None),
+            )
+        except psycopg.errors.UniqueViolation as exc:  # trùng admin_email — 409, không 500
+            raise HTTPException(status_code=409, detail=f"email {body.admin_email!r} đã tồn tại") from exc
 
     return CreateCompanyResponse(tenant_id=str(tenant_id), admin_email=body.admin_email)
 
@@ -92,6 +111,8 @@ class CreateUserRequest(BaseModel):
     # lý do `RunRequest` (`routes/runs.py:49-52`, INV-1): "request THẬM CHÍ KHÔNG THỂ mang
     # trường đó, chứ không phải mang được nhưng bị bỏ qua".
 
+    _validate_password = field_validator("password")(_reject_oversized_password)
+
 
 class CreateUserResponse(BaseModel):
     user_id: str
@@ -104,6 +125,17 @@ class CreateUserResponse(BaseModel):
 async def create_user(body: CreateUserRequest) -> CreateUserResponse:
     session = get_request_session()
     require_admin(session)
+
+    if "admin" not in session.roles:
+        # Người gọi có "superadmin" nhưng KHÔNG có "admin" — tức chưa từng qua `create_company`,
+        # không thuộc công ty nào (session.tenant_id là tenant `__system__` bootstrap). Nếu cho
+        # tạo tiếp, user mới sẽ rơi vào `__system__` một cách âm thầm — không phải lỗ hổng, nhưng
+        # là footgun im lặng (review `app#17`, "nên sửa" #3). Superadmin phải tạo công ty trước.
+        raise HTTPException(
+            status_code=400,
+            detail="Superadmin không thuộc công ty nào — dùng POST /api/admin/companies để tạo "
+            "công ty (và admin đầu tiên) trước khi tạo thêm user.",
+        )
 
     invalid_roles = set(body.roles) - _USER_ROLE_VOCAB
     if invalid_roles:
@@ -120,7 +152,19 @@ async def create_user(body: CreateUserRequest) -> CreateUserResponse:
             (session.user,),
         )
         creator_row = await cur.fetchone()
-        created_by = creator_row[0] if creator_row is not None else None
+        if creator_row is None:
+            # Người gọi có role "admin" trong JWT nhưng KHÔNG có dòng nào trong `core.users` — JWT
+            # đó chỉ có thể đến từ `demo-login` (registry cứng `_DEMO_ACCOUNTS`, không mật khẩu),
+            # KHÔNG phải từ `core.users` thật. Không chặn ở đây thì `demo-login` (không cần mật
+            # khẩu) mint được tài khoản thật bền vững qua route này — lỗ hổng leo quyền thật, review
+            # `app#17` Chặn 1. Mọi admin/superadmin thật (tạo qua `seed_superadmin.py` hoặc
+            # `create_company`) LUÔN có dòng trong `core.users`, nên chặn này không ảnh hưởng họ.
+            raise HTTPException(
+                status_code=403,
+                detail="Tài khoản gọi API không tồn tại trong core.users — demo-login không được "
+                "dùng để tạo tài khoản thật.",
+            )
+        created_by = creator_row[0]
 
         try:
             cur = await conn.execute(

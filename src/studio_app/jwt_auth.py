@@ -26,6 +26,34 @@ from studio_app.settings import get_settings
 _ALGORITHM = "HS256"
 
 
+def hash_password(plain: str) -> str:
+    """Băm mật khẩu bằng bcrypt (cost mặc định 12, đủ chậm chống brute-force mà không làm login
+    chậm cảm nhận được). Kết quả là chuỗi tự chứa salt — không cần lưu salt riêng."""
+    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(plain: str, password_hash: str) -> bool:
+    """So mật khẩu client gửi với hash đã lưu. Trả `bool` thuần (không raise) — sai mật khẩu là kết
+    quả BÌNH THƯỜNG của việc gõ nhầm, không phải lỗi hệ thống, khác hẳn `verify_token` (JWT sai/hết
+    hạn luôn là bất thường, phải raise `InvalidTokenError`).
+
+    `bcrypt.checkpw` raise `ValueError` cho mật khẩu >72 byte thay vì trả `False` — nếu để lọt,
+    `routes/auth.py::login` sẽ 500 cho email tồn tại nhưng 401 cho email không tồn tại (short-circuit
+    trước khi gọi hàm này), lộ ra sự tồn tại của email qua status code (review `app#17`, Chặn 2).
+    Chặn ở đây — trước bcrypt, không phải trong route — để MỌI call site (login lẫn tương lai) đều
+    fail-closed giống nhau, không phải nhớ tự chặn ở từng nơi gọi."""
+    if len(plain.encode("utf-8")) > 72:
+        return False
+    return bcrypt.checkpw(plain.encode("utf-8"), password_hash.encode("utf-8"))
+
+
+# Hash cố định của 1 chuỗi không phải mật khẩu thật của ai — dùng khi email KHÔNG tồn tại, để
+# `login()` vẫn tốn đúng 1 lần bcrypt.checkpw() thay vì return sớm. Không làm điều này thì thời
+# gian phản hồi (~0ms return sớm vs ~200ms bcrypt thật) tự nó là oracle phân biệt email tồn tại
+# hay không, độc lập với status code (review `app#17`, Chặn 2, nửa "timing" của oracle).
+DUMMY_PASSWORD_HASH = hash_password("dummy-password-khong-phai-cua-ai-chi-de-can-bang-thoi-gian-bcrypt")
+
+
 class InvalidTokenError(Exception):
     """Token thiếu/sai chữ ký/hết hạn/thiếu claim bắt buộc — luôn fail-closed, không có nhánh
     "coi như hợp lệ" nào cho lỗi loại này."""
@@ -65,16 +93,3 @@ def verify_token(token: str) -> ResolvedContext:
         raise InvalidTokenError(f"JWT thiếu/sai claim bắt buộc: {exc}") from exc
 
     return ResolvedContext(tenant_id=tenant_id, user=user, roles=roles)
-
-
-def hash_password(plain: str) -> str:
-    """Băm mật khẩu bằng bcrypt (cost mặc định 12, đủ chậm chống brute-force mà không làm login
-    chậm cảm nhận được). Kết quả là chuỗi tự chứa salt — không cần lưu salt riêng."""
-    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-
-
-def verify_password(plain: str, password_hash: str) -> bool:
-    """So mật khẩu client gửi với hash đã lưu. Trả `bool` thuần (không raise) — sai mật khẩu là
-    kết quả BÌNH THƯỜNG của việc gõ nhầm, không phải lỗi hệ thống, khác hẳn `verify_token` (JWT
-    sai/hết hạn luôn là bất thường, phải raise `InvalidTokenError`)."""
-    return bcrypt.checkpw(plain.encode("utf-8"), password_hash.encode("utf-8"))
