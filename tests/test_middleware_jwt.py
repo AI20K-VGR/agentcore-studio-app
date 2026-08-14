@@ -39,8 +39,9 @@ _TENANT_ID = UUID("a0000000-0000-0000-0000-000000000001")
 
 
 def test_no_authorization_header_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Không có header -> None (rơi về đường `x-tenant-id` cũ), KHÔNG raise — khác hẳn "có header
-    nhưng hỏng"."""
+    """Không có header -> None, KHÔNG raise — khác hẳn "có header nhưng hỏng". `kit#129` §3.2:
+    đường `x-tenant-id` cũ đã bị xoá hẳn, None ở đây nghĩa là "chưa đăng nhập", không còn ý nghĩa
+    "rơi về đường dự phòng" nữa."""
     monkeypatch.setattr(jwt_auth, "get_settings", _settings)
     result = _resolve_jwt_session(_FakeRequest({}))  # type: ignore[arg-type]
     assert result is None
