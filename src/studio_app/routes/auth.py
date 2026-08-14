@@ -63,10 +63,11 @@ class DemoLoginResponse(BaseModel):
 
 
 async def _resolve_tenant_slug(raw: str) -> str | None:
-    """Tra `core.tenants` bằng id::text hoặc name — CÙNG logic `middleware.py::_resolve_tenant_id`
-    (không import lại hàm đó vì nó nhận `Request`+header, không phải 1 chuỗi thô từ body). Trả
-    `None` khi không tìm thấy (fail-closed — không đoán, không tạo tenant mới ở đây: seed tenant
-    là việc của `scripts/seed_demo_tenants.py`, không phải của route đăng nhập)."""
+    """Tra `core.tenants` bằng id::text hoặc name. Trước `kit#129` §3.2, cùng logic này còn sống ở
+    `middleware.py::_resolve_tenant_id` (đã xoá hẳn — đường `x-tenant-id` header không còn tồn
+    tại); hàm này KHÔNG bị đụng vì nó tra bằng chuỗi email-derived, không phải header client tự
+    khai trực tiếp. Trả `None` khi không tìm thấy (fail-closed — không đoán, không tạo tenant mới
+    ở đây: seed tenant là việc của `scripts/seed_demo_tenants.py`, không phải của route đăng nhập)."""
     pool = await get_pool()
     async with pool.connection() as conn:
         cur = await conn.execute(
