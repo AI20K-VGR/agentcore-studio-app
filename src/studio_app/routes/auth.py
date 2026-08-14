@@ -39,11 +39,11 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 # vì dict hardcode này, phần còn lại (`demo_login()` bên dưới, `AppShell::isAdmin` phía FE) không
 # cần đổi gì — cùng shape input/output.
 _DEMO_ACCOUNTS: dict[str, tuple[str, list[str]]] = {
-    "admin@ankor.vn": ("ankor", ["admin"]),
+    "admin@ankor.vn": ("ankor", ["admin", "public", "hr", "finance", "engineering"]),
     "hr@ankor.vn": ("ankor", ["hr"]),
     "finance@ankor.vn": ("ankor", ["finance"]),
     "guest@ankor.vn": ("ankor", []),
-    "admin@borea.vn": ("borea", ["admin"]),
+    "admin@borea.vn": ("borea", ["admin", "public", "hr", "finance", "engineering"]),
     "nhanvien@borea.vn": ("borea", ["public", "hr"]),
 }
 
