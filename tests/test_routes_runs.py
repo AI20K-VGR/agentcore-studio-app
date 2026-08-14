@@ -10,6 +10,7 @@ tay, đúng khuôn `test_middleware_jwt.py` đã dùng cho session, cộng `admi
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from contextvars import Token
 from uuid import UUID
 
 import pytest
@@ -52,7 +53,7 @@ async def _seed_tenant(admin_pool: Pool, name: str) -> UUID:
     return UUID(str(row[0]))
 
 
-def _set_session(tenant_id: UUID) -> object:
+def _set_session(tenant_id: UUID) -> Token[ResolvedContext | None]:
     """Set `_request_session` contextvar bằng tay — mô phỏng đúng việc `tenant_context_middleware`
     làm sau khi verify JWT thật, không cần dựng JWT vì đây không phải test của tầng chữ ký
     (`test_jwt_auth.py`/`test_middleware_jwt.py` đã phủ tầng đó)."""
