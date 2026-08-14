@@ -131,3 +131,40 @@ async def test_create_run_without_session_raises_401(admin_pool: Pool) -> None:
     with pytest.raises(HTTPException) as exc_info:
         await create_run(body)
     assert exc_info.value.status_code == 401
+
+
+def _threshold_body(success_threshold: float, citation_accuracy_threshold: float) -> dict[str, object]:
+    return {
+        "agent_id": "agent-threshold-probe",
+        "instructions": "irrelevant",
+        "model": "gemini-2.5-flash",
+        "tool_whitelist": ["kb_search"],
+        "kb_id": "kb-callisto-v1",
+        "scope": "ankor/public",
+        "nodes": _NODES,
+        "edges": _EDGES,
+        "success_threshold": success_threshold,
+        "citation_accuracy_threshold": citation_accuracy_threshold,
+    }
+
+
+def test_run_request_rejects_out_of_range_thresholds() -> None:
+    """`kit#129` §3.1, vấn đề A (VinSOC AV-203052) — trước bản vá, `RunRequest` nhận thẳng
+    `success_threshold`/`citation_accuracy_threshold` từ body, không kiểm gì: gửi `-999` được
+    chấp nhận, mọi agent qua `POST /api/runs`/`/evaluate`/`/publish` đều "đạt". Test ở CHÍNH
+    `RunRequest` (không cần DB/session) — lỗi phải bắt được ngay lúc Pydantic parse body, trước
+    khi route chạy dòng nào."""
+    from pydantic import ValidationError
+
+    for success, citation in ((-999.0, -999.0), (-0.01, 0.5), (0.5, 1.01), (2.0, 0.5)):
+        with pytest.raises(ValidationError):
+            RunRequest.model_validate(_threshold_body(success, citation))
+
+
+def test_run_request_accepts_threshold_boundaries() -> None:
+    """Đối xứng có chủ đích với bài trên: `0.0`/`1.0` HỢP LỆ (chấp mọi thứ / đòi tuyệt đối) —
+    giết mutant `ge→gt`/`le→lt`."""
+    for success, citation in ((0.0, 0.0), (1.0, 1.0), (0.9, 0.95)):
+        body = RunRequest.model_validate(_threshold_body(success, citation))
+        assert body.success_threshold == success
+        assert body.citation_accuracy_threshold == citation
