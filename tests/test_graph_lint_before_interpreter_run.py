@@ -71,7 +71,9 @@ def _iter_functions(tree: ast.Module) -> list[tuple[str, ast.AST]]:
     return out
 
 
-def _calls(func_node: ast.AST, *, name: str | None = None, attr: str | None = None, on: str | None = None) -> list[ast.Call]:
+def _calls(
+    func_node: ast.AST, *, name: str | None = None, attr: str | None = None, on: str | None = None
+) -> list[ast.Call]:
     """Mọi `ast.Call` bên trong `func_node` khớp `name(...)` (lời gọi trần, vd `graph_lint(recipe)`)
     hoặc `on.attr(...)` (lời gọi thuộc tính, vd `interpreter.run(...)`)."""
     found: list[ast.Call] = []
@@ -79,9 +81,7 @@ def _calls(func_node: ast.AST, *, name: str | None = None, attr: str | None = No
         if not isinstance(node, ast.Call):
             continue
         fn = node.func
-        if name is not None and isinstance(fn, ast.Name) and fn.id == name:
-            found.append(node)
-        elif (
+        if (name is not None and isinstance(fn, ast.Name) and fn.id == name) or (
             attr is not None
             and isinstance(fn, ast.Attribute)
             and fn.attr == attr
