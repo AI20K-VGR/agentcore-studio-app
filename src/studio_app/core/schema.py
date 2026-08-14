@@ -40,8 +40,9 @@ CREATE TABLE IF NOT EXISTS core.tenants (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Auth thật (Kế hoạch 3, kế bên _DEMO_ACCOUNTS — hai đường song song, không thay thế nhau, xem
--- routes/auth.py). Không RLS theo tenant_id (khác wb.recipes/kb.chunks): bước LOGIN tra email
+-- Auth thật (Kế hoạch 3, xem routes/auth.py) — đường đăng nhập DUY NHẤT (registry demo
+-- _DEMO_ACCOUNTS/demo-login đã bị xoá hẳn, không còn song song với đường này). Không RLS theo
+-- tenant_id (khác wb.recipes/kb.chunks): bước LOGIN tra email
 -- xảy ra TRƯỚC KHI biết tenant nào (gà-trứng — chưa đăng nhập thì chưa có app.tenant_id để RLS
 -- lọc theo). Ranh giới "admin công ty chỉ quản được user tenant mình" enforce ở tầng application
 -- (routes/admin.py so session.tenant_id), không phải DB — cùng cách core.tenants đang xử lý.

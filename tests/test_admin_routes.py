@@ -147,14 +147,17 @@ async def test_password_never_leaks_in_create_company_response(admin_pool: Pool)
     assert "password123" not in str(dumped)
 
 
-async def test_demo_login_derived_session_cannot_mint_real_user(admin_pool: Pool) -> None:
-    """Chặn 1, review `app#17`: JWT phát từ `demo-login` (registry `_DEMO_ACCOUNTS`, không mật
-    khẩu) mang role "admin" y hệt `admin@ankor.vn`, nhưng KHÔNG có dòng nào trong `core.users` —
-    khác hẳn admin thật (tạo qua `create_company`/`seed_superadmin.py`, LUÔN có dòng). Trước bản
-    vá, `created_by` fallback về `None` và INSERT chạy tiếp — ai gọi `demo-login` xong gọi route
-    này sẽ mint được tài khoản thật bền vững, mật khẩu tự chọn, kể cả role admin. Mô phỏng đúng
-    session mà `demo-login` phát cho `admin@ankor.vn`, KHÔNG seed `core.users` cho email đó."""
-    tenant_id = await _seed_tenant(admin_pool, "probe-demo-login-cannot-mint")
+async def test_session_without_core_users_row_cannot_create_user(admin_pool: Pool) -> None:
+    """Chặn 1, review `app#17` (lịch sử): lúc còn `demo-login` (đã xoá hẳn, xem `routes/auth.py`),
+    JWT phát từ đó mang role "admin" nhưng KHÔNG có dòng nào trong `core.users` — khác hẳn admin
+    thật (tạo qua `create_company`/`seed_superadmin.py`, LUÔN có dòng). Trước bản vá, `created_by`
+    fallback về `None` và INSERT chạy tiếp — lỗ hổng leo quyền thật qua route này.
+
+    Giờ `demo-login` không còn tồn tại nên luồng bình thường không tạo được session kiểu này nữa —
+    bài test set thẳng contextvar (`_set_session`, bỏ qua hẳn bước phát JWT) để giữ nguyên bài test
+    làm lưới an toàn cho mọi thay đổi tương lai ở `issue_token()`/`login()` (xem comment ở
+    `routes/admin.py::create_user`)."""
+    tenant_id = await _seed_tenant(admin_pool, "probe-session-without-core-users-row")
     token = _set_session(
         tenant_id=tenant_id,
         user="admin@ankor.vn",
@@ -163,7 +166,9 @@ async def test_demo_login_derived_session_cannot_mint_real_user(admin_pool: Pool
     try:
         with pytest.raises(HTTPException) as exc_info:
             await create_user(
-                CreateUserRequest(email="minted-by-demo-login@ankor.vn", password="password123", roles=["public"])
+                CreateUserRequest(
+                    email="minted-without-core-users-row@ankor.vn", password="password123", roles=["public"]
+                )
             )
         assert exc_info.value.status_code == 403
     finally:

@@ -1,15 +1,14 @@
-"""Ký/verify JWT cho identity `{tenant_id, user, roles}` (Kế hoạch 2, A1/A2).
+"""Ký/verify JWT cho identity `{tenant_id, user, roles}`, cộng `hash_password()`/`verify_password()`
+(bcrypt) dùng chung cho cả login lẫn tạo tài khoản (Kế hoạch 3).
 
-Đây là phần "JWT THẬT" theo đúng nghĩa mật mã học — chữ ký được verify bằng `settings.jwt_secret`
-(HS256), một request không có khoá bí mật đó KHÔNG THỂ tự chế ra 1 token hợp lệ, khác hẳn bản demo
-cũ (tin thẳng JSON client gửi, không ký gì cả).
+Chữ ký được verify bằng `settings.jwt_secret` (HS256) — một request không có khoá bí mật đó KHÔNG
+THỂ tự chế ra 1 token hợp lệ.
 
-**Ranh giới cần nói rõ, không nhận vơ**: việc này KHÔNG phải "authentication thật" theo nghĩa đầy
-đủ — `issue_token()` (gọi từ `routes/auth.py::demo_login`) vẫn KÝ bất kỳ `tenant`/`user`/`roles`
-nào caller đưa vào, không có bước kiểm mật khẩu/OAuth/identity-provider nào đứng trước. Nói cách
-khác: đã đóng được câu hỏi "ai đó có thể GIẢ MẠO token của người khác không?" (KHÔNG, cần
-`jwt_secret`) nhưng CHƯA đóng câu hỏi "ai được phép TỰ XIN token cho tenant/user nào?" (câu đó cần
-1 identity provider thật — mật khẩu, SSO, ... — không có trong phạm vi hiện tại).
+`issue_token()` giờ CHỈ được gọi từ `routes/auth.py::login`, SAU KHI đã verify mật khẩu thật khớp
+`core.users.password_hash` — khác giai đoạn trước (`routes/auth.py::demo_login`, đã bị xoá hẳn),
+lúc đó `issue_token()` ký bất kỳ `tenant`/`user`/`roles` nào caller đưa vào, không có bước kiểm mật
+khẩu nào đứng trước. Câu hỏi "ai được phép TỰ XIN token cho tenant/user nào?" giờ đã đóng bằng mật
+khẩu thật, không còn là identity provider để trống như giai đoạn demo-login.
 """
 
 from __future__ import annotations

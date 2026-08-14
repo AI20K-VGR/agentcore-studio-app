@@ -1,12 +1,12 @@
 """`POST /api/admin/companies` + `POST /api/admin/users` (Kế hoạch 3) — 2 bậc quản trị của auth
-thật, kế bên `_DEMO_ACCOUNTS`/`demo-login` (không thay thế, xem `routes/auth.py`):
+thật (xem `routes/auth.py`). `_DEMO_ACCOUNTS`/`demo-login` đã bị xoá hẳn — đây giờ là con đường
+DUY NHẤT để có tài khoản đăng nhập được (mọi tài khoản, kể cả để dev/test, đều đi qua đây):
 
 - **superadmin** (bootstrap NGOÀI luồng API, `scripts/seed_superadmin.py`) tạo công ty mới
   (`core.tenants` row) + tài khoản admin ĐẦU TIÊN của công ty đó.
-- **company-admin** (do superadmin tạo, hoặc admin@ankor.vn/borea.vn kiểu cũ) tự tạo tài khoản
-  nhân viên cho ĐÚNG công ty mình — không có cách nào tạo cho tenant khác (`tenant_id` CỐ Ý
-  KHÔNG có field trong `CreateUserRequest`, copy nguyên văn pattern `RunRequest`/INV-1,
-  `routes/runs.py:49-52`).
+- **company-admin** (do superadmin tạo) tự tạo tài khoản nhân viên cho ĐÚNG công ty mình — không
+  có cách nào tạo cho tenant khác (`tenant_id` CỐ Ý KHÔNG có field trong `CreateUserRequest`, copy
+  nguyên văn pattern `RunRequest`/INV-1, `routes/runs.py:49-52`).
 
 `roles` client gửi lên LUÔN bị validate server-side `<= SECTION_VOCAB ∪ {"admin"}` — không tin
 riêng UI chặn (đúng bài học ngưỡng `[0,1]`, `kit#129` §3.1). `"superadmin"` KHÔNG nằm trong tập
@@ -86,9 +86,9 @@ async def create_company(body: CreateCompanyRequest) -> CreateCompanyResponse:
         assert row is not None
         tenant_id = row[0]
 
-        # roles mặc định của admin công ty ĐẦU TIÊN: "admin" (mở canvas) + đủ 4 role nội dung
-        # (đúng mẫu admin@ankor.vn/borea.vn hiện có ở _DEMO_ACCOUNTS — admin công ty cần đọc
-        # được mọi tài liệu để cấu hình agent, khác nhân viên phòng ban chỉ cần role của mình).
+        # roles mặc định của admin công ty ĐẦU TIÊN: "admin" (mở canvas) + đủ 4 role nội dung —
+        # admin công ty cần đọc được mọi tài liệu để cấu hình agent, khác nhân viên phòng ban chỉ
+        # cần role của mình.
         admin_roles = ["admin", *sorted(SECTION_VOCAB)]
         try:
             await conn.execute(
@@ -153,16 +153,16 @@ async def create_user(body: CreateUserRequest) -> CreateUserResponse:
         )
         creator_row = await cur.fetchone()
         if creator_row is None:
-            # Người gọi có role "admin" trong JWT nhưng KHÔNG có dòng nào trong `core.users` — JWT
-            # đó chỉ có thể đến từ `demo-login` (registry cứng `_DEMO_ACCOUNTS`, không mật khẩu),
-            # KHÔNG phải từ `core.users` thật. Không chặn ở đây thì `demo-login` (không cần mật
-            # khẩu) mint được tài khoản thật bền vững qua route này — lỗ hổng leo quyền thật, review
-            # `app#17` Chặn 1. Mọi admin/superadmin thật (tạo qua `seed_superadmin.py` hoặc
-            # `create_company`) LUÔN có dòng trong `core.users`, nên chặn này không ảnh hưởng họ.
+            # Phòng thủ theo chiều sâu: người gọi có role "admin"/"superadmin" trong JWT hợp lệ
+            # (chữ ký đúng) nhưng KHÔNG có dòng nào trong `core.users` — hiện tại `issue_token()`
+            # chỉ được gọi từ `login()` SAU KHI verify mật khẩu khớp 1 dòng `core.users` thật, nên
+            # nhánh này không còn đường nào tới được trong luồng bình thường (khác giai đoạn còn
+            # `demo-login`, khi đây là lỗ hổng leo quyền thật — review `app#17` Chặn 1: JWT từ
+            # `demo-login` không cần mật khẩu vẫn mint được tài khoản thật bền vững qua route này).
+            # Giữ lại chặn này làm lưới an toàn cho mọi thay đổi tương lai ở `issue_token()`/`login()`.
             raise HTTPException(
                 status_code=403,
-                detail="Tài khoản gọi API không tồn tại trong core.users — demo-login không được "
-                "dùng để tạo tài khoản thật.",
+                detail="Tài khoản gọi API không tồn tại trong core.users.",
             )
         created_by = creator_row[0]
 
