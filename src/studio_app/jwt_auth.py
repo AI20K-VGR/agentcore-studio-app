@@ -48,9 +48,14 @@ def verify_password(plain: str, password_hash: str) -> bool:
 
 # Hash cố định của 1 chuỗi không phải mật khẩu thật của ai — dùng khi email KHÔNG tồn tại, để
 # `login()` vẫn tốn đúng 1 lần bcrypt.checkpw() thay vì return sớm. Không làm điều này thì thời
-# gian phản hồi (~0ms return sớm vs ~200ms bcrypt thật) tự nó là oracle phân biệt email tồn tại
-# hay không, độc lập với status code (review `app#17`, Chặn 2, nửa "timing" của oracle).
-DUMMY_PASSWORD_HASH = hash_password("dummy-password-khong-phai-cua-ai-chi-de-can-bang-thoi-gian-bcrypt")
+# gian phản hồi (~0ms return sớm vs ~200-370ms bcrypt thật) tự nó là oracle phân biệt email tồn
+# tại hay không, độc lập với status code (review `app#17`, Chặn 2, nửa "timing" của oracle).
+#
+# Giá trị VIẾT TAY sẵn (không gọi `hash_password()` lúc import module) — review đợt 2 của `app#17`
+# chỉ ra: gọi `hash_password()` ở top-level module tốn ~200-370ms bcrypt THẬT ngay lúc import (mỗi
+# lần process khởi động/mỗi lần pytest collect module này), không cần thiết vì giá trị không đổi
+# giữa các lần chạy — chỉ cần MỘT hash bcrypt hợp lệ bất kỳ, không cần khớp lại plaintext nào.
+DUMMY_PASSWORD_HASH = "$2b$12$Ga5KFrUJZMsc8/kd1gTe/u9XnMi3uDM5tWUSbZUaM2V5qPr0paoAa"
 
 
 class InvalidTokenError(Exception):

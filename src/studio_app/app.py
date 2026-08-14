@@ -20,8 +20,11 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from studio_app.core._db import close_pools, get_admin_pool
 from studio_app.core.schema import ensure_all_schemas, grant_app_privileges
@@ -31,6 +34,33 @@ from studio_app.routes import auth as auth_routes
 from studio_app.routes import chat as chat_routes
 from studio_app.routes import publish as publish_routes
 from studio_app.routes import runs as runs_routes
+
+# `CreateUserRequest.password`/`CreateCompanyRequest.admin_password` — tên field CÓ mật khẩu, ở
+# BẤT KỲ route nào tương lai thêm field mật khẩu mới cũng nên đặt tên khớp 1 trong 2 chuỗi này
+# (hoặc thêm vào tập) để được redact tự động, xem `_redact_sensitive_validation_errors` dưới đây.
+_SENSITIVE_FIELD_NAMES = frozenset({"password", "admin_password"})
+
+
+async def _redact_sensitive_validation_errors(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Handler mặc định của FastAPI cho `RequestValidationError` echo lại NGUYÊN GIÁ TRỊ client
+    gửi vào `detail[].input` (Pydantic v2 `errors()`, và `.ctx.error` cho validator tự viết như
+    `_reject_oversized_password` ở `routes/admin.py`) — với field `password`/`admin_password`,
+    nghĩa là response 422 chứa THẲNG mật khẩu client vừa gõ. Response body 422 rất dễ bị log lại
+    (reverse-proxy access log, APM, devtools/HAR của bất kỳ ai bắt request) — đúng loại lỗ mà PR
+    này đang cố đóng (Chặn 1/2, `app#17`), nhưng lại mở ra qua chính đường vá (review `app#17`,
+    đợt 2, mục Critical #1). Chặn bằng cách bỏ `input`/`ctx` khỏi MỌI error item có field nhạy cảm
+    trong `loc`, giữ nguyên cho field khác — người dùng vẫn biết field nào sai, chỉ không thấy lại
+    giá trị mật khẩu."""
+    del request
+    redacted = []
+    for error in exc.errors():
+        error_dict = dict(error)
+        loc = error_dict.get("loc", ())
+        if any(str(part) in _SENSITIVE_FIELD_NAMES for part in loc):
+            error_dict.pop("input", None)
+            error_dict.pop("ctx", None)
+        redacted.append(error_dict)
+    return JSONResponse(status_code=422, content=jsonable_encoder({"detail": redacted}))
 
 
 @asynccontextmanager
@@ -49,6 +79,11 @@ def create_app() -> FastAPI:
     """Build the FastAPI app: lifespan boots DDL+grants via the admin pool; middleware holds one
     tenant-scoped connection per request via contextvar (F9)."""
     app = FastAPI(title="AgentCore Studio", lifespan=_lifespan)
+    # mypy: stub của Starlette khai `add_exception_handler` nhận handler cho `Exception` chung,
+    # không suy được kiểu hẹp hơn `RequestValidationError` dù đây là cách dùng CHÍNH THỐNG của
+    # FastAPI (`@app.exception_handler(RequestValidationError)` cũng cùng 1 signature) — cùng lớp
+    # false-positive đã gặp ở `test_admin_routes.py`'s `# type: ignore[arg-type]` cho ContextVar.
+    app.add_exception_handler(RequestValidationError, _redact_sensitive_validation_errors)  # type: ignore[arg-type]
     # DEV-TIME — cho phép `apps/web` (Vite, cổng KHÁC — 5173 — nên trình duyệt coi là origin
     # khác) gọi được API này. `dev_playground_server.py` (server tạm cũ) cũng tự set
     # `Access-Control-Allow-Origin: *` cho đúng lý do này — không phải phát minh mới, chỉ là

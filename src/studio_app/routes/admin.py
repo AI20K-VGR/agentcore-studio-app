@@ -18,6 +18,7 @@ from __future__ import annotations
 import psycopg.errors
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, field_validator
+from starlette.concurrency import run_in_threadpool
 from studio_kb.doc_factory import SECTION_VOCAB
 from studio_workbench.tenant_wall import ResolvedContext
 
@@ -73,8 +74,26 @@ async def create_company(body: CreateCompanyRequest) -> CreateCompanyResponse:
     session = get_request_session()
     require_superadmin(session)
 
+    # bcrypt là CPU-bound đồng bộ (~200-370ms) — chạy qua threadpool để không chặn event loop, và
+    # tính TRƯỚC khi mở connection để không giữ 1 connection Postgres suốt thời gian băm (review
+    # `app#17`, đợt 2, mục 4).
+    admin_password_hash = await run_in_threadpool(hash_password, body.admin_password)
+
     pool = await get_pool()
     async with pool.connection() as conn:
+        cur = await conn.execute("SELECT id FROM core.users WHERE email = %s", (session.user,))
+        creator_row = await cur.fetchone()
+        if creator_row is None:
+            # Cùng lưới an toàn với `create_user` bên dưới (Chặn 1, review `app#17`) — trước bản
+            # vá đợt 2, route này KHÔNG có chặn này: 1 JWT superadmin còn hạn (mặc định 480 phút)
+            # nhưng tài khoản đã bị xoá khỏi `core.users` (offboard) vẫn tạo được công ty + admin
+            # mới — token hết hạn hay account bị xoá không đồng nghĩa nhau nếu không kiểm lại DB.
+            raise HTTPException(
+                status_code=403,
+                detail="Tài khoản gọi API không tồn tại trong core.users.",
+            )
+        created_by = creator_row[0]
+
         try:
             cur = await conn.execute(
                 "INSERT INTO core.tenants (name) VALUES (%s) RETURNING id",
@@ -94,7 +113,7 @@ async def create_company(body: CreateCompanyRequest) -> CreateCompanyResponse:
             await conn.execute(
                 "INSERT INTO core.users (tenant_id, email, password_hash, roles, created_by) "
                 "VALUES (%s, %s, %s, %s, %s)",
-                (tenant_id, body.admin_email, hash_password(body.admin_password), admin_roles, None),
+                (tenant_id, body.admin_email, admin_password_hash, admin_roles, created_by),
             )
         except psycopg.errors.UniqueViolation as exc:  # trùng admin_email — 409, không 500
             raise HTTPException(status_code=409, detail=f"email {body.admin_email!r} đã tồn tại") from exc
@@ -144,6 +163,11 @@ async def create_user(body: CreateUserRequest) -> CreateUserResponse:
             detail=f"role {sorted(invalid_roles)} không hợp lệ — chỉ chấp nhận {sorted(_USER_ROLE_VOCAB)}",
         )
 
+    # bcrypt là CPU-bound đồng bộ (~200-370ms) — chạy qua threadpool để không chặn event loop, và
+    # tính TRƯỚC khi mở connection để không giữ 1 connection Postgres suốt thời gian băm (review
+    # `app#17`, đợt 2, mục 4).
+    password_hash = await run_in_threadpool(hash_password, body.password)
+
     pool = await get_pool()
     async with pool.connection() as conn:
         # session.tenant_id — KHÔNG đọc tenant_id từ body (body không có field đó).
@@ -170,7 +194,7 @@ async def create_user(body: CreateUserRequest) -> CreateUserResponse:
             cur = await conn.execute(
                 "INSERT INTO core.users (tenant_id, email, password_hash, roles, created_by) "
                 "VALUES (%s, %s, %s, %s, %s) RETURNING id",
-                (str(session.tenant_id), body.email, hash_password(body.password), body.roles, created_by),
+                (str(session.tenant_id), body.email, password_hash, body.roles, created_by),
             )
         except psycopg.errors.UniqueViolation as exc:  # email đã tồn tại — 409, không 500
             raise HTTPException(status_code=409, detail=f"email {body.email!r} đã tồn tại") from exc

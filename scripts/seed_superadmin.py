@@ -57,6 +57,16 @@ async def seed_superadmin() -> None:
             "STUDIO_SUPERADMIN_EMAIL và STUDIO_SUPERADMIN_PASSWORD chưa đặt — cần cả hai. "
             "Không có default (fail-loud): superadmin không được phép tạo bằng giá trị đoán được."
         )
+    # Cùng chính sách `CreateCompanyRequest.admin_password`/`CreateUserRequest.password`
+    # (`routes/admin.py`, `Field(min_length=8)` + guard 72 byte) — trước bản vá, script này KHÔNG
+    # kiểm gì cả, nên tài khoản quyền CAO NHẤT hệ thống lại có chính sách mật khẩu YẾU NHẤT (review
+    # `app#17` đợt 2, "nhẹ hơn nên biết"). >72 byte sẽ raise `ValueError` bên trong `hash_password`
+    # nếu để lọt xuống dưới — chặn ở đây, thông điệp rõ ràng, thay vì traceback khó hiểu.
+    password_bytes = len(password.encode("utf-8"))
+    if password_bytes < 8:
+        raise SystemExit("STUDIO_SUPERADMIN_PASSWORD tối thiểu 8 ký tự.")
+    if password_bytes > 72:
+        raise SystemExit("STUDIO_SUPERADMIN_PASSWORD tối đa 72 byte (giới hạn bcrypt).")
 
     admin = await get_admin_pool()
     await ensure_all_schemas(admin)  # đảm bảo core.users + core.tenants tồn tại trước khi INSERT

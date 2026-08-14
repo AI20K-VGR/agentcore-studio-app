@@ -122,3 +122,31 @@ async def test_login_rejects_oversized_password_with_401_not_500_for_unknown_ema
     with pytest.raises(HTTPException) as exc_info:
         await login(LoginRequest(email="khong-ton-tai-oversized@acme.com", password="a" * 73))
     assert exc_info.value.status_code == 401
+
+
+async def test_login_regression_verify_password_always_called_even_for_unknown_email(
+    admin_pool: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mutation-regression cho Chặn 2 nửa "timing" (review `app#17` đợt 2, mục 6): nếu ai revert
+    về `if row is None or not verify_password(...)` (short-circuit `or` — CHÍNH bug ban đầu bài
+    này vá), mọi test hiện tại (chỉ check status code, luôn 401 cả 2 nhánh) vẫn xanh, không bắt
+    được — vì status code không đổi, chỉ THỜI GIAN đổi. Bài này ghim trực tiếp HÀNH VI GỌI HÀM
+    (verify_password phải chạy đúng 1 lần dù email không tồn tại), không chỉ status code cuối."""
+    del admin_pool
+    monkeypatch.setattr(jwt_auth, "get_settings", _settings)
+
+    call_count = 0
+    real_verify_password = jwt_auth.verify_password
+
+    def _counting_verify_password(plain: str, password_hash: str) -> bool:
+        nonlocal call_count
+        call_count += 1
+        return real_verify_password(plain, password_hash)
+
+    monkeypatch.setattr("studio_app.routes.auth.verify_password", _counting_verify_password)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await login(LoginRequest(email="khong-ton-tai-regression@acme.com", password="whatever123"))
+
+    assert exc_info.value.status_code == 401
+    assert call_count == 1, "verify_password() phải được gọi ĐÚNG 1 lần kể cả khi email không tồn tại"

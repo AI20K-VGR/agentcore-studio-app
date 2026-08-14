@@ -39,6 +39,19 @@ async def _seed_tenant(admin_pool: Pool, name: str) -> UUID:
     return UUID(str(row[0]))
 
 
+async def _seed_superadmin_user(admin_pool: Pool, tenant_id: UUID, email: str) -> None:
+    """Cùng lý do `_seed_admin_user` bên dưới — `create_company` giờ CŨNG đòi `session.user` có
+    dòng thật trong `core.users` (review `app#17` đợt 2: route này trước đó KHÔNG có chặn này,
+    nên 1 JWT superadmin còn hạn của tài khoản đã bị xoá khỏi `core.users` vẫn tạo được công ty
+    mới). `tenant_id` ở đây chỉ cần THOẢ FK `core.users.tenant_id -> core.tenants(id)`, không cần
+    khớp tenant `__system__` thật — bài test không kiểm tenant của superadmin."""
+    async with admin_pool.connection() as conn:
+        await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            (str(tenant_id), email, "not-a-real-hash", ["superadmin"]),
+        )
+
+
 async def _seed_admin_user(admin_pool: Pool, tenant_id: UUID, email: str) -> None:
     """Chèn 1 dòng `core.users` thật cho người gọi — bắt buộc từ khi vá Chặn 1 (review `app#17`):
     `create_user` giờ đòi `session.user` phải có dòng trong `core.users`, không còn chấp nhận
@@ -130,8 +143,9 @@ async def test_non_admin_cannot_create_user(admin_pool: Pool) -> None:
 async def test_password_never_leaks_in_create_company_response(admin_pool: Pool) -> None:
     """`CreateCompanyResponse` không có field `admin_password`/`password_hash` — kiểm bằng
     model_dump() thay vì đọc mã bằng mắt (khoá cứng, không lệ thuộc ai đó nhớ không thêm lại)."""
-    del admin_pool
-    token = _set_session(tenant_id=UUID(int=0), user="su@sys", roles=["superadmin"])
+    tenant_id = await _seed_tenant(admin_pool, "probe-no-leak-superadmin-tenant")
+    await _seed_superadmin_user(admin_pool, tenant_id, "su@sys")
+    token = _set_session(tenant_id=tenant_id, user="su@sys", roles=["superadmin"])
     try:
         result = await create_company(
             CreateCompanyRequest(
@@ -175,6 +189,57 @@ async def test_session_without_core_users_row_cannot_create_user(admin_pool: Poo
         middleware._request_session.reset(token)  # type: ignore[arg-type]
 
 
+async def test_session_without_core_users_row_cannot_create_company(admin_pool: Pool) -> None:
+    """Important #2+#3, review `app#17` đợt 2: trước bản vá, `create_company` KHÔNG kiểm
+    `session.user` có tồn tại trong `core.users` không (khác `create_user` đã có chặn này từ đợt
+    1) — 1 JWT superadmin còn hạn (mặc định 480 phút, không có revocation) của tài khoản ĐÃ BỊ XOÁ
+    khỏi `core.users` (offboard) vẫn mint được tenant + admin mới có mật khẩu tự chọn. Cùng lưới an
+    toàn với `test_session_without_core_users_row_cannot_create_user` — set thẳng contextvar, bỏ
+    qua bước phát JWT, tenant chỉ cần thoả FK, không cần khớp `__system__` thật."""
+    tenant_id = await _seed_tenant(admin_pool, "probe-offboarded-superadmin-tenant")
+    token = _set_session(tenant_id=tenant_id, user="offboarded-su@sys", roles=["superadmin"])
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            await create_company(
+                CreateCompanyRequest(
+                    company_name="probe-offboarded-mint",
+                    admin_email="minted@offboarded.com",
+                    admin_password="password123",
+                )
+            )
+        assert exc_info.value.status_code == 403
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+
+async def test_create_company_sets_created_by_to_real_superadmin_id(admin_pool: Pool) -> None:
+    """Important #3, review `app#17` đợt 2: `created_by` của admin đầu tiên KHÔNG còn hardcode
+    `None` — phải khớp đúng `id` thật của superadmin đã gọi route, đóng provenance mà Chặn 1 muốn
+    đảm bảo (trước bản vá, mọi admin đầu tiên đều có `created_by IS NULL`, không phân biệt được
+    "bootstrap" với "superadmin thật tạo")."""
+    tenant_id = await _seed_tenant(admin_pool, "probe-created-by-tenant")
+    await _seed_superadmin_user(admin_pool, tenant_id, "su-created-by@sys")
+    token = _set_session(tenant_id=tenant_id, user="su-created-by@sys", roles=["superadmin"])
+    try:
+        await create_company(
+            CreateCompanyRequest(
+                company_name="probe-created-by-co", admin_email="admin@created-by.com", admin_password="password123"
+            )
+        )
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT u.created_by, su.id FROM core.users u, core.users su WHERE u.email = %s AND su.email = %s",
+            ("admin@created-by.com", "su-created-by@sys"),
+        )
+        row = await cur.fetchone()
+    assert row is not None
+    created_by, superadmin_id = row
+    assert created_by == superadmin_id
+
+
 async def test_superadmin_without_company_cannot_create_user() -> None:
     """Nên-sửa #3, review `app#17`: superadmin CHƯA tạo công ty nào (chỉ có role "superadmin",
     không có "admin") gọi thẳng `/api/admin/users` sẽ tạo user rơi vào tenant `__system__` một
@@ -206,8 +271,9 @@ async def test_create_company_duplicate_name_returns_409_not_500(admin_pool: Poo
     """`core.tenants.name` có UNIQUE — trước bản vá, `create_company` không bắt `UniqueViolation`
     nên trùng tên công ty (hoặc trùng `admin_email`, `core.users.email` cũng UNIQUE) ra 500, bất
     đối xứng với `create_user` ngay cạnh đã bắt đúng 409 (review `app#17`, "nên sửa" #1)."""
-    del admin_pool
-    token = _set_session(tenant_id=UUID(int=0), user="su@sys", roles=["superadmin"])
+    tenant_id = await _seed_tenant(admin_pool, "probe-dup-co-superadmin-tenant")
+    await _seed_superadmin_user(admin_pool, tenant_id, "su@sys")
+    token = _set_session(tenant_id=tenant_id, user="su@sys", roles=["superadmin"])
     try:
         await create_company(
             CreateCompanyRequest(
@@ -223,3 +289,37 @@ async def test_create_company_duplicate_name_returns_409_not_500(admin_pool: Poo
         assert exc_info.value.status_code == 409
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+
+async def test_create_company_duplicate_admin_email_returns_409_not_500(admin_pool: Pool) -> None:
+    """Đối trọng bài trên: `company_name` KHÁC nhau nhưng `admin_email` TRÙNG (`core.users.email`
+    cũng UNIQUE, độc lập với `core.tenants.name`) — review `app#17` đợt 2 chỉ ra bài trên chỉ phủ
+    nhánh trùng tên công ty, chưa có bài nào phủ nhánh trùng email dù docstring có nhắc tới. INSERT
+    tenant THÀNH CÔNG trước (tên khác), rồi mới vỡ ở INSERT user (email trùng) — phải rollback cả
+    tenant vừa tạo, không để lại 1 tenant mồ côi không có admin nào."""
+    tenant_id = await _seed_tenant(admin_pool, "probe-dup-email-superadmin-tenant")
+    await _seed_superadmin_user(admin_pool, tenant_id, "su-dup-email@sys")
+    token = _set_session(tenant_id=tenant_id, user="su-dup-email@sys", roles=["superadmin"])
+    try:
+        await create_company(
+            CreateCompanyRequest(
+                company_name="probe-dup-email-co-1", admin_email="shared-admin@dup.com", admin_password="password123"
+            )
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            await create_company(
+                CreateCompanyRequest(
+                    company_name="probe-dup-email-co-2",
+                    admin_email="shared-admin@dup.com",
+                    admin_password="password123",
+                )
+            )
+        assert exc_info.value.status_code == 409
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("SELECT count(*) FROM core.tenants WHERE name = %s", ("probe-dup-email-co-2",))
+        row = await cur.fetchone()
+    assert row is not None
+    assert row[0] == 0, "tenant thứ 2 phải bị rollback hoàn toàn, không để lại mồ côi"
