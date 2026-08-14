@@ -18,7 +18,7 @@ from studio_workbench.tenant_wall import ResolvedContext
 _TENANT_ID = UUID("a0000000-0000-0000-0000-000000000001")
 
 
-def _settings(*, secret: str = "test-secret", expire_minutes: int = 480) -> Settings:
+def _settings(*, secret: str = "test-secret-at-least-32-bytes-long", expire_minutes: int = 480) -> Settings:
     return Settings(
         database_url="postgresql://unused/unused",
         database_url_admin="postgresql://unused/unused",
@@ -45,11 +45,11 @@ def test_verify_rejects_wrong_secret(monkeypatch: pytest.MonkeyPatch) -> None:
     """KHÓA THẬT của "JWT thật": ký bằng khoá A, verify bằng khoá B (khác) -> PHẢI đỏ. Đây chính
     là bằng chứng "không ai giả mạo được token nếu không có `jwt_secret`" — nếu test này xanh mà
     lẽ ra phải đỏ, việc ký/verify không có tác dụng bảo vệ gì cả."""
-    monkeypatch.setattr(jwt_auth, "get_settings", lambda: _settings(secret="secret-A"))
+    monkeypatch.setattr(jwt_auth, "get_settings", lambda: _settings(secret="secret-A-at-least-32-bytes-long!!"))
     session = ResolvedContext(tenant_id=_TENANT_ID, user="attacker", roles=[])
     token = jwt_auth.issue_token(session)
 
-    monkeypatch.setattr(jwt_auth, "get_settings", lambda: _settings(secret="secret-B"))
+    monkeypatch.setattr(jwt_auth, "get_settings", lambda: _settings(secret="secret-B-at-least-32-bytes-long!!"))
     with pytest.raises(jwt_auth.InvalidTokenError):
         jwt_auth.verify_token(token)
 

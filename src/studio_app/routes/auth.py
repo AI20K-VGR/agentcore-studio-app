@@ -28,7 +28,7 @@ from pydantic import BaseModel
 from studio_workbench.tenant_wall import resolve_session
 
 from studio_app.core._db import get_pool
-from studio_app.jwt_auth import issue_token
+from studio_app.jwt_auth import issue_token, verify_password
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -112,6 +112,60 @@ async def demo_login(body: DemoLoginRequest) -> DemoLoginResponse:
 
     token = issue_token(resolved)
     return DemoLoginResponse(
+        access_token=token,
+        tenant_id=str(resolved.tenant_id),
+        user=resolved.user,
+        roles=resolved.roles,
+    )
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    tenant_id: str
+    user: str
+    roles: list[str]
+    """CỐ Ý không có `password`/`password_hash` ở bất kỳ đâu trong response — xem
+    `test_admin_routes.py::test_password_hash_never_leaks_in_any_admin_response`."""
+
+
+@router.post("/login", response_model=LoginResponse)
+async def login(body: LoginRequest) -> LoginResponse:
+    """Đăng nhập THẬT (Kế hoạch 3) — tra `core.users` bằng email + verify mật khẩu, khác hẳn
+    `demo_login()` (tra `_DEMO_ACCOUNTS` hardcode, không mật khẩu). Cả hai route CÙNG TỒN TẠI
+    song song — không thay thế nhau: `demo-login` tiện cho dev-stack test nhanh không cần seed
+    user thật, `login` là đường thật cho tài khoản do superadmin/company-admin tạo qua
+    `routes/admin.py`. Cùng `ResolvedContext`/JWT shape hệt `demo_login` — `middleware.py`/
+    `get_request_session()` không cần biết/đổi gì để phân biệt 2 đường này.
+
+    Không tiết lộ "email không tồn tại" vs "sai mật khẩu" qua status code khác nhau (cả hai đều
+    401) — tránh cho kẻ tấn công dò được danh sách email tồn tại trong hệ thống bằng cách thử
+    từng email (user enumeration qua timing/status code)."""
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT tenant_id, password_hash, roles FROM core.users WHERE email = %s",
+            (body.email,),
+        )
+        row = await cur.fetchone()
+
+    if row is None or not verify_password(body.password, row[1]):
+        raise HTTPException(status_code=401, detail="Email hoặc mật khẩu không đúng.")
+
+    tenant_id, _password_hash, roles = row
+    session: dict[str, Any] = {"tenant_id": str(tenant_id), "user": body.email, "roles": list(roles)}
+    try:
+        resolved = resolve_session(session)
+    except PermissionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    token = issue_token(resolved)
+    return LoginResponse(
         access_token=token,
         tenant_id=str(resolved.tenant_id),
         user=resolved.user,

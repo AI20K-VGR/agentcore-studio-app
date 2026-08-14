@@ -26,6 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from studio_app.core._db import close_pools, get_admin_pool
 from studio_app.core.schema import ensure_all_schemas, grant_app_privileges
 from studio_app.middleware import tenant_context_middleware
+from studio_app.routes import admin as admin_routes
 from studio_app.routes import auth as auth_routes
 from studio_app.routes import chat as chat_routes
 from studio_app.routes import publish as publish_routes
@@ -73,6 +74,7 @@ def create_app() -> FastAPI:
     # không tự chứa business logic (F3, đúng nguyên tắc "composition root wires, không viết domain
     # logic" đã ghi ở docstring module này).
     app.include_router(auth_routes.router)
+    app.include_router(admin_routes.router)
     app.include_router(runs_routes.router)
     app.include_router(publish_routes.router)
     app.include_router(chat_routes.router)

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -25,7 +26,16 @@ class Settings(BaseSettings):
     # token cho tenant/roles nào" vẫn CHƯA được xác thực — đó là hệ thống identity provider riêng,
     # ngoài phạm vi hiện tại. `jwt_secret` không có default: thiếu biến môi trường phải raise rõ
     # ràng lúc khởi động (pydantic ValidationError), không được chạy với khoá rỗng/đoán được.
-    jwt_secret: str
+    #
+    # `min_length=32` — kit#129 §3.3, mục #3 (VinSOC pentest, chưa ai nhận trước bản vá này):
+    # app khởi động bình thường với `STUDIO_JWT_SECRET=changeme` (default trong .env.example),
+    # chỉ cảnh báo "HMAC key 8 bytes" từ thư viện chứ không chặn — ai deploy thật quên đổi secret
+    # thì kẻ tấn công tự ký được JWT giả (biết trước default công khai trong repo). Verify JWT
+    # đã đúng chuẩn (alg=none/sai-secret/hết-hạn đều chặn — mentor xác nhận) — vấn đề CHỈ ở chỗ
+    # secret yếu không bị enforce. `min_length=32` chặn cả "changeme" (7 ký tự) lẫn mọi secret
+    # ngắn khác, không tách dev/prod (đã xác nhận .env.example thật + secret CI/test cục bộ đều
+    # ≥32 ký tự sẵn, enforce không phá gì đang chạy).
+    jwt_secret: str = Field(min_length=32)
     jwt_expire_minutes: int = 480
 
     gemini_api_key: str | None = None

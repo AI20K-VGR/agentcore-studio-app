@@ -31,7 +31,7 @@ def _settings() -> Settings:
     return Settings(
         database_url="postgresql://unused/unused",
         database_url_admin="postgresql://unused/unused",
-        jwt_secret="test-secret-middleware",
+        jwt_secret="test-secret-middleware-at-least-32-bytes",
     )
 
 
