@@ -44,8 +44,13 @@ class RunRequest(BaseModel):
     nodes: list[dict[str, Any]]
     edges: list[dict[str, Any]]
     golden_set_ref: str = "callisto-golden-30-v1"
-    success_threshold: float = 0.9
-    citation_accuracy_threshold: float = 0.95
+    # `ge=0.0, le=1.0` (kit#129 §3.1, vấn đề A, VinSOC AV-203052) — trước bản vá: client gửi
+    # `success_threshold: -999` được chấp nhận thẳng, mọi agent "đạt" bất kể chất lượng thật.
+    # Ràng buộc CHÍNH nằm ở contract (`ScorecardThreshold`, `create_dynamic_recipe` sẽ raise khi
+    # dựng recipe) — khai lại `Field` ở đây để FastAPI trả 422 SỚM (đúng lỗi input), thay vì để
+    # request đi hết `_evaluate()` rồi mới vỡ ở bước dựng recipe.
+    success_threshold: float = Field(default=0.9, ge=0.0, le=1.0)
+    citation_accuracy_threshold: float = Field(default=0.95, ge=0.0, le=1.0)
     # `tenant_id` CỐ Ý KHÔNG có field ở đây — request body không có chỗ nào để client khai nó;
     # tenant luôn tới từ `get_request_session()`, không phải body (đúng nguyên tắc "session luôn
     # thắng client tự khai" — INV-1 — nhưng ở đây còn mạnh hơn: request THẬM CHÍ KHÔNG THỂ mang
