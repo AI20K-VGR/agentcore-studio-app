@@ -38,11 +38,16 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 # thống tài khoản thật (phần "C" đã thống nhất làm sau): tra 1 bảng `core.users`/`wb.users` thay
 # vì dict hardcode này, phần còn lại (`demo_login()` bên dưới, `AppShell::isAdmin` phía FE) không
 # cần đổi gì — cùng shape input/output.
+# `app#13` (review DongAnh2704, D20): hr@/finance@ thiếu role `public` — mọi nhân viên phải đọc
+# được tài liệu chung công ty (`public` ∈ SECTION_VOCAB), chỉ nội dung PHÒNG BAN mới bị giới hạn.
+# `guest@` (0 role) thay bằng `intern@` (chỉ `public`) — thực tế hơn, vẫn giữ được ca "quyền tối
+# thiểu" mà không phải tài khoản 0 mục đích. Không FE/test nào tham chiếu `guest@` trước khi đổi
+# (đã grep xác nhận), nên đổi tên an toàn.
 _DEMO_ACCOUNTS: dict[str, tuple[str, list[str]]] = {
     "admin@ankor.vn": ("ankor", ["admin", "public", "hr", "finance", "engineering"]),
-    "hr@ankor.vn": ("ankor", ["hr"]),
-    "finance@ankor.vn": ("ankor", ["finance"]),
-    "guest@ankor.vn": ("ankor", []),
+    "hr@ankor.vn": ("ankor", ["public", "hr"]),
+    "finance@ankor.vn": ("ankor", ["public", "finance"]),
+    "intern@ankor.vn": ("ankor", ["public"]),
     "admin@borea.vn": ("borea", ["admin", "public", "hr", "finance", "engineering"]),
     "nhanvien@borea.vn": ("borea", ["public", "hr"]),
 }
