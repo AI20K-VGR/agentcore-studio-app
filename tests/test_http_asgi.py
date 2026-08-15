@@ -63,6 +63,19 @@ async def test_unauthenticated_admin_route_returns_401(client: AsyncClient, admi
     assert res.status_code == 401
 
 
+async def test_unauthenticated_users_route_returns_401(client: AsyncClient, admin_pool: Pool) -> None:
+    """`POST /api/admin/users` KHÔNG kèm `Authorization` -> 401 thật qua ASGI (review `app#17`,
+    "nên sửa" #2: trước bản vá này chỉ `/api/admin/companies` có test HTTP thật — route thứ hai,
+    `/api/admin/users`, chưa từng đi qua `ASGITransport`, chỉ được test bằng cách gọi thẳng hàm +
+    set ContextVar tay ở `test_admin_routes.py`)."""
+    del admin_pool
+    res = await client.post(
+        "/api/admin/users",
+        json={"email": "x@x.com", "password": "password123", "roles": ["public"]},
+    )
+    assert res.status_code == 401
+
+
 async def test_cors_header_present_on_error_response(client: AsyncClient, admin_pool: Pool) -> None:
     """Khoá đúng thứ tự middleware (`app.py:60-64`, review PR#5 DE M2). Dùng token HỎNG (không
     phải thiếu hẳn header) mới đúng kịch bản comment mô tả: `tenant_context_middleware` bắt
