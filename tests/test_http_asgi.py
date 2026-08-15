@@ -145,14 +145,70 @@ async def test_login_missing_email_422_does_not_echo_sibling_password(client: As
 
 async def test_login_array_body_422_does_not_echo_password(client: AsyncClient, admin_pool: Pool) -> None:
     """Critical, review `app#17` đợt 3 (lượt 2 — bản vá lượt 1 vẫn lọt): gửi THẲNG 1 JSON array
-    làm body thay vì object — Pydantic không tách được field nào (`loc=()`), `input` là NGUYÊN
-    list đó (thực nghiệm xác nhận: `LoginRequest.model_validate([...])` ra `{"loc": [],
-    "input": [...]}`) — bản vá lượt 1 (chỉ soi `input` khi là `dict`) bỏ lọt thẳng ca này. Fix:
-    `loc` rỗng luôn bị coi là nhạy cảm (`_error_touches_sensitive_field`, `app.py`)."""
+    làm body thay vì object — mật khẩu thật lộ nguyên trong `input` của error.
+
+    Docstring bài này TỪNG ghi sai (đợt 3): gọi thẳng `LoginRequest.model_validate([...])` (NGOÀI
+    FastAPI) cho `loc=[]` (rỗng hẳn), nên bản vá lượt 1 dùng tiêu chí `len(loc) == 0`. Nhưng qua
+    ĐƯỜNG HTTP THẬT (bài test này, `ASGITransport`, không gọi thẳng Pydantic) thực nghiệm cho kết
+    quả KHÁC hẳn — review `app#17` đợt 4 tự verify lại bằng code Python thật: FastAPI tự chèn
+    `"body"` làm phần tử ĐẦU của `loc` cho mọi lỗi validate body -> `loc=["body"]` (KHÔNG rỗng).
+    Nếu ai đó sửa `_error_touches_sensitive_field` (`app.py`) lại về đúng `len(loc) == 0` theo
+    docstring cũ, bài test NÀY vẫn xanh giả (vì assert chỉ check status+password, không tự ghim
+    lại hình dạng `loc`) trong khi lỗ mở lại — nên bài dưới đây ghim THÊM đúng hình dạng `loc` thật
+    (`["body"]`, 1 phần tử) để khoá lại, không chỉ khoá hành vi cuối (không lộ password)."""
     del admin_pool
     real_password = "array-body-real-password-do-not-leak"
     res = await client.post("/api/auth/login", json=["attacker@example.com", real_password])
     assert res.status_code == 422
+    assert real_password not in res.text
+    detail = res.json()["detail"]
+    assert detail, "phải có ít nhất 1 error item"
+    for error in detail:
+        assert error["loc"] == ["body"], f"loc thật qua HTTP là ['body'], không phải [] — thấy {error['loc']!r}"
+        assert "input" not in error
+        assert "ctx" not in error
+
+
+async def test_create_company_array_body_422_does_not_echo_admin_password(
+    client: AsyncClient, admin_pool: Pool
+) -> None:
+    """Important, review `app#17` đợt 4: biến thể body-dạng-array của Critical trên, nhưng cho
+    `/api/admin/companies` (chính route có `admin_password`, ví dụ động lực GỐC của cả lỗ này) —
+    trước bài này, chỉ `/api/auth/login` có test cho biến thể array, route kia chưa từng được thử."""
+    del admin_pool
+    real_password = "create-company-array-body-real-password-do-not-leak"
+    res = await client.post("/api/admin/companies", json=["acme-co", "x@x.com", real_password])
+    assert res.status_code == 422
+    assert real_password not in res.text
+    for error in res.json()["detail"]:
+        assert "input" not in error
+        assert "ctx" not in error
+
+
+async def test_login_deeply_nested_junk_field_422_not_500_does_not_leak_password_to_traceback(
+    client: AsyncClient, admin_pool: Pool
+) -> None:
+    """Critical, review `app#17` đợt 4 — do CHÍNH bản vá đợt 3 tạo ra: `_value_contains_sensitive_key`
+    (`app.py`) bản đệ quy bị `RecursionError` khi body chứa 1 field lồng đủ sâu (reviewer thực
+    nghiệm: ~600 tầng đã vỡ). `RecursionError` không bắt được ở đâu -> FastAPI trả 500 -> traceback
+    (chứa NGUYÊN payload lỗi, gồm `password` thật) đi thẳng vào log server dưới uvicorn thật — lộ
+    mật khẩu vào LOG, không cần đăng nhập/request hợp lệ, TỆ HƠN lỗ gốc PR này đóng (lỗ gốc lộ qua
+    RESPONSE, cái này lộ vào log, và attacker không cần biết gì về email/mật khẩu ai cả). Fix: đổi
+    đệ quy thành vòng lặp (stack tường minh, không tốn call-frame theo độ sâu) + trần
+    `_MAX_SCAN_NODES`. Bài này gửi field rác (`aaa_junk`, cố tình đặt tên đứng TRƯỚC `password`
+    theo alphabet/insertion order — dict Python duyệt theo thứ tự chèn, đúng thứ tự JSON gửi lên)
+    lồng 2000 tầng kèm `password` thật, thiếu `email` (trigger error "missing" có `input` = nguyên
+    dict body, đúng đường mà `_value_contains_sensitive_key` phải quét qua `aaa_junk` trước khi
+    tới được `password`) — verify: không 500, không crash, không lộ mật khẩu qua response (server
+    log không kiểm được từ test này, nhưng loại bỏ hẳn `RecursionError` là loại bỏ hẳn đường lộ
+    vào log, không chỉ giảm xác suất)."""
+    del admin_pool
+    nested: object = "bottom"
+    for _ in range(2000):
+        nested = [nested]
+    real_password = "deeply-nested-junk-real-password-do-not-leak"
+    res = await client.post("/api/auth/login", json={"aaa_junk": nested, "password": real_password})
+    assert res.status_code == 422, f"phải là 422 (redact), không phải 500 (RecursionError) — thấy {res.status_code}"
     assert real_password not in res.text
     for error in res.json()["detail"]:
         assert "input" not in error

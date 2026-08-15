@@ -40,15 +40,45 @@ from studio_app.routes import runs as runs_routes
 # (hoặc thêm vào tập) để được redact tự động, xem `_redact_sensitive_validation_errors` dưới đây.
 _SENSITIVE_FIELD_NAMES = frozenset({"password", "admin_password"})
 
+# Trần số node được duyệt trong `_value_contains_sensitive_key` — review `app#17` đợt 4, Critical:
+# xem docstring hàm đó.
+_MAX_SCAN_NODES = 2000
+
 
 def _value_contains_sensitive_key(value: object) -> bool:
-    """Quét ĐỆ QUY qua `dict`/`list` lồng nhau ở BẤT KỲ độ sâu nào, tìm key trùng
-    `_SENSITIVE_FIELD_NAMES` — review `app#17` đợt 3: bản trước chỉ soi key ở top-level `input`,
-    bỏ lọt ca field cha là object/list chứa 1 object con có key nhạy cảm bên trong."""
-    if isinstance(value, dict):
-        return any(str(key) in _SENSITIVE_FIELD_NAMES or _value_contains_sensitive_key(v) for key, v in value.items())
-    if isinstance(value, (list, tuple)):
-        return any(_value_contains_sensitive_key(item) for item in value)
+    """Quét LẶP (stack tường minh, KHÔNG đệ quy) qua `dict`/`list` lồng nhau ở BẤT KỲ độ sâu nào,
+    tìm key trùng `_SENSITIVE_FIELD_NAMES` — review `app#17` đợt 3: bản đầu chỉ soi key ở top-level
+    `input`, bỏ lọt ca field cha là object/list chứa 1 object con có key nhạy cảm bên trong.
+
+    Review `app#17` đợt 4, Critical, do CHÍNH bản đệ quy (đợt 3) tạo ra: bản đệ quy bị
+    `RecursionError` với body lồng đủ sâu (thực nghiệm reviewer xác nhận: ~600 tầng đã vỡ dưới
+    limit đệ quy mặc định của Python, vì mỗi tầng tốn NHIỀU HƠN 1 frame — đi qua `any()`/genexpr).
+    `RecursionError` đó KHÔNG được bắt ở đâu cả -> 500 -> traceback (chứa NGUYÊN payload lỗi, gồm
+    cả field `password` thật) đi thẳng vào log server dưới uvicorn/gunicorn thật — mật khẩu lộ ra
+    log mà KHÔNG CẦN đăng nhập/request hợp lệ, chỉ cần 1 field rác lồng đủ sâu, TỆ HƠN lỗ ban đầu
+    PR này định đóng (lỗ cũ lộ qua RESPONSE, còn lộ này lộ vào LOG server, và không cần hợp lệ hoá
+    request). Đồng thời đệ quy không giới hạn tự nó là 1 vector DoS nhẹ (CPU tỉ lệ độ sâu, ~1KB
+    payload đủ tốn nhiều giây).
+
+    Vá bằng vòng lặp `while` + `list` làm stack tường minh (không tốn Python call-frame nào theo
+    độ sâu dữ liệu, chỉ tốn heap) VÀ chặn thêm `_MAX_SCAN_NODES` (đếm số node đã duyệt, không chỉ
+    độ sâu — chặn cả body RỘNG lẫn SÂU). Vượt trần -> trả `True` (fail-closed, coi như CÓ thể nhạy
+    cảm, redact), KHÔNG phải `False` — không chứng minh được phần chưa duyệt tới là an toàn thì
+    không được kết luận an toàn, đúng nguyên tắc over-redact đã dùng xuyên suốt hàm này."""
+    stack: list[object] = [value]
+    visited = 0
+    while stack:
+        current = stack.pop()
+        visited += 1
+        if visited > _MAX_SCAN_NODES:
+            return True
+        if isinstance(current, dict):
+            for key, v in current.items():
+                if str(key) in _SENSITIVE_FIELD_NAMES:
+                    return True
+                stack.append(v)
+        elif isinstance(current, (list, tuple)):
+            stack.extend(current)
     return False
 
 
