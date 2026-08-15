@@ -195,24 +195,68 @@ async def test_login_deeply_nested_junk_field_422_not_500_does_not_leak_password
     mật khẩu vào LOG, không cần đăng nhập/request hợp lệ, TỆ HƠN lỗ gốc PR này đóng (lỗ gốc lộ qua
     RESPONSE, cái này lộ vào log, và attacker không cần biết gì về email/mật khẩu ai cả). Fix: đổi
     đệ quy thành vòng lặp (stack tường minh, không tốn call-frame theo độ sâu) + trần
-    `_MAX_SCAN_NODES`. Bài này gửi field rác (`aaa_junk`, cố tình đặt tên đứng TRƯỚC `password`
-    theo alphabet/insertion order — dict Python duyệt theo thứ tự chèn, đúng thứ tự JSON gửi lên)
-    lồng 2000 tầng kèm `password` thật, thiếu `email` (trigger error "missing" có `input` = nguyên
-    dict body, đúng đường mà `_value_contains_sensitive_key` phải quét qua `aaa_junk` trước khi
-    tới được `password`) — verify: không 500, không crash, không lộ mật khẩu qua response (server
-    log không kiểm được từ test này, nhưng loại bỏ hẳn `RecursionError` là loại bỏ hẳn đường lộ
-    vào log, không chỉ giảm xác suất)."""
+    `_MAX_SCAN_NODES`.
+
+    Nitpick round 5 (đã sửa): bản đầu của bài này để `password` làm SIBLING-KEY cùng cấp với field
+    rác lồng sâu (`{"aaa_junk": <lồng 2000 tầng>, "password": "..."}`) — vòng `for key, v in
+    current.items()` ở tầng dict NGOÀI CÙNG gặp `"password"` (return `True` NGAY) trước khi vòng
+    `while` chính kịp pop phần tử `aaa_junk` đã đẩy vào stack ra để duyệt xuống — bài test XANH
+    ĐÚNG kết luận (không 500, không lộ) nhưng KHÔNG thực sự đi qua nhánh duyệt list lồng sâu, chỉ
+    test lại đúng case sibling-key đã có bài riêng (`test_login_missing_email_422...`). Sửa: chôn
+    `password` THẲNG Ở ĐÁY cấu trúc lồng 2000 tầng (`{"payload": [[[...{"password": "..."}...]]]}`)
+    — không còn sibling-key nào ở tầng ngoài để thoát sớm, buộc vòng `while` phải pop hết 1500 tầng
+    `list` trong stack rồi mới chạm `dict` chứa `password` ở đáy và trả `True` (1500 CỐ Ý dưới
+    `_MAX_SCAN_NODES=2000` — để lần trả `True` này chắc chắn là do TÌM THẤY thật, không lẫn với
+    nhánh chạm trần fail-closed; ca chạm trần đã có unit test riêng,
+    `test_value_contains_sensitive_key_handles_extreme_depth_without_recursion_error`) — verify:
+    không 500, không lộ mật khẩu qua response."""
     del admin_pool
-    nested: object = "bottom"
-    for _ in range(2000):
-        nested = [nested]
     real_password = "deeply-nested-junk-real-password-do-not-leak"
-    res = await client.post("/api/auth/login", json={"aaa_junk": nested, "password": real_password})
+    nested: object = {"password": real_password}
+    for _ in range(1500):
+        nested = [nested]
+    res = await client.post("/api/auth/login", json={"payload": nested})
     assert res.status_code == 422, f"phải là 422 (redact), không phải 500 (RecursionError) — thấy {res.status_code}"
     assert real_password not in res.text
     for error in res.json()["detail"]:
         assert "input" not in error
         assert "ctx" not in error
+
+
+def test_value_contains_sensitive_key_handles_extreme_depth_without_recursion_error() -> None:
+    """Unit test trực tiếp, không qua HTTP — tái tạo ĐÚNG cách reviewer round 5 tự verify thủ công
+    (`app#17` đợt 4→5): stress `_value_contains_sensitive_key` (`app.py`) ở độ sâu vượt XA giới hạn
+    đệ quy mặc định của Python (~1000), để chứng minh thuật toán THỰC SỰ không tốn call-frame theo
+    độ sâu dữ liệu (vòng lặp, không đệ quy) — ghim lại bằng test tự động thay vì chỉ dựa vào script
+    Python reviewer chạy tay 1 lần rồi bỏ.
+
+    3 ca, cố ý tách riêng để không lẫn 2 lý do khác nhau ra cùng 1 kết quả `True`:
+    - `depth=50_000` (vượt hẳn `_MAX_SCAN_NODES=2000`), KHÔNG có key nhạy cảm nào -> `True` — nhưng
+      lý do là chạm TRẦN số node (fail-closed), KHÔNG PHẢI vì tìm thấy key nào — trần chặn trước
+      khi thuật toán đi hết được xuống đáy.
+    - `depth=1500` (DƯỚI trần 2000, nhưng vẫn sâu hơn giới hạn đệ quy Python) với `password` chôn
+      Ở ĐÁY -> `True` — lần này chắc chắn là do THẬT SỰ đi hết 1500 tầng rồi TÌM THẤY key, không
+      phải chạm trần (1500 < 2000) — ca này mới thật sự chứng minh vòng lặp duyệt đúng, không chỉ
+      "không crash".
+    - `depth=1500`, KHÔNG có key nhạy cảm -> `False` — chứng minh không over-redact tuỳ tiện: đi
+      hết 1500 tầng (dưới trần, không bị fail-closed chặn giữa chừng), không thấy gì thì phải kết
+      luận đúng là không có, không phải cứ sâu là redact."""
+    from studio_app.app import _value_contains_sensitive_key
+
+    beyond_cap_no_sensitive_key: object = "bottom"
+    for _ in range(50_000):
+        beyond_cap_no_sensitive_key = [beyond_cap_no_sensitive_key]
+    assert _value_contains_sensitive_key(beyond_cap_no_sensitive_key) is True  # chạm trần, fail-closed
+
+    under_cap_sensitive_key_at_bottom: object = {"password": "x"}
+    for _ in range(1500):
+        under_cap_sensitive_key_at_bottom = [under_cap_sensitive_key_at_bottom]
+    assert _value_contains_sensitive_key(under_cap_sensitive_key_at_bottom) is True  # tìm thấy thật, không phải trần
+
+    under_cap_no_sensitive_key: object = "bottom"
+    for _ in range(1500):
+        under_cap_no_sensitive_key = [under_cap_no_sensitive_key]
+    assert _value_contains_sensitive_key(under_cap_no_sensitive_key) is False  # đi hết, không thấy -> không redact
 
 
 async def test_login_end_to_end_through_real_http(client: AsyncClient, admin_pool: Pool) -> None:
