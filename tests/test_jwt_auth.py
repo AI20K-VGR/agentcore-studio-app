@@ -96,6 +96,29 @@ def test_verify_rejects_malformed_token_string(monkeypatch: pytest.MonkeyPatch) 
         jwt_auth.verify_token("not-a-real-jwt-at-all")
 
 
+def test_verify_password_roundtrips_correct_and_wrong_plaintext() -> None:
+    password_hash = jwt_auth.hash_password("correct-horse-battery-staple")
+    assert jwt_auth.verify_password("correct-horse-battery-staple", password_hash) is True
+    assert jwt_auth.verify_password("wrong-password", password_hash) is False
+
+
+def test_verify_password_oversized_plaintext_returns_false_not_raise() -> None:
+    """bcrypt giới hạn 72 byte — `bcrypt.checkpw` tự nó raise `ValueError` cho input dài hơn, phải
+    chặn TRƯỚC khi lọt xuống bcrypt để không lộ oracle 500-vs-401 (review `app#17`, Chặn 2)."""
+    password_hash = jwt_auth.hash_password("some-real-password")
+    oversized = "a" * 73
+    assert jwt_auth.verify_password(oversized, password_hash) is False
+
+
+def test_verify_password_malformed_stored_hash_returns_false_not_raise() -> None:
+    """`bcrypt.checkpw` raise `ValueError("Invalid salt")` (thực nghiệm xác nhận) cho
+    `password_hash` KHÔNG đúng định dạng bcrypt, thay vì trả `False` — nếu để lọt, 1 dòng
+    `core.users.password_hash` hỏng (không có CHECK constraint ràng ở DB) sẽ làm `login()` 500 cho
+    ĐÚNG email đó nhưng 401 cho email không tồn tại, tự nó là 1 oracle khác biệt account tồn tại
+    (review `app#17` đợt 3, Important)."""
+    assert jwt_auth.verify_password("anything", "not-a-valid-bcrypt-hash") is False
+
+
 def test_two_tenants_get_non_interchangeable_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     """Sanity chống nhầm: token của tenant A không verify ra tenant B — tránh lỗi copy-paste kiểu
     `issue_token` lờ đi `session` truyền vào mà ký hằng số."""

@@ -10,15 +10,32 @@ object nhưng cùng DSN/database nên dữ liệu nhất quán, xem docstring `c
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
-from studio_app import jwt_auth
-from studio_app.core._db import Pool, close_pools
+from studio_app import jwt_auth, middleware
+from studio_app.core._db import Pool, close_pools, get_pool
 from studio_app.jwt_auth import hash_password
 from studio_app.routes.auth import LoginRequest, login
 from studio_app.settings import Settings
+
+
+@asynccontextmanager
+async def _simulate_request_connection() -> AsyncIterator[None]:
+    """`login()` giờ đọc `core.users` qua `get_request_connection()` (review `app#17` đợt 3,
+    Important — tránh mở 1 connection thứ 2 ngoài connection `tenant_context_middleware` đã giữ
+    suốt đời request), nên test gọi thẳng hàm (không qua ASGI, khác `test_http_asgi.py`) phải tự
+    set `_request_conn` contextvar trước khi gọi — cùng convention `middleware._request_session`
+    mà `test_admin_routes.py`/`test_routes_runs.py` đã dùng cho `create_company`/`create_run`."""
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        token = middleware._request_conn.set(conn)
+        try:
+            yield
+        finally:
+            middleware._request_conn.reset(token)
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -56,7 +73,8 @@ async def test_login_succeeds_with_correct_password(admin_pool: Pool, monkeypatc
             (tenant_id, "real@acme.com", hash_password("correct-horse-battery-staple"), ["admin", "public"]),
         )
 
-    response = await login(LoginRequest(email="real@acme.com", password="correct-horse-battery-staple"))
+    async with _simulate_request_connection():
+        response = await login(LoginRequest(email="real@acme.com", password="correct-horse-battery-staple"))
 
     assert response.tenant_id == str(tenant_id)
     assert response.roles == ["admin", "public"]
@@ -77,7 +95,8 @@ async def test_login_rejects_wrong_password(admin_pool: Pool, monkeypatch: pytes
         )
 
     with pytest.raises(HTTPException) as exc_info:
-        await login(LoginRequest(email="wrongpw@acme.com", password="incorrect-password"))
+        async with _simulate_request_connection():
+            await login(LoginRequest(email="wrongpw@acme.com", password="incorrect-password"))
     assert exc_info.value.status_code == 401
 
 
@@ -85,7 +104,8 @@ async def test_login_rejects_unknown_email(admin_pool: Pool, monkeypatch: pytest
     del admin_pool
     monkeypatch.setattr(jwt_auth, "get_settings", _settings)
     with pytest.raises(HTTPException) as exc_info:
-        await login(LoginRequest(email="khong-ton-tai@acme.com", password="whatever123"))
+        async with _simulate_request_connection():
+            await login(LoginRequest(email="khong-ton-tai@acme.com", password="whatever123"))
     assert exc_info.value.status_code == 401
 
 
@@ -107,7 +127,8 @@ async def test_login_rejects_oversized_password_with_401_not_500_for_existing_em
         )
 
     with pytest.raises(HTTPException) as exc_info:
-        await login(LoginRequest(email="oversized@acme.com", password="a" * 73))
+        async with _simulate_request_connection():
+            await login(LoginRequest(email="oversized@acme.com", password="a" * 73))
     assert exc_info.value.status_code == 401
 
 
@@ -120,7 +141,8 @@ async def test_login_rejects_oversized_password_with_401_not_500_for_unknown_ema
     del admin_pool
     monkeypatch.setattr(jwt_auth, "get_settings", _settings)
     with pytest.raises(HTTPException) as exc_info:
-        await login(LoginRequest(email="khong-ton-tai-oversized@acme.com", password="a" * 73))
+        async with _simulate_request_connection():
+            await login(LoginRequest(email="khong-ton-tai-oversized@acme.com", password="a" * 73))
     assert exc_info.value.status_code == 401
 
 
@@ -146,7 +168,8 @@ async def test_login_regression_verify_password_always_called_even_for_unknown_e
     monkeypatch.setattr("studio_app.routes.auth.verify_password", _counting_verify_password)
 
     with pytest.raises(HTTPException) as exc_info:
-        await login(LoginRequest(email="khong-ton-tai-regression@acme.com", password="whatever123"))
+        async with _simulate_request_connection():
+            await login(LoginRequest(email="khong-ton-tai-regression@acme.com", password="whatever123"))
 
     assert exc_info.value.status_code == 401
     assert call_count == 1, "verify_password() phải được gọi ĐÚNG 1 lần kể cả khi email không tồn tại"

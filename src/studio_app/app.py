@@ -41,6 +41,23 @@ from studio_app.routes import runs as runs_routes
 _SENSITIVE_FIELD_NAMES = frozenset({"password", "admin_password"})
 
 
+def _error_touches_sensitive_field(error_dict: dict[str, object]) -> bool:
+    """True nếu error item này CÓ THỂ mang giá trị 1 field nhạy cảm — qua `loc` của chính nó (ca
+    thường: field đó tự sai, VD mật khẩu quá dài) HOẶC qua `input` (ca `"missing"`: Pydantic v2 gắn
+    NGUYÊN dict input gốc — mọi field ANH EM còn lại, kể cả field nhạy cảm đã gửi hợp lệ — vào
+    `input` của error field bị THIẾU, không phải field nhạy cảm tự nó lỗi). Review `app#17` đợt 3,
+    Critical: `LoginRequest(password=...)` thiếu `email` → error có `loc=("email",)` nhưng
+    `input={"password": "<mật khẩu thật>"}` — bản cũ chỉ soi `loc` nên bỏ lọt thẳng ca này, mật
+    khẩu lộ nguyên trong response 422. Thực nghiệm xác nhận bằng Pydantic 2.13 (`ValidationError`
+    trên model 2 field, thiếu 1): `errors()[0]["input"]` chính là dict field-anh-em, không phải
+    `{}`/giá trị field thiếu."""
+    loc = error_dict.get("loc", ())
+    if isinstance(loc, (list, tuple)) and any(str(part) in _SENSITIVE_FIELD_NAMES for part in loc):
+        return True
+    input_value = error_dict.get("input")
+    return isinstance(input_value, dict) and any(key in _SENSITIVE_FIELD_NAMES for key in input_value)
+
+
 async def _redact_sensitive_validation_errors(request: Request, exc: RequestValidationError) -> JSONResponse:
     """Handler mặc định của FastAPI cho `RequestValidationError` echo lại NGUYÊN GIÁ TRỊ client
     gửi vào `detail[].input` (Pydantic v2 `errors()`, và `.ctx.error` cho validator tự viết như
@@ -48,15 +65,15 @@ async def _redact_sensitive_validation_errors(request: Request, exc: RequestVali
     nghĩa là response 422 chứa THẲNG mật khẩu client vừa gõ. Response body 422 rất dễ bị log lại
     (reverse-proxy access log, APM, devtools/HAR của bất kỳ ai bắt request) — đúng loại lỗ mà PR
     này đang cố đóng (Chặn 1/2, `app#17`), nhưng lại mở ra qua chính đường vá (review `app#17`,
-    đợt 2, mục Critical #1). Chặn bằng cách bỏ `input`/`ctx` khỏi MỌI error item có field nhạy cảm
-    trong `loc`, giữ nguyên cho field khác — người dùng vẫn biết field nào sai, chỉ không thấy lại
-    giá trị mật khẩu."""
+    đợt 2, mục Critical #1). Chặn bằng cách bỏ `input`/`ctx` khỏi MỌI error item chạm field nhạy
+    cảm — qua `loc` CỦA CHÍNH NÓ hoặc qua sibling-field lộ trong `input` (đợt 3, xem
+    `_error_touches_sensitive_field`) — giữ nguyên cho field khác, người dùng vẫn biết field nào
+    sai, chỉ không thấy lại giá trị mật khẩu."""
     del request
     redacted = []
     for error in exc.errors():
         error_dict = dict(error)
-        loc = error_dict.get("loc", ())
-        if any(str(part) in _SENSITIVE_FIELD_NAMES for part in loc):
+        if _error_touches_sensitive_field(error_dict):
             error_dict.pop("input", None)
             error_dict.pop("ctx", None)
         redacted.append(error_dict)

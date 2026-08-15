@@ -40,10 +40,20 @@ def verify_password(plain: str, password_hash: str) -> bool:
     `routes/auth.py::login` sẽ 500 cho email tồn tại nhưng 401 cho email không tồn tại (short-circuit
     trước khi gọi hàm này), lộ ra sự tồn tại của email qua status code (review `app#17`, Chặn 2).
     Chặn ở đây — trước bcrypt, không phải trong route — để MỌI call site (login lẫn tương lai) đều
-    fail-closed giống nhau, không phải nhớ tự chặn ở từng nơi gọi."""
+    fail-closed giống nhau, không phải nhớ tự chặn ở từng nơi gọi.
+
+    `bcrypt.checkpw` cũng raise `ValueError` (không phải trả `False`) nếu `password_hash` KHÔNG
+    đúng định dạng bcrypt (VD `"Invalid salt"` — thực nghiệm xác nhận). `core.users.password_hash`
+    là `TEXT` thuần, không có CHECK constraint ràng định dạng ở DB — nếu 1 dòng nào đó có hash hỏng
+    (lỗi ghi dữ liệu, sửa tay, migration tương lai), request login đúng email đó sẽ 500 thay vì
+    401, lại là 1 oracle khác biệt account đó tồn tại (review `app#17` đợt 3, Important). Bắt luôn
+    `ValueError` ở đây — cùng chỗ đã chặn ca >72 byte, cùng lý do fail-closed cho mọi call site."""
     if len(plain.encode("utf-8")) > 72:
         return False
-    return bcrypt.checkpw(plain.encode("utf-8"), password_hash.encode("utf-8"))
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), password_hash.encode("utf-8"))
+    except ValueError:
+        return False
 
 
 # Hash cố định của 1 chuỗi không phải mật khẩu thật của ai — dùng khi email KHÔNG tồn tại, để

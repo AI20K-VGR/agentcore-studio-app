@@ -64,7 +64,7 @@ async def seed_superadmin() -> None:
     # nếu để lọt xuống dưới — chặn ở đây, thông điệp rõ ràng, thay vì traceback khó hiểu.
     password_bytes = len(password.encode("utf-8"))
     if password_bytes < 8:
-        raise SystemExit("STUDIO_SUPERADMIN_PASSWORD tối thiểu 8 ký tự.")
+        raise SystemExit("STUDIO_SUPERADMIN_PASSWORD tối thiểu 8 byte.")
     if password_bytes > 72:
         raise SystemExit("STUDIO_SUPERADMIN_PASSWORD tối đa 72 byte (giới hạn bcrypt).")
 

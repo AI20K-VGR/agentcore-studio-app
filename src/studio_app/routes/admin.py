@@ -79,6 +79,16 @@ async def create_company(body: CreateCompanyRequest) -> CreateCompanyResponse:
     # `app#17`, đợt 2, mục 4).
     admin_password_hash = await run_in_threadpool(hash_password, body.admin_password)
 
+    # CỐ Ý tự mở connection riêng qua `get_pool()`, KHÔNG dùng `get_request_connection()` của
+    # middleware (khác `routes/auth.py::login`, đã đổi sang dùng connection đó — review `app#17`
+    # đợt 3, Important, pool exhaustion) — block này bắt `UniqueViolation` GIỮA transaction rồi
+    # RAISE TIẾP (không phải return/tiếp tục query khác), nên Postgres đánh dấu transaction đó
+    # "aborted"; thoát khỏi `async with pool.connection()` bằng exception khiến psycopg tự
+    # ROLLBACK connection RIÊNG này khi trả về pool. Nếu dùng connection của middleware (giữ suốt
+    # đời request, chỉ COMMIT 1 lần lúc middleware thoát), transaction "aborted" đó sẽ không được
+    # rollback cho tới khi middleware's `async with` thoát — COMMIT trên transaction aborted tuy
+    # Postgres không lỗi (tự hiểu là ROLLBACK) nhưng để lại 1 quả mìn cho bất kỳ query nào khác
+    # lỡ chạy trên cùng connection đó trong phần đời còn lại của request.
     pool = await get_pool()
     async with pool.connection() as conn:
         cur = await conn.execute("SELECT id FROM core.users WHERE email = %s", (session.user,))
@@ -168,6 +178,9 @@ async def create_user(body: CreateUserRequest) -> CreateUserResponse:
     # `app#17`, đợt 2, mục 4).
     password_hash = await run_in_threadpool(hash_password, body.password)
 
+    # Connection riêng, cùng lý do `create_company` ở trên (comment đầy đủ tại đó) — bắt
+    # `UniqueViolation` giữa transaction rồi raise tiếp, cần rollback độc lập, không phải
+    # connection dùng chung suốt đời request của middleware.
     pool = await get_pool()
     async with pool.connection() as conn:
         # session.tenant_id — KHÔNG đọc tenant_id từ body (body không có field đó).

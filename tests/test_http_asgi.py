@@ -120,6 +120,29 @@ async def test_oversized_password_422_does_not_echo_plaintext(client: AsyncClien
         assert "ctx" not in error
 
 
+async def test_login_missing_email_422_does_not_echo_sibling_password(client: AsyncClient, admin_pool: Pool) -> None:
+    """Critical, review `app#17` đợt 3: khi 1 field BẮT BUỘC bị thiếu hẳn (ở đây: `email`),
+    Pydantic v2's `ValidationError.errors()` gắn NGUYÊN dict input gốc — MỌI field anh em khác đã
+    gửi, kể cả `password` hợp lệ — vào `input` của error đó, không phải `input` của riêng field bị
+    thiếu. Thực nghiệm xác nhận: `LoginRequest(password="...")` (thiếu email) ra
+    `errors()[0] == {"loc": ("email",), "input": {"password": "<mật khẩu thật>"}, ...}` — lỗi có
+    `loc=("email",)`, KHÔNG chứa "password"/"admin_password", nên bản `_redact_sensitive_validation_errors`
+    cũ (chỉ soi `loc` của chính error) bỏ lọt thẳng: mật khẩu thật lộ nguyên trong response 422 dù
+    chính field password không hề sai. Fix: `_error_touches_sensitive_field` (`app.py`) soi thêm
+    `input` (khi là dict) cho key nhạy cảm, không chỉ `loc`."""
+    del admin_pool
+    real_password = "this-is-the-real-password-do-not-leak"
+    res = await client.post("/api/auth/login", json={"password": real_password})
+    assert res.status_code == 422
+    assert real_password not in res.text
+    detail = res.json()["detail"]
+    email_errors = [e for e in detail if "email" in str(e.get("loc", ()))]
+    assert email_errors, "phải có ít nhất 1 error item cho field email"
+    for error in email_errors:
+        assert "input" not in error
+        assert "ctx" not in error
+
+
 async def test_login_end_to_end_through_real_http(client: AsyncClient, admin_pool: Pool) -> None:
     """Đường thật, đầu-cuối qua HTTP: seed 1 dòng `core.users`, `POST /api/auth/login` bằng
     `httpx`, verify token trả về xài được để gọi tiếp 1 route cần auth (`/api/admin/companies`,
