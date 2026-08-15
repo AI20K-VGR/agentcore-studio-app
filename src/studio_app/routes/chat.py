@@ -89,6 +89,9 @@ async def chat(agent_id: str, body: ChatRequest) -> ChatResponse:
     except ValueError as exc:
         raise HTTPException(status_code=500, detail=f"recipe đã published nhưng graph_lint() đỏ: {exc}") from exc
 
+    # `Pool` (không phải `get_request_connection()`) — cùng lý do đã ghi ở `routes/runs.py` (review
+    # `app#17` đợt 3): `interpreter.run()` bên dưới trải dài qua nhiều truy vấn KB + gọi LLM (độ trễ
+    # giây), giữ 1 connection request cố định suốt đó tốn pool capacity hơn, không phải ít hơn.
     pool = await get_pool()
     embedding = CallistoEmbedding()
     result = await interpreter.run(

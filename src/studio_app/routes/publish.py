@@ -91,6 +91,12 @@ async def _evaluate(agent_id: str, body: RunRequest, session: ResolvedContext) -
             detail=f"golden_set_ref {recipe.golden_set_ref!r} không có file tương ứng ở {golden_set_path}",
         )
 
+    # `Pool` (không phải `get_request_connection()`) — cùng lý do đã ghi ở `routes/runs.py` (review
+    # `app#17` đợt 3): `EngineAgentRunner`/`EvalHarness().run()` bên dưới trải dài qua nhiều truy vấn
+    # KB + gọi LLM (độ trễ giây), giữ 1 connection request cố định suốt đó tốn pool capacity hơn,
+    # không phải ít hơn. Route này VẪN dùng `get_request_connection()` riêng cho ghi publish cuối
+    # cùng (`publish(recipe, scorecard, conn=get_request_connection())` dưới) — 2 kiểu dùng khác
+    # mục đích trong cùng 1 route, không phải thiếu nhất quán.
     pool = await get_pool()
     embedding = CallistoEmbedding()
     runner = EngineAgentRunner(

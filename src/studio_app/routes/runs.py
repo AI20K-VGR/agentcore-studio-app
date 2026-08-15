@@ -100,6 +100,16 @@ async def create_run(body: RunRequest) -> RunResponse:
         # UI đã chặn export/test khi `graph_lint()` đỏ, nhưng client vẫn có thể gửi thẳng qua API.
         raise HTTPException(status_code=400, detail=f"recipe không qua graph_lint(): {exc}") from exc
 
+    # CỐ Ý dùng `Pool` (`get_pool()`), KHÔNG dùng `get_request_connection()` của middleware — review
+    # `app#17` đợt 3, "mở rộng connection-reuse pattern sang runs.py/publish.py/chat.py?": KHÔNG,
+    # quyết định tường minh. `interpreter.run()` bên dưới có thể chạy NHIỀU truy vấn KB độc lập +
+    # gọi LLM (độ trễ giây, không phải ms) trải dài suốt quá trình chạy — nếu ép dùng 1 connection
+    # request giữ suốt đời request, connection đó bị CHIẾM (idle phần lớn thời gian chờ LLM) trong
+    # khi lẽ ra nên trả về pool giữa các lượt query để request khác dùng. Dùng `Pool` (checkout/trả
+    # lại theo từng query bên trong `PgKbSearch`/`PgTraceWriter`) tốn pool capacity ÍT hơn, không
+    # phải nhiều hơn, so với giữ 1 connection cố định suốt 1 lượt chạy có thể kéo dài nhiều giây.
+    # `chat.py`/`publish.py` cùng lý do y hệt cho `interpreter.run()`/`EvalHarness().run()` của
+    # chúng — pattern nhất quán trên cả 3 file, không phải bỏ sót.
     pool = await get_pool()
     embedding: EmbeddingService = CallistoEmbedding()
     kb_search = PgKbSearch(pool, embedding)

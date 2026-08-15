@@ -143,6 +143,22 @@ async def test_login_missing_email_422_does_not_echo_sibling_password(client: As
         assert "ctx" not in error
 
 
+async def test_login_array_body_422_does_not_echo_password(client: AsyncClient, admin_pool: Pool) -> None:
+    """Critical, review `app#17` đợt 3 (lượt 2 — bản vá lượt 1 vẫn lọt): gửi THẲNG 1 JSON array
+    làm body thay vì object — Pydantic không tách được field nào (`loc=()`), `input` là NGUYÊN
+    list đó (thực nghiệm xác nhận: `LoginRequest.model_validate([...])` ra `{"loc": [],
+    "input": [...]}`) — bản vá lượt 1 (chỉ soi `input` khi là `dict`) bỏ lọt thẳng ca này. Fix:
+    `loc` rỗng luôn bị coi là nhạy cảm (`_error_touches_sensitive_field`, `app.py`)."""
+    del admin_pool
+    real_password = "array-body-real-password-do-not-leak"
+    res = await client.post("/api/auth/login", json=["attacker@example.com", real_password])
+    assert res.status_code == 422
+    assert real_password not in res.text
+    for error in res.json()["detail"]:
+        assert "input" not in error
+        assert "ctx" not in error
+
+
 async def test_login_end_to_end_through_real_http(client: AsyncClient, admin_pool: Pool) -> None:
     """Đường thật, đầu-cuối qua HTTP: seed 1 dòng `core.users`, `POST /api/auth/login` bằng
     `httpx`, verify token trả về xài được để gọi tiếp 1 route cần auth (`/api/admin/companies`,

@@ -41,21 +41,54 @@ from studio_app.routes import runs as runs_routes
 _SENSITIVE_FIELD_NAMES = frozenset({"password", "admin_password"})
 
 
+def _value_contains_sensitive_key(value: object) -> bool:
+    """Quét ĐỆ QUY qua `dict`/`list` lồng nhau ở BẤT KỲ độ sâu nào, tìm key trùng
+    `_SENSITIVE_FIELD_NAMES` — review `app#17` đợt 3: bản trước chỉ soi key ở top-level `input`,
+    bỏ lọt ca field cha là object/list chứa 1 object con có key nhạy cảm bên trong."""
+    if isinstance(value, dict):
+        return any(str(key) in _SENSITIVE_FIELD_NAMES or _value_contains_sensitive_key(v) for key, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_value_contains_sensitive_key(item) for item in value)
+    return False
+
+
 def _error_touches_sensitive_field(error_dict: dict[str, object]) -> bool:
     """True nếu error item này CÓ THỂ mang giá trị 1 field nhạy cảm — qua `loc` của chính nó (ca
-    thường: field đó tự sai, VD mật khẩu quá dài) HOẶC qua `input` (ca `"missing"`: Pydantic v2 gắn
-    NGUYÊN dict input gốc — mọi field ANH EM còn lại, kể cả field nhạy cảm đã gửi hợp lệ — vào
-    `input` của error field bị THIẾU, không phải field nhạy cảm tự nó lỗi). Review `app#17` đợt 3,
-    Critical: `LoginRequest(password=...)` thiếu `email` → error có `loc=("email",)` nhưng
-    `input={"password": "<mật khẩu thật>"}` — bản cũ chỉ soi `loc` nên bỏ lọt thẳng ca này, mật
-    khẩu lộ nguyên trong response 422. Thực nghiệm xác nhận bằng Pydantic 2.13 (`ValidationError`
-    trên model 2 field, thiếu 1): `errors()[0]["input"]` chính là dict field-anh-em, không phải
-    `{}`/giá trị field thiếu."""
+    thường: field đó tự sai, VD mật khẩu quá dài), qua `input`/`ctx` (ca `"missing"`: Pydantic v2
+    gắn NGUYÊN dict input gốc — mọi field ANH EM còn lại, kể cả field nhạy cảm đã gửi hợp lệ — vào
+    `input` của error field bị THIẾU, không phải field nhạy cảm tự nó lỗi), HOẶC qua `loc` KHÔNG
+    XÁC ĐỊNH ĐƯỢC TÊN FIELD NÀO (ca body sai hẳn HÌNH DẠNG, không parse được thành object — `input`
+    khi đó là NGUYÊN payload thô, có thể chứa mật khẩu ở bất kỳ đâu trong đó mà không có key nào
+    để soi).
+
+    Review `app#17` đợt 3, Critical (3 lượt — lượt 2 verify LẦN ĐẦU bằng test HTTP thật qua ASGI
+    mới lộ ra lượt 2 tự nó cũng SAI, không chỉ dừng ở đọc review):
+    - Lượt 1: `LoginRequest(password=...)` thiếu `email` → error có `loc=("email",)` nhưng
+      `input={"password": "<mật khẩu thật>"}` — bản đầu chỉ soi `loc` nên bỏ lọt. Vá bằng cách soi
+      thêm `input`.
+    - Lượt 2 (bản vá lượt 1 vẫn lọt): gửi THẲNG 1 JSON array làm body thay vì object. Gọi
+      `LoginRequest.model_validate([...])` TRỰC TIẾP (ngoài FastAPI) cho `loc=[]` (rỗng hẳn) — ban
+      đầu vá bằng `len(loc) == 0`. NHƯNG verify lại bằng `test_http_asgi.py` (request HTTP THẬT,
+      qua FastAPI, không gọi thẳng Pydantic) cho kết quả KHÁC: FastAPI tự chèn `"body"` làm phần tử
+      ĐẦU của `loc` cho MỌI lỗi validate body (xác nhận qua debug print thật:
+      `loc=["body"]`, `input=["attacker@example.com", "<mật khẩu thật>"]`, error item này còn
+      KHÔNG CÓ `ctx`) — `len(loc) == 0` không bao giờ đúng qua đường HTTP thật, bài test lượt 2 tự
+      nó XANH GIẢ (assert sai chỗ, không phải code đúng). So `loc` với field lỗi thường (VD
+      `admin_password` quá dài) qua CÙNG đường HTTP thật: `loc=["body", "admin_password"]` — 2
+      phần tử: `"body"` (loại vị trí) + tên field thật. Vậy tín hiệu đúng là ĐỘ DÀI `loc` sau khi
+      trừ marker vị trí (`"body"/"query"/"path"/...`) — `len(loc) <= 1` nghĩa là CHỈ có marker vị
+      trí, không có tên field nào theo sau -> không xác định được field -> không thể chứng minh
+      input đó an toàn -> redact toàn bộ, chấp nhận over-redact vài ca vô hại (route không có field
+      nhạy cảm) để không bỏ lọt ca có."""
     loc = error_dict.get("loc", ())
-    if isinstance(loc, (list, tuple)) and any(str(part) in _SENSITIVE_FIELD_NAMES for part in loc):
-        return True
-    input_value = error_dict.get("input")
-    return isinstance(input_value, dict) and any(key in _SENSITIVE_FIELD_NAMES for key in input_value)
+    if isinstance(loc, (list, tuple)):
+        if any(str(part) in _SENSITIVE_FIELD_NAMES for part in loc):
+            return True
+        if len(loc) <= 1:
+            return True
+    return _value_contains_sensitive_key(error_dict.get("input")) or _value_contains_sensitive_key(
+        error_dict.get("ctx")
+    )
 
 
 async def _redact_sensitive_validation_errors(request: Request, exc: RequestValidationError) -> JSONResponse:

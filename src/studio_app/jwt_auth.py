@@ -18,6 +18,7 @@ from uuid import UUID
 
 import bcrypt
 import jwt
+from loguru import logger
 from studio_workbench.tenant_wall import ResolvedContext
 
 from studio_app.settings import get_settings
@@ -47,12 +48,20 @@ def verify_password(plain: str, password_hash: str) -> bool:
     là `TEXT` thuần, không có CHECK constraint ràng định dạng ở DB — nếu 1 dòng nào đó có hash hỏng
     (lỗi ghi dữ liệu, sửa tay, migration tương lai), request login đúng email đó sẽ 500 thay vì
     401, lại là 1 oracle khác biệt account đó tồn tại (review `app#17` đợt 3, Important). Bắt luôn
-    `ValueError` ở đây — cùng chỗ đã chặn ca >72 byte, cùng lý do fail-closed cho mọi call site."""
+    `ValueError` ở đây — cùng chỗ đã chặn ca >72 byte, cùng lý do fail-closed cho mọi call site.
+
+    Log `warning` khi rơi vào nhánh hash hỏng (review `app#17` đợt 3, "log khi hash hỏng"): fail-
+    closed (trả `False`, account đó không login được) là đúng, nhưng NẾU không log gì, dữ liệu
+    hỏng này sẽ nằm im vô thời hạn — không ai biết để sửa, account đó coi như "quên mật khẩu" mãi
+    mãi mà không có dấu vết nào để debug. KHÔNG log `plain`/`password_hash` (chính giá trị mật
+    khẩu/hash thật) — chỉ log SỰ KIỆN "gặp hash hỏng", đủ để vận hành biết có dữ liệu cần sửa mà
+    không tự nó lại thành 1 chỗ rò rỉ mới."""
     if len(plain.encode("utf-8")) > 72:
         return False
     try:
         return bcrypt.checkpw(plain.encode("utf-8"), password_hash.encode("utf-8"))
     except ValueError:
+        logger.warning("[AUTH] verify_password: password_hash không đúng định dạng bcrypt — coi như sai mật khẩu")
         return False
 
 
