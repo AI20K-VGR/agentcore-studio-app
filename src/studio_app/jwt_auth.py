@@ -26,6 +26,20 @@ from studio_app.settings import get_settings
 _ALGORITHM = "HS256"
 
 
+def normalize_email(email: str) -> str:
+    """`.strip().lower()` — chuẩn hoá email TRƯỚC khi ghi (`routes/admin.py::CreateCompanyRequest`/
+    `CreateUserRequest`) và TRƯỚC khi tra (`routes/auth.py::login`), dùng chung 1 hàm để 2 phía
+    không lệch nhau (trước bản vá, `"Admin@Acme.com"` tạo được nhưng không đăng nhập nổi bằng
+    `"admin@acme.com"` vì `login()` khớp `WHERE email = %s` chính xác — review `app#17`, "nên sửa"
+    #1). Không dùng `pydantic.EmailStr` (cần thêm dependency `email-validator`, repo hiện không có)
+    — validate tối thiểu bằng tay: rỗng/toàn khoảng trắng hoặc thiếu `"@"` bị chặn ngay ở tầng
+    Pydantic (422), đủ đóng `""`, `"   "`, `"khong-phai-email"` mà không kéo thêm gói ngoài."""
+    normalized = email.strip().lower()
+    if not normalized or "@" not in normalized:
+        raise ValueError("email không hợp lệ")
+    return normalized
+
+
 def hash_password(plain: str) -> str:
     """Băm mật khẩu bằng bcrypt (cost mặc định 12, đủ chậm chống brute-force mà không làm login
     chậm cảm nhận được). Kết quả là chuỗi tự chứa salt — không cần lưu salt riêng."""

@@ -28,7 +28,7 @@ import sys
 
 from studio_app.core._db import Pool, close_pools, get_admin_pool
 from studio_app.core.schema import ensure_all_schemas
-from studio_app.jwt_auth import hash_password
+from studio_app.jwt_auth import hash_password, normalize_email
 
 _SYSTEM_TENANT_NAME = "__system__"
 
@@ -57,6 +57,13 @@ async def seed_superadmin() -> None:
             "STUDIO_SUPERADMIN_EMAIL và STUDIO_SUPERADMIN_PASSWORD chưa đặt — cần cả hai. "
             "Không có default (fail-loud): superadmin không được phép tạo bằng giá trị đoán được."
         )
+    # Cùng `normalize_email()` dùng ở `routes/admin.py`/`routes/auth.py::login` — nếu ghi email
+    # không chuẩn hoá ở đây, `login()` (tra bằng email đã `.strip().lower()`) sẽ không khớp được
+    # dòng superadmin (review `app#17`, "nên sửa" #1).
+    try:
+        email = normalize_email(email)
+    except ValueError as exc:
+        raise SystemExit(f"STUDIO_SUPERADMIN_EMAIL không hợp lệ: {exc}") from exc
     # Cùng chính sách `CreateCompanyRequest.admin_password`/`CreateUserRequest.password`
     # (`routes/admin.py`, `Field(min_length=8)` + guard 72 byte) — trước bản vá, script này KHÔNG
     # kiểm gì cả, nên tài khoản quyền CAO NHẤT hệ thống lại có chính sách mật khẩu YẾU NHẤT (review
@@ -73,13 +80,24 @@ async def seed_superadmin() -> None:
     system_tenant_id = await _ensure_system_tenant(admin)
 
     async with admin.connection() as conn:
-        await conn.execute(
+        cur = await conn.execute(
             "INSERT INTO core.users (tenant_id, email, password_hash, roles, created_by) "
             "VALUES (%s, %s, %s, %s, NULL) "
-            "ON CONFLICT (email) DO NOTHING",
+            "ON CONFLICT (email) DO NOTHING "
+            "RETURNING id",
             (system_tenant_id, email, hash_password(password), ["superadmin"]),
         )
-    print(f"Seeded superadmin {email!r} (tenant hệ thống {system_tenant_id}) vào core.users.")
+        row = await cur.fetchone()
+
+    # `ON CONFLICT ... DO NOTHING` không trả dòng nào khi email đã tồn tại — nếu vẫn in "Seeded ...",
+    # ai chạy lại script để XOAY mật khẩu superadmin sẽ nhận thông báo thành công trong khi mật khẩu
+    # KHÔNG đổi (review `app#17`, "nên sửa" #4: thực nghiệm xác nhận mật khẩu cũ vẫn còn đúng, mật
+    # khẩu mới không được ghi). `RETURNING id` phân biệt 2 ca — không có dòng nào nghĩa là hàng đã
+    # tồn tại từ trước, script không đổi gì cả, phải nói rõ thay vì báo giả.
+    if row is None:
+        print(f"Superadmin {email!r} đã tồn tại trong core.users — không đổi gì (mật khẩu giữ nguyên).")
+    else:
+        print(f"Seeded superadmin {email!r} (tenant hệ thống {system_tenant_id}) vào core.users.")
 
 
 async def main() -> None:

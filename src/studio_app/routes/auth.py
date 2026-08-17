@@ -20,11 +20,11 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from starlette.concurrency import run_in_threadpool
 from studio_workbench.tenant_wall import resolve_session
 
-from studio_app.jwt_auth import DUMMY_PASSWORD_HASH, issue_token, verify_password
+from studio_app.jwt_auth import DUMMY_PASSWORD_HASH, issue_token, normalize_email, verify_password
 from studio_app.middleware import get_request_connection
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -33,6 +33,13 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 class LoginRequest(BaseModel):
     email: str
     password: str
+
+    # Cùng `normalize_email()` phía ghi (`routes/admin.py`) — email lưu trong `core.users` đã qua
+    # `.strip().lower()`, tra bằng chuỗi chưa chuẩn hoá sẽ không khớp (review `app#17`, "nên sửa"
+    # #1). Một email sai định dạng (rỗng/thiếu "@") luôn 422 bất kể có tồn tại trong DB hay không —
+    # không phải oracle mới, vì `normalize_email()` phía ghi cũng chặn y hệt những giá trị đó, nên
+    # không có dòng `core.users` nào mang email sai định dạng để so sánh.
+    _normalize_email = field_validator("email")(normalize_email)
 
 
 class LoginResponse(BaseModel):

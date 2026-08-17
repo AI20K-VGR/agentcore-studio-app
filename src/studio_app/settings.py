@@ -20,12 +20,15 @@ class Settings(BaseSettings):
     enable_tracing: bool = False
     use_fake_providers: bool = True
 
-    # JWT ký/verify identity (Kế hoạch 2, A2/A1) — KHÔNG có provider identity thật đứng sau (không
-    # password/OAuth/IdP nào check `user`/`tenant`/`roles` trước khi ký): việc ký/verify chữ ký là
-    # THẬT (không ai giả mạo được token nếu không có `jwt_secret`), nhưng việc "ai được phép xin
-    # token cho tenant/roles nào" vẫn CHƯA được xác thực — đó là hệ thống identity provider riêng,
-    # ngoài phạm vi hiện tại. `jwt_secret` không có default: thiếu biến môi trường phải raise rõ
-    # ràng lúc khởi động (pydantic ValidationError), không được chạy với khoá rỗng/đoán được.
+    # JWT ký/verify identity (Kế hoạch 3) — `issue_token()` giờ CHỈ được gọi từ `routes/auth.py::login`
+    # SAU KHI verify mật khẩu thật khớp `core.users.password_hash` (bcrypt) — không còn giai đoạn
+    # `demo-login` ký bất kỳ tenant/roles nào không qua kiểm mật khẩu (xem `jwt_auth.py` docstring).
+    # Việc ký/verify chữ ký là THẬT (không ai giả mạo được token nếu không có `jwt_secret`), VÀ việc
+    # "ai được phép xin token cho tenant/roles nào" giờ ĐÃ được xác thực bằng mật khẩu thật — không
+    # còn là câu hỏi bỏ ngỏ (review `app#17`, "nên sửa" #2: comment cũ nói ngược, viết lúc còn
+    # demo-login, chưa cập nhật theo commit xoá route đó). `jwt_secret` không có default: thiếu biến
+    # môi trường phải raise rõ ràng lúc khởi động (pydantic ValidationError), không được chạy với
+    # khoá rỗng/đoán được.
     #
     # `min_length=32` — kit#129 §3.3, mục #3 (VinSOC pentest). LÚC PHÁT HIỆN (trước bản vá này),
     # `.env.example` để default `STUDIO_JWT_SECRET=changeme` (7 ký tự) — app khởi động bình thường,

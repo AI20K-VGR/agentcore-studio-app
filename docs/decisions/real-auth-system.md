@@ -57,11 +57,33 @@ ra 2 đường không độc lập — cửa yếu nhất (`demo-login`, không 
   bump con trỏ `apps/studio` sau khi cả hai merge.
 - Không còn đường đăng nhập nào "khỏi cần mật khẩu" cho dev-stack — mọi lần seed dev-stack đều cần
   chạy `seed_superadmin.py` trước khi đăng nhập được.
-- Timing/status-code oracle cho email tồn tại/không (`DUMMY_PASSWORD_HASH`,
-  `jwt_auth.verify_password`'s 72-byte guard) và validation-error leak (`app.py`'s
-  `_redact_sensitive_validation_errors`) là những mặt còn lại của CÙNG quyết định này — 1 đường
-  đăng nhập thật nghĩa là đường đó phải chịu đúng mức soi mà một hệ thống identity thật cần, khác
-  hẳn 1 dict demo không ai kỳ vọng chịu tải đó.
+- Timing/status-code oracle cho email tồn tại/không ở `POST /api/auth/login`
+  (`DUMMY_PASSWORD_HASH`, `jwt_auth.verify_password`'s 72-byte guard) và validation-error leak
+  (`app.py`'s `_redact_sensitive_validation_errors`) là những mặt còn lại của CÙNG quyết định này —
+  1 đường đăng nhập thật nghĩa là đường đó phải chịu đúng mức soi mà một hệ thống identity thật
+  cần, khác hẳn 1 dict demo không ai kỳ vọng chịu tải đó.
+
+- **Cross-tenant email-exists oracle ở `POST /api/admin/users`/`POST /api/admin/companies` — CHẤP
+  NHẬN, KHÁC mặt oracle ở trên** (review `app#17` đợt 5, Chặn A — sửa lại đoạn này vì bản trước nói
+  ngược: coi 2 mặt oracle là "cùng 1 quyết định đã xử lý", trong khi mặt này CHƯA xử lý). `email`
+  UNIQUE toàn hệ thống (không theo tenant) — company-admin gọi `create_user`/`create_company` với
+  1 email đã tồn tại (kể cả ở tenant KHÁC, kể cả chính email superadmin) nhận `409`, lộ ra "email
+  này tồn tại ở đâu đó trong hệ thống" bằng đúng 1 request, không cần mẹo timing nào. Đây KHÁC oracle
+  ở `login()`: oracle đó cần dò TỪNG email một để biết nó có tồn tại; oracle này thêm khả năng dò
+  ĐƯỢC những email admin/superadmin có giá trị cao (mục tiêu brute-force tiếp theo) từ một tài
+  khoản company-admin cấp thấp.
+  - **Lý do chấp nhận thay vì sửa ngay**: sửa thật đòi đổi `core.users.email` UNIQUE sang
+    `(tenant_id, email)`, kéo theo `login()` không còn tra được chỉ bằng email (cần thêm định danh
+    công ty ở form đăng nhập) — đụng `apps/web#5` (LoginForm đang mở song song, ngoài phạm vi
+    `app#17`). Đổi thiết kế đó cần bàn với `apps/web` trước, không làm đơn phương ở PR này.
+  - **Ai chịu rủi ro**: người vận hành hệ thống (biết superadmin email dễ bị dò hơn qua route quản
+    trị nội bộ, không phải endpoint công khai — company-admin đã là tài khoản có xác thực, không
+    phải người lạ ẩn danh). Giảm nhẹ hiện có: route `/api/admin/*` đòi Bearer JWT hợp lệ của 1
+    company-admin/superadmin thật (không phải endpoint mở), nên kẻ tấn công phải có ít nhất 1 tài
+    khoản admin hợp lệ trước khi dò được oracle này.
+  - **Theo dõi**: nếu `apps/web` chuyển sang yêu cầu định danh công ty lúc đăng nhập (hoặc có nhu
+    cầu bảo mật khác đẩy ưu tiên lên), đổi UNIQUE theo tenant là hướng sửa thật — ghi 1 issue riêng
+    khi quyết định đó chín, không phải trong `app#17`.
 
 ## Chữ ký
 

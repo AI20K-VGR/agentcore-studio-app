@@ -8,6 +8,7 @@ admin mới, không chỉ `_DEMO_ACCOUNTS` cũ.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from uuid import UUID
 
 import pytest
@@ -15,7 +16,7 @@ import pytest_asyncio
 from fastapi import HTTPException
 from pydantic import ValidationError
 from studio_app import middleware
-from studio_app.core._db import Pool, close_pools
+from studio_app.core._db import Pool, close_pools, get_pool
 from studio_app.routes.admin import CreateCompanyRequest, CreateUserRequest, create_company, create_user
 from studio_workbench.tenant_wall import ResolvedContext
 
@@ -29,6 +30,26 @@ async def _close_singleton_pools_after_test() -> AsyncIterator[None]:
 def _set_session(*, tenant_id: UUID, user: str, roles: list[str]) -> object:
     session = ResolvedContext(tenant_id=tenant_id, user=user, roles=roles)
     return middleware._request_session.set(session)
+
+
+@asynccontextmanager
+async def _simulate_request_connection() -> AsyncIterator[None]:
+    """`create_company`/`create_user` giờ đọc/ghi `core.users`/`core.tenants` qua
+    `get_request_connection()` thay vì tự mở connection riêng (review `app#17` đợt 5, Chặn B: pool
+    deadlock khi 2 connection/request giẫm lên `max_size=8`) — test gọi thẳng hàm (không qua ASGI)
+    phải tự set `_request_conn` contextvar trước khi gọi, cùng convention
+    `test_routes_auth.py::_simulate_request_connection`. Một `async with` = một "request" thật:
+    commit xảy ra lúc thoát khối `pool.connection()`, nên dữ liệu chỉ VISIBLE cho connection khác
+    (vd. `admin_pool` dùng để seed/verify) SAU KHI khối này đã thoát — 2 lệnh gọi route liên tiếp
+    trong 1 bài test phải bọc RIÊNG từng khối, không dùng chung 1 khối cho cả hai (khác với 1
+    request HTTP thật, mỗi lệnh gọi route ở đây là 1 "request" độc lập)."""
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        token = middleware._request_conn.set(conn)
+        try:
+            yield
+        finally:
+            middleware._request_conn.reset(token)
 
 
 async def _seed_tenant(admin_pool: Pool, name: str) -> UUID:
@@ -93,7 +114,8 @@ async def test_company_admin_cannot_create_user_in_other_tenant(admin_pool: Pool
 
     token = _set_session(tenant_id=tenant_a, user="admin@acme.com", roles=["admin"])
     try:
-        result = await create_user(body)
+        async with _simulate_request_connection():
+            result = await create_user(body)
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
 
@@ -147,11 +169,12 @@ async def test_password_never_leaks_in_create_company_response(admin_pool: Pool)
     await _seed_superadmin_user(admin_pool, tenant_id, "su@sys")
     token = _set_session(tenant_id=tenant_id, user="su@sys", roles=["superadmin"])
     try:
-        result = await create_company(
-            CreateCompanyRequest(
-                company_name="probe-no-leak-co", admin_email="admin@no-leak.com", admin_password="password123"
+        async with _simulate_request_connection():
+            result = await create_company(
+                CreateCompanyRequest(
+                    company_name="probe-no-leak-co", admin_email="admin@no-leak.com", admin_password="password123"
+                )
             )
-        )
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
 
@@ -179,11 +202,12 @@ async def test_session_without_core_users_row_cannot_create_user(admin_pool: Poo
     )
     try:
         with pytest.raises(HTTPException) as exc_info:
-            await create_user(
-                CreateUserRequest(
-                    email="minted-without-core-users-row@ankor.vn", password="password123", roles=["public"]
+            async with _simulate_request_connection():
+                await create_user(
+                    CreateUserRequest(
+                        email="minted-without-core-users-row@ankor.vn", password="password123", roles=["public"]
+                    )
                 )
-            )
         assert exc_info.value.status_code == 403
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
@@ -200,13 +224,14 @@ async def test_session_without_core_users_row_cannot_create_company(admin_pool: 
     token = _set_session(tenant_id=tenant_id, user="offboarded-su@sys", roles=["superadmin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
-            await create_company(
-                CreateCompanyRequest(
-                    company_name="probe-offboarded-mint",
-                    admin_email="minted@offboarded.com",
-                    admin_password="password123",
+            async with _simulate_request_connection():
+                await create_company(
+                    CreateCompanyRequest(
+                        company_name="probe-offboarded-mint",
+                        admin_email="minted@offboarded.com",
+                        admin_password="password123",
+                    )
                 )
-            )
         assert exc_info.value.status_code == 403
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
@@ -221,11 +246,14 @@ async def test_create_company_sets_created_by_to_real_superadmin_id(admin_pool: 
     await _seed_superadmin_user(admin_pool, tenant_id, "su-created-by@sys")
     token = _set_session(tenant_id=tenant_id, user="su-created-by@sys", roles=["superadmin"])
     try:
-        await create_company(
-            CreateCompanyRequest(
-                company_name="probe-created-by-co", admin_email="admin@created-by.com", admin_password="password123"
+        async with _simulate_request_connection():
+            await create_company(
+                CreateCompanyRequest(
+                    company_name="probe-created-by-co",
+                    admin_email="admin@created-by.com",
+                    admin_password="password123",
+                )
             )
-        )
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
 
@@ -275,17 +303,19 @@ async def test_create_company_duplicate_name_returns_409_not_500(admin_pool: Poo
     await _seed_superadmin_user(admin_pool, tenant_id, "su@sys")
     token = _set_session(tenant_id=tenant_id, user="su@sys", roles=["superadmin"])
     try:
-        await create_company(
-            CreateCompanyRequest(
-                company_name="probe-dup-co", admin_email="admin1@dup.com", admin_password="password123"
-            )
-        )
-        with pytest.raises(HTTPException) as exc_info:
+        async with _simulate_request_connection():
             await create_company(
                 CreateCompanyRequest(
-                    company_name="probe-dup-co", admin_email="admin2@dup.com", admin_password="password123"
+                    company_name="probe-dup-co", admin_email="admin1@dup.com", admin_password="password123"
                 )
             )
+        with pytest.raises(HTTPException) as exc_info:
+            async with _simulate_request_connection():
+                await create_company(
+                    CreateCompanyRequest(
+                        company_name="probe-dup-co", admin_email="admin2@dup.com", admin_password="password123"
+                    )
+                )
         assert exc_info.value.status_code == 409
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
@@ -301,19 +331,23 @@ async def test_create_company_duplicate_admin_email_returns_409_not_500(admin_po
     await _seed_superadmin_user(admin_pool, tenant_id, "su-dup-email@sys")
     token = _set_session(tenant_id=tenant_id, user="su-dup-email@sys", roles=["superadmin"])
     try:
-        await create_company(
-            CreateCompanyRequest(
-                company_name="probe-dup-email-co-1", admin_email="shared-admin@dup.com", admin_password="password123"
-            )
-        )
-        with pytest.raises(HTTPException) as exc_info:
+        async with _simulate_request_connection():
             await create_company(
                 CreateCompanyRequest(
-                    company_name="probe-dup-email-co-2",
+                    company_name="probe-dup-email-co-1",
                     admin_email="shared-admin@dup.com",
                     admin_password="password123",
                 )
             )
+        with pytest.raises(HTTPException) as exc_info:
+            async with _simulate_request_connection():
+                await create_company(
+                    CreateCompanyRequest(
+                        company_name="probe-dup-email-co-2",
+                        admin_email="shared-admin@dup.com",
+                        admin_password="password123",
+                    )
+                )
         assert exc_info.value.status_code == 409
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
@@ -323,3 +357,44 @@ async def test_create_company_duplicate_admin_email_returns_409_not_500(admin_po
         row = await cur.fetchone()
     assert row is not None
     assert row[0] == 0, "tenant thứ 2 phải bị rollback hoàn toàn, không để lại mồ côi"
+
+
+async def test_create_user_rejects_empty_roles() -> None:
+    """`roles: []` trước bản vá vẫn tạo được tài khoản (không hại — fence trả 0 chunk — nhưng không
+    có lý do hợp lệ nào cho tài khoản không role nào tồn tại, review `app#17`, "nên sửa" #5).
+    Chặn này xảy ra TRƯỚC khi chạm connection nào (cùng chỗ với check `invalid_roles`), nên không
+    cần `_simulate_request_connection()`."""
+    token = _set_session(tenant_id=UUID(int=0), user="admin@acme.com", roles=["admin"])
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            await create_user(CreateUserRequest(email="no-roles@acme.com", password="password123", roles=[]))
+        assert exc_info.value.status_code == 400
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+
+def test_create_company_rejects_blank_company_name() -> None:
+    """`company_name=""`/`"   "` trước bản vá vẫn tạo được tenant (review `app#17`, "nên sửa" #1)."""
+    with pytest.raises(ValidationError):
+        CreateCompanyRequest(company_name="   ", admin_email="admin@blank-co.com", admin_password="password123")
+
+
+def test_create_user_normalizes_email_whitespace_and_case() -> None:
+    """`"Admin@Acme.com"`/`"  admin@acme.com  "` trước bản vá tạo được tài khoản KHÔNG đăng nhập
+    nổi bằng dạng chuẩn hoá (`login()` khớp `WHERE email = %s` chính xác) — review `app#17`,
+    "nên sửa" #1. `CreateUserRequest`/`CreateCompanyRequest` giờ chuẩn hoá `.strip().lower()` ngay
+    ở tầng Pydantic, TRƯỚC khi chạm route/DB."""
+    body = CreateUserRequest(email="  Admin@ACME.example  ", password="password123", roles=["public"])
+    assert body.email == "admin@acme.example"
+
+
+def test_create_company_admin_email_normalized() -> None:
+    body = CreateCompanyRequest(
+        company_name="normalize-co", admin_email="  Admin@ACME.example  ", admin_password="password123"
+    )
+    assert body.admin_email == "admin@acme.example"
+
+
+def test_create_user_rejects_blank_email() -> None:
+    with pytest.raises(ValidationError):
+        CreateUserRequest(email="   ", password="password123", roles=["public"])

@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 
 import jwt as pyjwt
 import pytest
+from loguru import logger as loguru_logger
 from studio_app import jwt_auth
 from studio_app.settings import Settings
 from studio_workbench.tenant_wall import ResolvedContext
@@ -117,6 +118,37 @@ def test_verify_password_malformed_stored_hash_returns_false_not_raise() -> None
     ĐÚNG email đó nhưng 401 cho email không tồn tại, tự nó là 1 oracle khác biệt account tồn tại
     (review `app#17` đợt 3, Important)."""
     assert jwt_auth.verify_password("anything", "not-a-valid-bcrypt-hash") is False
+
+
+def test_verify_password_oversized_plaintext_does_not_log_malformed_hash_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ghim ĐƯỜNG ĐI, không chỉ giá trị trả về: `verify_password` phải trả `False` cho ca >72 byte
+    qua nhánh `if len(plain.encode("utf-8")) > 72:` RIÊNG, TRƯỚC khi chạm `except ValueError`. Nếu
+    xoá nhánh pre-check đó, hành vi NGOÀI quan sát được (trả `False`, không raise) vẫn giữ nguyên —
+    `bcrypt.checkpw` tự nó cũng raise `ValueError` cho input >72 byte, rơi vào `except ValueError`
+    bên dưới — nên `test_verify_password_oversized_plaintext_returns_false_not_raise` ở trên KHÔNG
+    bắt được mutant xoá pre-check đó (review `app#17`, "nên sửa" #3: thực nghiệm xác nhận mutant
+    này cho `111 passed`, suite xanh nguyên). Tín hiệu DUY NHẤT phân biệt 2 đường: `except
+    ValueError` bên dưới LUÔN log cảnh báo "hash không đúng định dạng bcrypt" — pre-check thì
+    không log gì. Ghim bằng cách assert KHÔNG có cảnh báo nào cho ca >72 byte thật (khác ca hash
+    hỏng, xem bài dưới) — sai đường sẽ log, làm bài này đỏ."""
+    warnings: list[str] = []
+    monkeypatch.setattr(loguru_logger, "warning", lambda msg: warnings.append(msg))
+    password_hash = jwt_auth.hash_password("some-real-password")
+
+    assert jwt_auth.verify_password("a" * 73, password_hash) is False
+    assert warnings == []
+
+
+def test_verify_password_malformed_hash_does_log_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Đối trọng của bài trên — ca hash hỏng THẬT (không phải >72 byte) phải đi qua `except
+    ValueError` và log đúng 1 cảnh báo, khác ca >72 byte ở trên (không log gì)."""
+    warnings: list[str] = []
+    monkeypatch.setattr(loguru_logger, "warning", lambda msg: warnings.append(msg))
+
+    assert jwt_auth.verify_password("anything", "not-a-valid-bcrypt-hash") is False
+    assert len(warnings) == 1
 
 
 def test_two_tenants_get_non_interchangeable_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
