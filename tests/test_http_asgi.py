@@ -286,3 +286,80 @@ async def test_login_end_to_end_through_real_http(client: AsyncClient, admin_poo
         headers={"Authorization": f"Bearer {token}"},
     )
     assert admin_res.status_code == 403  # role "admin", không phải "superadmin" — đúng, không phải 401
+
+
+async def test_create_company_partial_failure_does_not_orphan_tenant_through_real_http(
+    client: AsyncClient, admin_pool: Pool
+) -> None:
+    """Critical, phát hiện độc lập bởi 4 review khác nhau SAU đợt 6 (bug thật, không phải nitpick):
+    `create_company` (`routes/admin.py`) trước bản vá này bọc 2 INSERT (tenant, rồi admin user)
+    trong 2 `conn.transaction()` (SAVEPOINT) RIÊNG. Nếu insert tenant thành công (savepoint 1 đã
+    RELEASE — merge vào transaction ngoài của middleware) rồi insert admin user thất bại
+    (`UniqueViolation`, savepoint 2 rollback, route raise `HTTPException(409)`): `HTTPException` đó
+    bị FastAPI's `ExceptionMiddleware` bắt và CHUYỂN THÀNH RESPONSE ngay TRONG lời gọi `call_next()`
+    (`middleware.py::tenant_context_middleware`) — không BAO GIỜ propagate lên tới `try/finally`
+    bọc `async with pool.connection()` của middleware. Middleware thoát khối `async with` KHÔNG có
+    exception nào cả -> COMMIT nguyên transaction ngoài -> tenant vừa insert (savepoint đã release)
+    được commit thật dù client nhận 409. `core.tenants.name` UNIQUE nên tên công ty đó kẹt VĨNH VIỄN
+    — không endpoint nào tạo lại được qua API.
+
+    Bài test gọi thẳng hàm (`test_admin_routes.py`, không qua ASGI) KHÔNG bắt được lỗ này: đặt
+    `pytest.raises(HTTPException)` bọc NGOÀI khối tự dựng connection khiến exception propagate qua
+    `pool.connection()` context manager thật của psycopg -> psycopg TỰ rollback TOÀN BỘ connection
+    (kể cả savepoint đã release) -> test đó thấy "sạch", nhưng đường rollback đó KHÔNG xảy ra được
+    qua HTTP thật (FastAPI đã nuốt exception trước khi nó tới được `pool.connection()`). Bài này đi
+    qua `ASGITransport` thật — đúng đường thật, không mô phỏng sai.
+
+    Sửa: gộp 2 SAVEPOINT thành 1 (bọc CẢ HAI insert), disambiguate qua `exc.diag.constraint_name`.
+    Verify ở đây theo 2 lớp: (1) `core.tenants` KHÔNG có dòng mồ côi tên `partial-fail-co` sau 409;
+    (2) tên công ty đó có thể tạo LẠI thành công ngay sau — chứng minh không kẹt vĩnh viễn."""
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute(
+            "INSERT INTO core.tenants (name) VALUES (%s) RETURNING id", ("partial-fail-superadmin-tenant",)
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        su_tenant_id = row[0]
+        await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            (su_tenant_id, "su-partial-fail@sys", hash_password("superadmin-password-123"), ["superadmin"]),
+        )
+        # Email đã tồn tại SẴN — dùng làm admin_email cho lần gọi bên dưới để buộc INSERT thứ 2 vỡ.
+        await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            (su_tenant_id, "already-taken@acme.com", hash_password("whatever-password"), ["admin"]),
+        )
+
+    login_res = await client.post(
+        "/api/auth/login", json={"email": "su-partial-fail@sys", "password": "superadmin-password-123"}
+    )
+    assert login_res.status_code == 200
+    token = login_res.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    company_name = "partial-fail-co"
+    res = await client.post(
+        "/api/admin/companies",
+        json={"company_name": company_name, "admin_email": "already-taken@acme.com", "admin_password": "password123"},
+        headers=headers,
+    )
+    assert res.status_code == 409, f"admin_email trùng phải 409 — thấy {res.status_code}: {res.text}"
+
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("SELECT count(*) FROM core.tenants WHERE name = %s", (company_name,))
+        count_row = await cur.fetchone()
+    assert count_row is not None
+    assert count_row[0] == 0, (
+        "tenant mồ côi: insert tenant đã commit dù insert admin user thất bại — "
+        f"{company_name!r} kẹt vĩnh viễn vì core.tenants.name UNIQUE"
+    )
+
+    retry_res = await client.post(
+        "/api/admin/companies",
+        json={"company_name": company_name, "admin_email": "retry-admin@acme.com", "admin_password": "password123"},
+        headers=headers,
+    )
+    assert retry_res.status_code == 200, (
+        f"tên công ty {company_name!r} phải tạo lại được sau lần lỗi trước — thấy {retry_res.status_code}: "
+        f"{retry_res.text}"
+    )

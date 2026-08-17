@@ -117,37 +117,47 @@ async def create_company(body: CreateCompanyRequest) -> CreateCompanyResponse:
         )
     created_by = creator_row[0]
 
-    # `async with conn.transaction():` mở 1 SAVEPOINT (connection này đã ở giữa 1 transaction do
-    # middleware mở) — bắt `UniqueViolation` rồi raise tiếp chỉ rollback tới SAVEPOINT đó, không
-    # đánh "aborted" nguyên transaction ngoài của middleware. Verify thật (review `app#17` đợt 5):
-    # UniqueViolation bắt được trong block lồng, query tiếp trên CÙNG connection sau lỗi vẫn chạy
-    # bình thường, và sau commit chỉ dòng KHÔNG lỗi được giữ lại — thay hẳn cho việc mở connection
-    # riêng như trước, không cần connection thứ 2 để có rollback độc lập.
+    # roles mặc định của admin công ty ĐẦU TIÊN: "admin" (mở canvas) + đủ 4 role nội dung —
+    # admin công ty cần đọc được mọi tài liệu để cấu hình agent, khác nhân viên phòng ban chỉ
+    # cần role của mình.
+    admin_roles = ["admin", *sorted(SECTION_VOCAB)]
+
+    # MỘT SAVEPOINT DUY NHẤT bọc CẢ HAI insert — KHÔNG phải 2 savepoint riêng (review `app#17`
+    # đợt 6, phát hiện độc lập từ 4 lượt review sau đợt 5: bug thật, không phải nitpick). Lý do 2
+    # savepoint riêng SAI: nếu insert tenant THÀNH CÔNG (savepoint 1 đã RELEASE — merge vào
+    # transaction ngoài của middleware) rồi insert admin user THẤT BẠI (savepoint 2 rollback,
+    # raise HTTPException(409)) — HTTPException bị FastAPI's ExceptionMiddleware bắt VÀ CHUYỂN
+    # THÀNH RESPONSE ngay TRONG lời gọi `call_next()`, nên nó KHÔNG BAO GIỜ propagate lên tới
+    # `tenant_context_middleware`'s `async with pool.connection()` (middleware.py:96-122, `try/
+    # finally`, không phải `try/except` — response trả về BÌNH THƯỜNG). Middleware thoát khối
+    # `async with` KHÔNG có exception -> COMMIT nguyên transaction ngoài -> tenant vừa insert
+    # (savepoint đã release) được commit thật, dù client nhận 409. `core.tenants.name` UNIQUE nên
+    # tên công ty đó kẹt vĩnh viễn — không endpoint nào xoá được qua API. Gộp 1 savepoint: insert
+    # thứ 2 lỗi sẽ rollback NGUYÊN savepoint đó, tức rollback CẢ hai insert cùng lúc — không còn
+    # tenant mồ côi nào được release trước khi biết insert thứ 2 có ổn không.
     try:
         async with conn.transaction():
             cur = await conn.execute(
                 "INSERT INTO core.tenants (name) VALUES (%s) RETURNING id",
                 (body.company_name,),
             )
-    except psycopg.errors.UniqueViolation as exc:  # trùng company_name — 409, không 500
-        raise HTTPException(status_code=409, detail=f"công ty {body.company_name!r} đã tồn tại") from exc
-    row = await cur.fetchone()
-    assert row is not None
-    tenant_id = row[0]
-
-    # roles mặc định của admin công ty ĐẦU TIÊN: "admin" (mở canvas) + đủ 4 role nội dung —
-    # admin công ty cần đọc được mọi tài liệu để cấu hình agent, khác nhân viên phòng ban chỉ
-    # cần role của mình.
-    admin_roles = ["admin", *sorted(SECTION_VOCAB)]
-    try:
-        async with conn.transaction():
+            row = await cur.fetchone()
+            assert row is not None
+            tenant_id = row[0]
             await conn.execute(
                 "INSERT INTO core.users (tenant_id, email, password_hash, roles, created_by) "
                 "VALUES (%s, %s, %s, %s, %s)",
                 (tenant_id, body.admin_email, admin_password_hash, admin_roles, created_by),
             )
-    except psycopg.errors.UniqueViolation as exc:  # trùng admin_email — 409, không 500
-        raise HTTPException(status_code=409, detail=f"email {body.admin_email!r} đã tồn tại") from exc
+    except psycopg.errors.UniqueViolation as exc:
+        # Một constraint DUY NHẤT có thể vỡ ở đây — `exc.diag.constraint_name` (Postgres tự đặt
+        # tên `<table>_<column>_key` cho UNIQUE cột đơn không đặt tên tay, xác nhận thật qua
+        # `pg_constraint`) phân biệt 2 ca thay vì suy luận từ thứ tự câu lệnh nào vừa chạy.
+        if exc.diag.constraint_name == "tenants_name_key":
+            raise HTTPException(status_code=409, detail=f"công ty {body.company_name!r} đã tồn tại") from exc
+        if exc.diag.constraint_name == "users_email_key":
+            raise HTTPException(status_code=409, detail=f"email {body.admin_email!r} đã tồn tại") from exc
+        raise  # constraint lạ chưa biết — fail loud, không đoán mò thông điệp
 
     return CreateCompanyResponse(tenant_id=str(tenant_id), admin_email=body.admin_email)
 

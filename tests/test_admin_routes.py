@@ -326,7 +326,20 @@ async def test_create_company_duplicate_admin_email_returns_409_not_500(admin_po
     cũng UNIQUE, độc lập với `core.tenants.name`) — review `app#17` đợt 2 chỉ ra bài trên chỉ phủ
     nhánh trùng tên công ty, chưa có bài nào phủ nhánh trùng email dù docstring có nhắc tới. INSERT
     tenant THÀNH CÔNG trước (tên khác), rồi mới vỡ ở INSERT user (email trùng) — phải rollback cả
-    tenant vừa tạo, không để lại 1 tenant mồ côi không có admin nào."""
+    tenant vừa tạo, không để lại 1 tenant mồ côi không có admin nào.
+
+    GIỚI HẠN của bài này (4 review độc lập chỉ ra sau đợt 6): gọi thẳng hàm, không qua ASGI — khi
+    `HTTPException` propagate qua `async with _simulate_request_connection():` (khối `pool.
+    connection()` TỰ DựNG cho test), psycopg tự ROLLBACK TOÀN BỘ connection đó, kể cả phần đã
+    "release" của SAVEPOINT trước. Qua HTTP THẬT, `HTTPException` bị FastAPI's `ExceptionMiddleware`
+    bắt và chuyển thành response NGAY trong `call_next()` — KHÔNG BAO GIỜ propagate tới
+    `tenant_context_middleware`'s `pool.connection()`, nên middleware đó COMMIT bình thường. Nếu 2
+    INSERT của `create_company` từng nằm ở 2 SAVEPOINT riêng (bug đã sửa ở đợt 6), bài test NÀY vẫn
+    xanh dù bug còn sống, vì cơ chế rollback ở đây MẠNH HƠN cơ chế thật. Bài xác nhận ĐÚNG đường thật
+    (qua `ASGITransport`, sống sót được cả class bug này) là
+    `test_http_asgi.py::test_create_company_partial_failure_does_not_orphan_tenant_through_real_http`
+    — bài đó mới là nguồn xác nhận chính, bài này giữ lại vì vẫn hữu ích cho việc test nhanh 2 nhánh
+    UNIQUE riêng biệt (tên công ty vs email)."""
     tenant_id = await _seed_tenant(admin_pool, "probe-dup-email-superadmin-tenant")
     await _seed_superadmin_user(admin_pool, tenant_id, "su-dup-email@sys")
     token = _set_session(tenant_id=tenant_id, user="su-dup-email@sys", roles=["superadmin"])
