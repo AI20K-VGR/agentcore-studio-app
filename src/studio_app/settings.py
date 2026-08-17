@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -19,14 +20,38 @@ class Settings(BaseSettings):
     enable_tracing: bool = False
     use_fake_providers: bool = True
 
-    # JWT ký/verify identity (Kế hoạch 2, A2/A1) — KHÔNG có provider identity thật đứng sau (không
-    # password/OAuth/IdP nào check `user`/`tenant`/`roles` trước khi ký): việc ký/verify chữ ký là
-    # THẬT (không ai giả mạo được token nếu không có `jwt_secret`), nhưng việc "ai được phép xin
-    # token cho tenant/roles nào" vẫn CHƯA được xác thực — đó là hệ thống identity provider riêng,
-    # ngoài phạm vi hiện tại. `jwt_secret` không có default: thiếu biến môi trường phải raise rõ
-    # ràng lúc khởi động (pydantic ValidationError), không được chạy với khoá rỗng/đoán được.
-    jwt_secret: str
+    # JWT ký/verify identity (Kế hoạch 3) — `issue_token()` giờ CHỈ được gọi từ `routes/auth.py::login`
+    # SAU KHI verify mật khẩu thật khớp `core.users.password_hash` (bcrypt) — không còn giai đoạn
+    # `demo-login` ký bất kỳ tenant/roles nào không qua kiểm mật khẩu (xem `jwt_auth.py` docstring).
+    # Việc ký/verify chữ ký là THẬT (không ai giả mạo được token nếu không có `jwt_secret`), VÀ việc
+    # "ai được phép xin token cho tenant/roles nào" giờ ĐÃ được xác thực bằng mật khẩu thật — không
+    # còn là câu hỏi bỏ ngỏ (review `app#17`, "nên sửa" #2: comment cũ nói ngược, viết lúc còn
+    # demo-login, chưa cập nhật theo commit xoá route đó). `jwt_secret` không có default: thiếu biến
+    # môi trường phải raise rõ ràng lúc khởi động (pydantic ValidationError), không được chạy với
+    # khoá rỗng/đoán được.
+    #
+    # `min_length=32` — kit#129 §3.3, mục #3 (VinSOC pentest). LÚC PHÁT HIỆN (trước bản vá này),
+    # `.env.example` để default `STUDIO_JWT_SECRET=changeme` (7 ký tự) — app khởi động bình thường,
+    # chỉ cảnh báo "HMAC key 8 bytes" từ thư viện chứ không chặn — ai deploy thật quên đổi secret
+    # thì kẻ tấn công tự ký được JWT giả (biết trước default công khai trong repo). Verify JWT đã
+    # đúng chuẩn (alg=none/sai-secret/hết-hạn đều chặn — mentor xác nhận) — vấn đề CHỈ ở chỗ secret
+    # yếu không bị enforce. `min_length=32` chặn cả "changeme" lẫn mọi secret ngắn khác, không tách
+    # dev/prod. `.env.example` đã đổi placeholder dài hơn 32 ký tự trong cùng đợt vá (kit#164) —
+    # comment này giữ nguyên bối cảnh LÚC PHÁT HIỆN, không phải hiện trạng `.env.example` bây giờ
+    # (review `app#17`, Chặn 3: comment cũ khẳng định nhầm "đã xác nhận sẵn" trong khi lúc viết PR
+    # đó `.env.example` vẫn còn `changeme` — sửa cách diễn đạt cho khỏi tự mâu thuẫn).
+    jwt_secret: str = Field(min_length=32)
     jwt_expire_minutes: int = 480
+
+    # `rate_limit.py` keys theo IP cho `POST /api/auth/login` (review `app#17`, Important #2, đợt
+    # 8→9) — mặc định đọc `request.client.host` (IP TCP thật của kết nối tới process này). Sau
+    # reverse proxy/load balancer, MỌI request đều mang cùng 1 IP đó (IP của proxy), gộp MỌI người
+    # dùng thật vào chung 1 bucket 10 req/phút — tự-DoS người dùng hợp lệ, không cần kẻ tấn công
+    # làm gì. Mặc định `False` (an toàn cho triển khai KHÔNG có proxy đáng tin, kể cả `docker-compose
+    # --profile app`) — bật `True` CHỈ khi có reverse proxy đáng tin cấu hình ghi đè/set cứng
+    # `X-Forwarded-For` (không cho client tự khai giá trị đó lọt qua), nếu không bật nhầm sẽ MỞ LẠI
+    # đường né rate-limit bằng cách client tự set header giả trực tiếp (KHÔNG qua proxy nào).
+    trust_x_forwarded_for: bool = False
 
     gemini_api_key: str | None = None
 

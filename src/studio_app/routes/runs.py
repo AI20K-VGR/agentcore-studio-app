@@ -100,6 +100,26 @@ async def create_run(body: RunRequest) -> RunResponse:
         # UI đã chặn export/test khi `graph_lint()` đỏ, nhưng client vẫn có thể gửi thẳng qua API.
         raise HTTPException(status_code=400, detail=f"recipe không qua graph_lint(): {exc}") from exc
 
+    # `Pool` (`get_pool()`), KHÔNG dùng `get_request_connection()` — review `app#17` đợt 3, "mở
+    # rộng connection-reuse pattern sang runs.py/publish.py/chat.py?". QUYẾT ĐỊNH: KHÔNG mở rộng
+    # trong PR này, nhưng đây KHÔNG PHẢI vì get_pool() "tiết kiệm" connection hơn — bản comment đầu
+    # ở đây (đợt 3) khẳng định vậy là SAI, đã tự phản chứng (đợt 4): `middleware.py`'s
+    # `tenant_context_middleware` ĐÃ giữ 1 connection từ CHÍNH pool này (`await pool.connection()`)
+    # bọc quanh TOÀN BỘ `await call_next(request)` — tức MỌI request (bất kể route) đã tốn 1
+    # connection suốt đời request rồi, KHÔNG PHỤ THUỘC route này dùng `get_pool()` hay
+    # `get_request_connection()`. `get_pool()` ở đây là connection THỨ HAI, checkout/trả lại riêng
+    # theo từng query của `PgKbSearch`/`PgTraceWriter` bên trong `interpreter.run()` — CỘNG THÊM
+    # vào connection middleware đã giữ, không phải thay thế nó. Với `max_size=8` (`core/_db.py`),
+    # dù route dùng `get_request_connection()` (không cộng thêm) hay `get_pool()` (cộng thêm tạm
+    # thời mỗi query) thì phần đáy — 1 connection/request suốt cả lượt `interpreter.run()` có thể
+    # kéo dài nhiều giây vì gọi LLM — VẪN CÒN NGUYÊN, khoảng 8 request đồng thời (bất kỳ route nào,
+    # không riêng route này) đã đủ ăn hết pool. Đây là rủi ro Important còn tồn tại từ đợt 3, CHƯA
+    # được PR này giải quyết — sửa đúng cần 1 trong 2: (a) đổi `PgKbSearch`/`PgTraceWriter`
+    # (`packages/kb`) nhận 1 connection thay vì cả `Pool`, để route này tái dùng
+    # `get_request_connection()` (giảm về đúng 1 connection/request, không cộng thêm — nhưng đổi
+    # chữ ký 1 package dùng chung, ngoài scope PR này), hoặc (b) tái cấu trúc middleware để không
+    # giữ connection xuyên suốt `call_next()` cho các route không cần nó suốt cả lượt chạy. Không
+    # làm ở đây — ghi lại tường minh làm follow-up, không phải để im như đợt 3 đã cảnh báo.
     pool = await get_pool()
     embedding: EmbeddingService = CallistoEmbedding()
     kb_search = PgKbSearch(pool, embedding)

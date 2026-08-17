@@ -63,7 +63,7 @@ def get_request_session() -> ResolvedContext:
     if session is None:
         raise HTTPException(
             status_code=401,
-            detail="Thiếu hoặc sai `Authorization: Bearer <jwt>` — cần đăng nhập trước (`POST /api/auth/demo-login`).",
+            detail="Thiếu hoặc sai `Authorization: Bearer <jwt>` — cần đăng nhập trước (`POST /api/auth/login`).",
         )
     return session
 

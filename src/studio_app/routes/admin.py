@@ -1,0 +1,310 @@
+"""`POST /api/admin/companies` + `POST /api/admin/users` (Kế hoạch 3) — 2 bậc quản trị của auth
+thật (xem `routes/auth.py`). `_DEMO_ACCOUNTS`/`demo-login` đã bị xoá hẳn — đây giờ là con đường
+DUY NHẤT để có tài khoản đăng nhập được (mọi tài khoản, kể cả để dev/test, đều đi qua đây):
+
+- **superadmin** (bootstrap NGOÀI luồng API, `scripts/seed_superadmin.py`) tạo công ty mới
+  (`core.tenants` row) + tài khoản admin ĐẦU TIÊN của công ty đó.
+- **company-admin** (do superadmin tạo) tự tạo tài khoản nhân viên cho ĐÚNG công ty mình — không
+  có cách nào tạo cho tenant khác (`tenant_id` CỐ Ý KHÔNG có field trong `CreateUserRequest`, copy
+  nguyên văn pattern `RunRequest`/INV-1, `routes/runs.py:49-52`).
+
+`roles` client gửi lên LUÔN bị validate server-side `<= SECTION_VOCAB ∪ {"admin"}` — không tin
+riêng UI chặn (đúng bài học ngưỡng `[0,1]`, `kit#129` §3.1). `"superadmin"` KHÔNG nằm trong tập
+cho phép ở `/users` — company-admin không tự phong được superadmin cho ai.
+
+`email` UNIQUE TOÀN HỆ THỐNG (không theo tenant) — 409 dưới đây (trùng email) LỘ RA "email này tồn
+tại ở đâu đó trong hệ thống", kể cả tenant KHÁC, kể cả email superadmin. Đây là oracle CHẤP NHẬN có
+chủ đích, KHÔNG phải bỏ sót — lý do đầy đủ + điều kiện đổi hướng ở
+`docs/decisions/real-auth-system.md` §"Hệ quả đã chấp nhận" (review `app#17` đợt 5, Chặn A).
+"""
+
+from __future__ import annotations
+
+from typing import NewType
+
+import psycopg.errors
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field, field_validator
+from starlette.concurrency import run_in_threadpool
+from studio_kb.doc_factory import SECTION_VOCAB
+
+from studio_app.jwt_auth import hash_password, normalize_email
+from studio_app.middleware import get_request_connection, get_request_session
+
+router = APIRouter(prefix="/api/admin", tags=["admin"])
+
+# `roles` hợp lệ khi COMPANY-ADMIN tạo user — KHÔNG có "superadmin" (chỉ superadmin mới phong
+# được superadmin, và hiện tại không route nào cho phép — cố tình, xem module docstring).
+_USER_ROLE_VOCAB: frozenset[str] = SECTION_VOCAB | {"admin"}
+
+FreshRoles = NewType("FreshRoles", list[str])
+"""Type riêng cho "roles vừa tra từ `core.users` trong request này" — KHÁC `list[str]` thường
+(vd `session.roles`, claim JWT). Không có type riêng, `require_admin(session.roles)` type-check
+sạch như `require_admin(fresh_roles)` — mypy không phân biệt được, 1 lần review-miss là bug leo
+quyền sống lại lặng lẽ (review `app#17` đợt 9, Type-safety gap: "enforced by exactly one regression
+test plus convention, not the compiler"). `NewType` không chặn được ai CỐ TÌNH viết
+`require_admin(FreshRoles(session.roles))` để né mypy — nhưng chặn được ca ngộ nhận, việc thực tế
+hay xảy ra hơn nhiều: gõ nhầm `session.roles` thay vì roles vừa tra sẽ ĐỎ NGAY ở mypy, không đợi
+tới lúc chạy production."""
+
+
+def _reject_blank(v: str) -> str:
+    """`.strip()` rồi chặn rỗng — `company_name=""`/`"   "` trước bản vá vẫn tạo được tenant
+    (review `app#17`, "nên sửa" #1, phần `company_name`)."""
+    stripped = v.strip()
+    if not stripped:
+        raise ValueError("không được để trống")
+    return stripped
+
+
+def _reject_oversized_password(v: str) -> str:
+    """bcrypt chỉ băm được tối đa 72 BYTE (không phải 72 ký tự — 1 ký tự có dấu tiếng Việt có thể
+    chiếm 2-3 byte UTF-8), vượt quá sẽ raise `ValueError` bên trong `hash_password` -> 500 không
+    bắt được ở tầng route. Chặn ở Pydantic validator (422, không phải 500) — review `app#17`, nửa
+    "create" của Chặn 2 (nửa "login" đã chặn riêng ở `jwt_auth.verify_password`)."""
+    if len(v.encode("utf-8")) > 72:
+        raise ValueError("mật khẩu tối đa 72 byte (giới hạn bcrypt)")
+    return v
+
+
+def require_superadmin(roles: FreshRoles) -> None:
+    """403 — đã đăng nhập rồi (qua get_request_session(), 401 xử lý ở lớp dưới), chỉ thiếu ĐÚNG
+    quyền superadmin. Khác `get_request_session()`'s 401 (chưa chứng minh được là ai).
+
+    `roles` PHẢI là roles TƯƠI tra lại từ `core.users` ngay trong request này (type `FreshRoles`,
+    xem định nghĩa ở trên), KHÔNG phải `session.roles` (claim JWT, type `list[str]` thường) — JWT
+    là ảnh chụp lúc đăng nhập, sống tới `jwt_expire_minutes` (mặc định 480 phút = 8 tiếng). 1
+    superadmin bị thu hồi quyền giữa chừng (roles đổi trong DB) vẫn còn "superadmin" trong JWT cũ
+    tới lúc hết hạn nếu route tin thẳng `session.roles` — review `app#17`, Important #1 (đợt 8)."""
+    if "superadmin" not in roles:
+        raise HTTPException(status_code=403, detail="Cần quyền superadmin.")
+
+
+def require_admin(roles: FreshRoles) -> None:
+    """Cùng lý do `require_superadmin` ở trên — `roles` phải là roles TƯƠI từ DB, không phải JWT."""
+    if "admin" not in roles and "superadmin" not in roles:
+        raise HTTPException(status_code=403, detail="Cần quyền admin.")
+
+
+class CreateCompanyRequest(BaseModel):
+    company_name: str
+    admin_email: str
+    admin_password: str = Field(min_length=8)
+
+    _validate_admin_password = field_validator("admin_password")(_reject_oversized_password)
+    _normalize_admin_email = field_validator("admin_email")(normalize_email)
+    _validate_company_name = field_validator("company_name")(_reject_blank)
+
+
+class CreateCompanyResponse(BaseModel):
+    tenant_id: str
+    admin_email: str
+    """CỐ Ý không trả `admin_password`/`password_hash` — xem `test_admin_routes.py`."""
+
+
+@router.post("/companies", response_model=CreateCompanyResponse)
+async def create_company(body: CreateCompanyRequest) -> CreateCompanyResponse:
+    # `get_request_session()` ở đây CHỈ để lấy identity (`session.user`, tức email đã qua verify
+    # chữ ký JWT) — KHÔNG dùng `session.roles` để phân quyền (xem SELECT ngay dưới). 401 (chưa
+    # chứng minh được là ai) vẫn xử lý ở đây như cũ.
+    session = get_request_session()
+
+    # Dùng `get_request_connection()` (connection middleware đã mở sẵn cho request này), KHÔNG tự
+    # mở thêm 1 connection riêng qua `get_pool()` — trước bản vá đợt 6, mỗi request tới route này
+    # giữ ĐỒNG THỜI 2 connection trong pool `max_size=8` suốt đời request, y hệt vấn đề
+    # `routes/auth.py::login` đã sửa ở đợt 3 (review `app#17` đợt 5, Chặn B).
+    conn = get_request_connection()
+
+    # Tra `id` + `roles` TƯƠI từ `core.users`, KHÔNG dùng `session.roles` (claim JWT) để phân
+    # quyền — JWT là ảnh chụp lúc đăng nhập, sống tới `jwt_expire_minutes` (mặc định 480 phút).
+    # 1 superadmin bị thu hồi quyền giữa chừng (sửa `roles` trong `core.users`) vẫn còn quyền cũ
+    # trong JWT tới lúc hết hạn nếu route tin thẳng `session.roles` (review `app#17`, Important #1,
+    # đợt 8) — route này ĐÃ SẴN 1 lượt round-trip để lấy `created_by`, nên tra thêm cột `roles`
+    # ở CÙNG query không tốn thêm round-trip nào. Đặt TRƯỚC bcrypt (khác thứ tự cũ) — không còn lý
+    # do giữ hash trước connection nữa: `get_request_connection()` không phải 1 lượt checkout pool
+    # mới (khác `get_pool()` cũ), connection đã được middleware giữ suốt đời request bất kể gọi lúc
+    # nào, nên đổi thứ tự không tốn thêm pool pressure, mà còn fail-fast đúng roles trước khi tốn
+    # ~200-370ms băm mật khẩu cho 1 request sẽ bị 403 dù sao.
+    cur = await conn.execute("SELECT id, roles FROM core.users WHERE email = %s", (session.user,))
+    creator_row = await cur.fetchone()
+    if creator_row is None:
+        # Cùng lưới an toàn với `create_user` bên dưới (Chặn 1, review `app#17`) — trước bản
+        # vá đợt 2, route này KHÔNG có chặn này: 1 JWT superadmin còn hạn (mặc định 480 phút)
+        # nhưng tài khoản đã bị xoá khỏi `core.users` (offboard) vẫn tạo được công ty + admin
+        # mới — token hết hạn hay account bị xoá không đồng nghĩa nhau nếu không kiểm lại DB.
+        raise HTTPException(
+            status_code=403,
+            detail="Tài khoản gọi API không tồn tại trong core.users.",
+        )
+    created_by, creator_roles_raw = creator_row
+    require_superadmin(FreshRoles(list(creator_roles_raw)))
+
+    # bcrypt là CPU-bound đồng bộ (~200-370ms) — chạy qua threadpool để không chặn event loop.
+    admin_password_hash = await run_in_threadpool(hash_password, body.admin_password)
+
+    # roles mặc định của admin công ty ĐẦU TIÊN: "admin" (mở canvas) + đủ 4 role nội dung —
+    # admin công ty cần đọc được mọi tài liệu để cấu hình agent, khác nhân viên phòng ban chỉ
+    # cần role của mình.
+    admin_roles = ["admin", *sorted(SECTION_VOCAB)]
+
+    # MỘT SAVEPOINT DUY NHẤT bọc CẢ HAI insert — KHÔNG phải 2 savepoint riêng (review `app#17`
+    # đợt 6, phát hiện độc lập từ 4 lượt review sau đợt 5: bug thật, không phải nitpick). Lý do 2
+    # savepoint riêng SAI: nếu insert tenant THÀNH CÔNG (savepoint 1 đã RELEASE — merge vào
+    # transaction ngoài của middleware) rồi insert admin user THẤT BẠI (savepoint 2 rollback,
+    # raise HTTPException(409)) — HTTPException bị FastAPI's ExceptionMiddleware bắt VÀ CHUYỂN
+    # THÀNH RESPONSE ngay TRONG lời gọi `call_next()`, nên nó KHÔNG BAO GIỜ propagate lên tới
+    # `tenant_context_middleware`'s `async with pool.connection()` (middleware.py:96-122, `try/
+    # finally`, không phải `try/except` — response trả về BÌNH THƯỜNG). Middleware thoát khối
+    # `async with` KHÔNG có exception -> COMMIT nguyên transaction ngoài -> tenant vừa insert
+    # (savepoint đã release) được commit thật, dù client nhận 409. `core.tenants.name` UNIQUE nên
+    # tên công ty đó kẹt vĩnh viễn — không endpoint nào xoá được qua API. Gộp 1 savepoint: insert
+    # thứ 2 lỗi sẽ rollback NGUYÊN savepoint đó, tức rollback CẢ hai insert cùng lúc — không còn
+    # tenant mồ côi nào được release trước khi biết insert thứ 2 có ổn không.
+    try:
+        async with conn.transaction():
+            cur = await conn.execute(
+                "INSERT INTO core.tenants (name) VALUES (%s) RETURNING id",
+                (body.company_name,),
+            )
+            row = await cur.fetchone()
+            assert row is not None
+            tenant_id = row[0]
+            await conn.execute(
+                "INSERT INTO core.users (tenant_id, email, password_hash, roles, created_by) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (tenant_id, body.admin_email, admin_password_hash, admin_roles, created_by),
+            )
+    except psycopg.errors.UniqueViolation as exc:
+        # Một constraint DUY NHẤT có thể vỡ ở đây — `exc.diag.constraint_name` (Postgres tự đặt
+        # tên `<table>_<column>_key` cho UNIQUE cột đơn không đặt tên tay, xác nhận thật qua
+        # `pg_constraint`) phân biệt 2 ca thay vì suy luận từ thứ tự câu lệnh nào vừa chạy.
+        if exc.diag.constraint_name == "tenants_name_key":
+            raise HTTPException(status_code=409, detail=f"công ty {body.company_name!r} đã tồn tại") from exc
+        if exc.diag.constraint_name == "users_email_key":
+            raise HTTPException(status_code=409, detail=f"email {body.admin_email!r} đã tồn tại") from exc
+        raise  # constraint lạ chưa biết — fail loud, không đoán mò thông điệp
+
+    return CreateCompanyResponse(tenant_id=str(tenant_id), admin_email=body.admin_email)
+
+
+class CreateUserRequest(BaseModel):
+    email: str
+    password: str = Field(min_length=8)
+    roles: list[str]
+    # `tenant_id` CỐ Ý KHÔNG có field ở đây — client không có chỗ nào để tự khai tenant, server
+    # LUÔN dùng tenant_id TƯƠI (tra lại từ `core.users` ngay trong request, xem `create_user`)
+    # của người gọi (company-admin đang đăng nhập), KHÔNG phải claim JWT. Copy nguyên văn lý do
+    # `RunRequest` (`routes/runs.py:49-52`, INV-1): "request THẬM CHÍ KHÔNG THỂ mang trường đó,
+    # chứ không phải mang được nhưng bị bỏ qua".
+
+    _validate_password = field_validator("password")(_reject_oversized_password)
+    _normalize_email = field_validator("email")(normalize_email)
+
+
+class CreateUserResponse(BaseModel):
+    user_id: str
+    email: str
+    tenant_id: str
+    roles: list[str]
+
+
+@router.post("/users", response_model=CreateUserResponse)
+async def create_user(body: CreateUserRequest) -> CreateUserResponse:
+    # `get_request_session()` ở đây CHỈ để lấy identity (`session.user`) — KHÔNG dùng
+    # `session.roles`/`session.tenant_id` (claim JWT) để phân quyền/gán tenant, xem SELECT dưới.
+    session = get_request_session()
+
+    # Dùng connection của middleware (`get_request_connection()`) + SAVEPOINT qua `conn.transaction()`
+    # cho rollback độc lập khi `UniqueViolation`, KHÔNG tự mở connection riêng — cùng lý do
+    # `create_company` ở trên (comment đầy đủ tại đó, review `app#17` đợt 5, Chặn B).
+    conn = get_request_connection()
+
+    # Tra `id`/`roles`/`tenant_id` TƯƠI từ `core.users`, KHÔNG dùng `session.roles`/
+    # `session.tenant_id` (claim JWT) — JWT là ảnh chụp lúc đăng nhập, sống tới
+    # `jwt_expire_minutes` (mặc định 480 phút). 2 hệ quả nếu tin thẳng JWT (review `app#17`,
+    # Important #1, đợt 8):
+    # 1. Admin bị thu hồi quyền (`roles` đổi trong DB) vẫn còn "admin" trong JWT cũ tới lúc hết
+    #    hạn — leo quyền tạm thời, không cần làm gì thêm ngoài chờ JWT hết hạn tự nhiên.
+    # 2. Admin bị CHUYỂN CÔNG TY (`tenant_id` đổi trong DB, vd tách/sáp nhập tenant) vẫn ghi user
+    #    mới vào tenant CŨ (từ JWT) thay vì tenant HIỆN TẠI — user mới lạc sang company sai.
+    # Route này ĐÃ SẴN 1 lượt round-trip để lấy `created_by`, nên tra thêm 2 cột này ở CÙNG query
+    # không tốn thêm round-trip nào.
+    #
+    # CÒN SÓT (review `app#17` đợt 9, KHÔNG sửa ở PR này — phạm vi rộng hơn 1 route, xem
+    # `docs/decisions/real-auth-system.md` §"Hệ quả đã chấp nhận"): `tenant_context_middleware`
+    # (`middleware.py:109`) vẫn `SET LOCAL app.tenant_id` từ `session.tenant_id` (claim JWT, KHÔNG
+    # phải `creator_tenant_id` tra tươi ở trên) cho MỌI query trên connection này trong suốt đời
+    # request — kể cả các query bên dưới. Với admin bị re-home, INSERT dưới đây ghi user mới vào
+    # `creator_tenant_id` (tenant TƯƠI, đúng) nhưng RLS context của chính connection đó vẫn đang
+    # đứng ở tenant CŨ (từ JWT) — không lỗi ở ĐÂY chỉ vì `core.users` không bật RLS (ADR §Quyết
+    # định #2), nhưng `wb.recipes`/`kb.chunks`/mọi bảng CÓ RLS mà route khác trên CÙNG request này
+    # lỡ đọc/ghi sẽ vẫn lọc theo tenant CŨ. Đây là 1 THỂ HIỆN của lỗ hổng rộng hơn: `routes/runs.py`,
+    # `routes/chat.py`, `routes/publish.py`, content-section role fence ở `packages/engine` đều còn
+    # phân quyền bằng `session.roles`/`session.tenant_id` (claim JWT) — vá trọn vẹn đòi middleware
+    # tự tra lại `roles`/`tenant_id` MỖI request (round-trip DB thêm cho MỌI route, không riêng
+    # route admin), ngoài phạm vi 1 PR sửa 2 route admin.
+    cur = await conn.execute(
+        "SELECT id, roles, tenant_id FROM core.users WHERE email = %s",
+        (session.user,),
+    )
+    creator_row = await cur.fetchone()
+    if creator_row is None:
+        # Phòng thủ theo chiều sâu: người gọi có role "admin"/"superadmin" trong JWT hợp lệ
+        # (chữ ký đúng) nhưng KHÔNG có dòng nào trong `core.users` — hiện tại `issue_token()`
+        # chỉ được gọi từ `login()` SAU KHI verify mật khẩu khớp 1 dòng `core.users` thật, nên
+        # nhánh này không còn đường nào tới được trong luồng bình thường (khác giai đoạn còn
+        # `demo-login`, khi đây là lỗ hổng leo quyền thật — review `app#17` Chặn 1: JWT từ
+        # `demo-login` không cần mật khẩu vẫn mint được tài khoản thật bền vững qua route này).
+        # Giữ lại chặn này làm lưới an toàn cho mọi thay đổi tương lai ở `issue_token()`/`login()`.
+        raise HTTPException(
+            status_code=403,
+            detail="Tài khoản gọi API không tồn tại trong core.users.",
+        )
+    created_by, creator_roles_raw, creator_tenant_id = creator_row
+    creator_roles = FreshRoles(list(creator_roles_raw))
+    require_admin(creator_roles)
+
+    if "admin" not in creator_roles:
+        # Người gọi có "superadmin" nhưng KHÔNG có "admin" — tức chưa từng qua `create_company`,
+        # không thuộc công ty nào (`creator_tenant_id` là tenant `__system__` bootstrap). Nếu cho
+        # tạo tiếp, user mới sẽ rơi vào `__system__` một cách âm thầm — không phải lỗ hổng, nhưng
+        # là footgun im lặng (review `app#17`, "nên sửa" #3). Superadmin phải tạo công ty trước.
+        raise HTTPException(
+            status_code=400,
+            detail="Superadmin không thuộc công ty nào — dùng POST /api/admin/companies để tạo "
+            "công ty (và admin đầu tiên) trước khi tạo thêm user.",
+        )
+
+    invalid_roles = set(body.roles) - _USER_ROLE_VOCAB
+    if invalid_roles:
+        raise HTTPException(
+            status_code=400,
+            detail=f"role {sorted(invalid_roles)} không hợp lệ — chỉ chấp nhận {sorted(_USER_ROLE_VOCAB)}",
+        )
+    if not body.roles:
+        # `roles: []` tạo được và đăng nhập được — không phải lỗ hổng (fence trả 0 chunk cho tập
+        # role rỗng), nhưng không có lý do hợp lệ nào cho phép tài khoản không role nào tồn tại
+        # (review `app#17`, "nên sửa" #5).
+        raise HTTPException(status_code=400, detail="roles không được rỗng.")
+
+    # bcrypt là CPU-bound đồng bộ (~200-370ms) — chạy qua threadpool để không chặn event loop.
+    # Chạy SAU mọi kiểm tra ở trên (đổi thứ tự so với trước đợt 8): fail-fast cho request sẽ bị
+    # 400/403 dù sao, không tốn ~200-370ms băm mật khẩu vô ích.
+    password_hash = await run_in_threadpool(hash_password, body.password)
+
+    try:
+        async with conn.transaction():
+            cur = await conn.execute(
+                "INSERT INTO core.users (tenant_id, email, password_hash, roles, created_by) "
+                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                (str(creator_tenant_id), body.email, password_hash, body.roles, created_by),
+            )
+    except psycopg.errors.UniqueViolation as exc:  # email đã tồn tại — 409, không 500
+        raise HTTPException(status_code=409, detail=f"email {body.email!r} đã tồn tại") from exc
+    row = await cur.fetchone()
+    assert row is not None
+    user_id = row[0]
+
+    return CreateUserResponse(
+        user_id=str(user_id), email=body.email, tenant_id=str(creator_tenant_id), roles=body.roles
+    )

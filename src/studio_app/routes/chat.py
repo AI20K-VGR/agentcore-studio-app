@@ -89,6 +89,10 @@ async def chat(agent_id: str, body: ChatRequest) -> ChatResponse:
     except ValueError as exc:
         raise HTTPException(status_code=500, detail=f"recipe đã published nhưng graph_lint() đỏ: {exc}") from exc
 
+    # `Pool` (không phải `get_request_connection()`) — rủi ro pool self-deadlock CHƯA được giải
+    # quyết ở route này, xem giải thích đầy đủ + lý do ở `routes/runs.py` (review `app#17` đợt 4,
+    # sửa lại 1 lập luận SAI ở đợt 3: `get_pool()` là connection THỨ HAI cộng thêm vào connection
+    # middleware đã giữ suốt request, không phải "tiết kiệm" hơn).
     pool = await get_pool()
     embedding = CallistoEmbedding()
     result = await interpreter.run(

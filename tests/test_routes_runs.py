@@ -39,7 +39,7 @@ _EDGES = [
 @pytest_asyncio.fixture(autouse=True)
 async def _close_singleton_pools_after_test() -> AsyncIterator[None]:
     """`create_run()` chạm `get_pool()` (singleton process-wide) — cùng lý do/kỷ luật
-    `test_routes_auth.py` đã tự áp cho `demo_login()` (tránh `ValueError: The future belongs to a
+    `test_routes_auth.py` đã tự áp cho `login()` (tránh `ValueError: The future belongs to a
     different loop` khi chạy full suite, event loop mới mỗi test)."""
     yield
     await close_pools()

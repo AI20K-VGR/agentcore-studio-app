@@ -1,15 +1,14 @@
-"""Ký/verify JWT cho identity `{tenant_id, user, roles}` (Kế hoạch 2, A1/A2).
+"""Ký/verify JWT cho identity `{tenant_id, user, roles}`, cộng `hash_password()`/`verify_password()`
+(bcrypt) dùng chung cho cả login lẫn tạo tài khoản (Kế hoạch 3).
 
-Đây là phần "JWT THẬT" theo đúng nghĩa mật mã học — chữ ký được verify bằng `settings.jwt_secret`
-(HS256), một request không có khoá bí mật đó KHÔNG THỂ tự chế ra 1 token hợp lệ, khác hẳn bản demo
-cũ (tin thẳng JSON client gửi, không ký gì cả).
+Chữ ký được verify bằng `settings.jwt_secret` (HS256) — một request không có khoá bí mật đó KHÔNG
+THỂ tự chế ra 1 token hợp lệ.
 
-**Ranh giới cần nói rõ, không nhận vơ**: việc này KHÔNG phải "authentication thật" theo nghĩa đầy
-đủ — `issue_token()` (gọi từ `routes/auth.py::demo_login`) vẫn KÝ bất kỳ `tenant`/`user`/`roles`
-nào caller đưa vào, không có bước kiểm mật khẩu/OAuth/identity-provider nào đứng trước. Nói cách
-khác: đã đóng được câu hỏi "ai đó có thể GIẢ MẠO token của người khác không?" (KHÔNG, cần
-`jwt_secret`) nhưng CHƯA đóng câu hỏi "ai được phép TỰ XIN token cho tenant/user nào?" (câu đó cần
-1 identity provider thật — mật khẩu, SSO, ... — không có trong phạm vi hiện tại).
+`issue_token()` giờ CHỈ được gọi từ `routes/auth.py::login`, SAU KHI đã verify mật khẩu thật khớp
+`core.users.password_hash` — khác giai đoạn trước (`routes/auth.py::demo_login`, đã bị xoá hẳn),
+lúc đó `issue_token()` ký bất kỳ `tenant`/`user`/`roles` nào caller đưa vào, không có bước kiểm mật
+khẩu nào đứng trước. Câu hỏi "ai được phép TỰ XIN token cho tenant/user nào?" giờ đã đóng bằng mật
+khẩu thật, không còn là identity provider để trống như giai đoạn demo-login.
 """
 
 from __future__ import annotations
@@ -17,12 +16,79 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
+import bcrypt
 import jwt
+from loguru import logger
 from studio_workbench.tenant_wall import ResolvedContext
 
 from studio_app.settings import get_settings
 
 _ALGORITHM = "HS256"
+
+
+def normalize_email(email: str) -> str:
+    """`.strip().lower()` — chuẩn hoá email TRƯỚC khi ghi (`routes/admin.py::CreateCompanyRequest`/
+    `CreateUserRequest`) và TRƯỚC khi tra (`routes/auth.py::login`), dùng chung 1 hàm để 2 phía
+    không lệch nhau (trước bản vá, `"Admin@Acme.com"` tạo được nhưng không đăng nhập nổi bằng
+    `"admin@acme.com"` vì `login()` khớp `WHERE email = %s` chính xác — review `app#17`, "nên sửa"
+    #1). Không dùng `pydantic.EmailStr` (cần thêm dependency `email-validator`, repo hiện không có)
+    — validate tối thiểu bằng tay: rỗng/toàn khoảng trắng hoặc thiếu `"@"` bị chặn ngay ở tầng
+    Pydantic (422), đủ đóng `""`, `"   "`, `"khong-phai-email"` mà không kéo thêm gói ngoài."""
+    normalized = email.strip().lower()
+    if not normalized or "@" not in normalized:
+        raise ValueError("email không hợp lệ")
+    return normalized
+
+
+def hash_password(plain: str) -> str:
+    """Băm mật khẩu bằng bcrypt (cost mặc định 12, đủ chậm chống brute-force mà không làm login
+    chậm cảm nhận được). Kết quả là chuỗi tự chứa salt — không cần lưu salt riêng."""
+    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(plain: str, password_hash: str) -> bool:
+    """So mật khẩu client gửi với hash đã lưu. Trả `bool` thuần (không raise) — sai mật khẩu là kết
+    quả BÌNH THƯỜNG của việc gõ nhầm, không phải lỗi hệ thống, khác hẳn `verify_token` (JWT sai/hết
+    hạn luôn là bất thường, phải raise `InvalidTokenError`).
+
+    `bcrypt.checkpw` raise `ValueError` cho mật khẩu >72 byte thay vì trả `False` — nếu để lọt,
+    `routes/auth.py::login` sẽ 500 cho email tồn tại nhưng 401 cho email không tồn tại (short-circuit
+    trước khi gọi hàm này), lộ ra sự tồn tại của email qua status code (review `app#17`, Chặn 2).
+    Chặn ở đây — trước bcrypt, không phải trong route — để MỌI call site (login lẫn tương lai) đều
+    fail-closed giống nhau, không phải nhớ tự chặn ở từng nơi gọi.
+
+    `bcrypt.checkpw` cũng raise `ValueError` (không phải trả `False`) nếu `password_hash` KHÔNG
+    đúng định dạng bcrypt (VD `"Invalid salt"` — thực nghiệm xác nhận). `core.users.password_hash`
+    là `TEXT` thuần, không có CHECK constraint ràng định dạng ở DB — nếu 1 dòng nào đó có hash hỏng
+    (lỗi ghi dữ liệu, sửa tay, migration tương lai), request login đúng email đó sẽ 500 thay vì
+    401, lại là 1 oracle khác biệt account đó tồn tại (review `app#17` đợt 3, Important). Bắt luôn
+    `ValueError` ở đây — cùng chỗ đã chặn ca >72 byte, cùng lý do fail-closed cho mọi call site.
+
+    Log `warning` khi rơi vào nhánh hash hỏng (review `app#17` đợt 3, "log khi hash hỏng"): fail-
+    closed (trả `False`, account đó không login được) là đúng, nhưng NẾU không log gì, dữ liệu
+    hỏng này sẽ nằm im vô thời hạn — không ai biết để sửa, account đó coi như "quên mật khẩu" mãi
+    mãi mà không có dấu vết nào để debug. KHÔNG log `plain`/`password_hash` (chính giá trị mật
+    khẩu/hash thật) — chỉ log SỰ KIỆN "gặp hash hỏng", đủ để vận hành biết có dữ liệu cần sửa mà
+    không tự nó lại thành 1 chỗ rò rỉ mới."""
+    if len(plain.encode("utf-8")) > 72:
+        return False
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), password_hash.encode("utf-8"))
+    except ValueError:
+        logger.warning("[AUTH] verify_password: password_hash không đúng định dạng bcrypt — coi như sai mật khẩu")
+        return False
+
+
+# Hash cố định của 1 chuỗi không phải mật khẩu thật của ai — dùng khi email KHÔNG tồn tại, để
+# `login()` vẫn tốn đúng 1 lần bcrypt.checkpw() thay vì return sớm. Không làm điều này thì thời
+# gian phản hồi (~0ms return sớm vs ~200-370ms bcrypt thật) tự nó là oracle phân biệt email tồn
+# tại hay không, độc lập với status code (review `app#17`, Chặn 2, nửa "timing" của oracle).
+#
+# Giá trị VIẾT TAY sẵn (không gọi `hash_password()` lúc import module) — review đợt 2 của `app#17`
+# chỉ ra: gọi `hash_password()` ở top-level module tốn ~200-370ms bcrypt THẬT ngay lúc import (mỗi
+# lần process khởi động/mỗi lần pytest collect module này), không cần thiết vì giá trị không đổi
+# giữa các lần chạy — chỉ cần MỘT hash bcrypt hợp lệ bất kỳ, không cần khớp lại plaintext nào.
+DUMMY_PASSWORD_HASH = "$2b$12$Ga5KFrUJZMsc8/kd1gTe/u9XnMi3uDM5tWUSbZUaM2V5qPr0paoAa"
 
 
 class InvalidTokenError(Exception):
