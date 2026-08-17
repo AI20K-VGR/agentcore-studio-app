@@ -20,6 +20,8 @@ chủ đích, KHÔNG phải bỏ sót — lý do đầy đủ + điều kiện �
 
 from __future__ import annotations
 
+from typing import NewType
+
 import psycopg.errors
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, field_validator
@@ -34,6 +36,16 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 # `roles` hợp lệ khi COMPANY-ADMIN tạo user — KHÔNG có "superadmin" (chỉ superadmin mới phong
 # được superadmin, và hiện tại không route nào cho phép — cố tình, xem module docstring).
 _USER_ROLE_VOCAB: frozenset[str] = SECTION_VOCAB | {"admin"}
+
+FreshRoles = NewType("FreshRoles", list[str])
+"""Type riêng cho "roles vừa tra từ `core.users` trong request này" — KHÁC `list[str]` thường
+(vd `session.roles`, claim JWT). Không có type riêng, `require_admin(session.roles)` type-check
+sạch như `require_admin(fresh_roles)` — mypy không phân biệt được, 1 lần review-miss là bug leo
+quyền sống lại lặng lẽ (review `app#17` đợt 9, Type-safety gap: "enforced by exactly one regression
+test plus convention, not the compiler"). `NewType` không chặn được ai CỐ TÌNH viết
+`require_admin(FreshRoles(session.roles))` để né mypy — nhưng chặn được ca ngộ nhận, việc thực tế
+hay xảy ra hơn nhiều: gõ nhầm `session.roles` thay vì roles vừa tra sẽ ĐỎ NGAY ở mypy, không đợi
+tới lúc chạy production."""
 
 
 def _reject_blank(v: str) -> str:
@@ -55,20 +67,20 @@ def _reject_oversized_password(v: str) -> str:
     return v
 
 
-def require_superadmin(roles: list[str]) -> None:
+def require_superadmin(roles: FreshRoles) -> None:
     """403 — đã đăng nhập rồi (qua get_request_session(), 401 xử lý ở lớp dưới), chỉ thiếu ĐÚNG
     quyền superadmin. Khác `get_request_session()`'s 401 (chưa chứng minh được là ai).
 
-    `roles` PHẢI là roles TƯƠI tra lại từ `core.users` ngay trong request này, KHÔNG phải
-    `session.roles` (claim JWT) — JWT là ảnh chụp lúc đăng nhập, sống tới `jwt_expire_minutes`
-    (mặc định 480 phút = 8 tiếng). 1 superadmin bị thu hồi quyền giữa chừng (roles đổi trong DB)
-    vẫn còn "superadmin" trong JWT cũ tới lúc hết hạn nếu route tin thẳng `session.roles` — review
-    `app#17`, Important #1 (đợt 8)."""
+    `roles` PHẢI là roles TƯƠI tra lại từ `core.users` ngay trong request này (type `FreshRoles`,
+    xem định nghĩa ở trên), KHÔNG phải `session.roles` (claim JWT, type `list[str]` thường) — JWT
+    là ảnh chụp lúc đăng nhập, sống tới `jwt_expire_minutes` (mặc định 480 phút = 8 tiếng). 1
+    superadmin bị thu hồi quyền giữa chừng (roles đổi trong DB) vẫn còn "superadmin" trong JWT cũ
+    tới lúc hết hạn nếu route tin thẳng `session.roles` — review `app#17`, Important #1 (đợt 8)."""
     if "superadmin" not in roles:
         raise HTTPException(status_code=403, detail="Cần quyền superadmin.")
 
 
-def require_admin(roles: list[str]) -> None:
+def require_admin(roles: FreshRoles) -> None:
     """Cùng lý do `require_superadmin` ở trên — `roles` phải là roles TƯƠI từ DB, không phải JWT."""
     if "admin" not in roles and "superadmin" not in roles:
         raise HTTPException(status_code=403, detail="Cần quyền admin.")
@@ -124,8 +136,8 @@ async def create_company(body: CreateCompanyRequest) -> CreateCompanyResponse:
             status_code=403,
             detail="Tài khoản gọi API không tồn tại trong core.users.",
         )
-    created_by, creator_roles = creator_row
-    require_superadmin(list(creator_roles))
+    created_by, creator_roles_raw = creator_row
+    require_superadmin(FreshRoles(list(creator_roles_raw)))
 
     # bcrypt là CPU-bound đồng bộ (~200-370ms) — chạy qua threadpool để không chặn event loop.
     admin_password_hash = await run_in_threadpool(hash_password, body.admin_password)
@@ -217,6 +229,20 @@ async def create_user(body: CreateUserRequest) -> CreateUserResponse:
     #    mới vào tenant CŨ (từ JWT) thay vì tenant HIỆN TẠI — user mới lạc sang company sai.
     # Route này ĐÃ SẴN 1 lượt round-trip để lấy `created_by`, nên tra thêm 2 cột này ở CÙNG query
     # không tốn thêm round-trip nào.
+    #
+    # CÒN SÓT (review `app#17` đợt 9, KHÔNG sửa ở PR này — phạm vi rộng hơn 1 route, xem
+    # `docs/decisions/real-auth-system.md` §"Hệ quả đã chấp nhận"): `tenant_context_middleware`
+    # (`middleware.py:109`) vẫn `SET LOCAL app.tenant_id` từ `session.tenant_id` (claim JWT, KHÔNG
+    # phải `creator_tenant_id` tra tươi ở trên) cho MỌI query trên connection này trong suốt đời
+    # request — kể cả các query bên dưới. Với admin bị re-home, INSERT dưới đây ghi user mới vào
+    # `creator_tenant_id` (tenant TƯƠI, đúng) nhưng RLS context của chính connection đó vẫn đang
+    # đứng ở tenant CŨ (từ JWT) — không lỗi ở ĐÂY chỉ vì `core.users` không bật RLS (ADR §Quyết
+    # định #2), nhưng `wb.recipes`/`kb.chunks`/mọi bảng CÓ RLS mà route khác trên CÙNG request này
+    # lỡ đọc/ghi sẽ vẫn lọc theo tenant CŨ. Đây là 1 THỂ HIỆN của lỗ hổng rộng hơn: `routes/runs.py`,
+    # `routes/chat.py`, `routes/publish.py`, content-section role fence ở `packages/engine` đều còn
+    # phân quyền bằng `session.roles`/`session.tenant_id` (claim JWT) — vá trọn vẹn đòi middleware
+    # tự tra lại `roles`/`tenant_id` MỖI request (round-trip DB thêm cho MỌI route, không riêng
+    # route admin), ngoài phạm vi 1 PR sửa 2 route admin.
     cur = await conn.execute(
         "SELECT id, roles, tenant_id FROM core.users WHERE email = %s",
         (session.user,),
@@ -235,7 +261,7 @@ async def create_user(body: CreateUserRequest) -> CreateUserResponse:
             detail="Tài khoản gọi API không tồn tại trong core.users.",
         )
     created_by, creator_roles_raw, creator_tenant_id = creator_row
-    creator_roles = list(creator_roles_raw)
+    creator_roles = FreshRoles(list(creator_roles_raw))
     require_admin(creator_roles)
 
     if "admin" not in creator_roles:

@@ -427,6 +427,61 @@ async def test_demoted_admin_stale_jwt_cannot_create_user_through_real_http(
     assert count_row[0] == 0, "user không được tạo dù JWT cũ còn 'admin' — phải tra roles tươi từ DB"
 
 
+async def test_rehomed_admin_stale_jwt_creates_user_in_fresh_tenant_not_stale_one(
+    client: AsyncClient, admin_pool: Pool
+) -> None:
+    """Nửa THỨ HAI của Important #1 (đợt 8), review đợt 9 chỉ ra chưa có bài nào ghim riêng: mọi
+    bài test trong suite (kể cả bài demote roles ở trên) đều seed session/DB CÙNG 1 tenant, nên nếu
+    revert nguồn `tenant_id` của `create_user` về lại `str(session.tenant_id)` (JWT) thay vì
+    `str(creator_tenant_id)` (tra tươi), TOÀN BỘ suite vẫn xanh — không bài nào phân biệt được 2
+    nguồn đó vì chúng luôn TRÙNG giá trị trong mọi kịch bản khác. Bài này CỐ Ý làm chúng LỆCH nhau:
+    admin đăng nhập ở tenant A (JWT mang tenant A) -> "re-home" ngoài luồng API (UPDATE thẳng
+    `core.users.tenant_id` sang tenant B, mô phỏng tách/sáp nhập công ty) -> DÙNG LẠI JWT cũ (còn
+    mang tenant A) gọi `/api/admin/users` -> user mới PHẢI rơi vào tenant B (tươi), KHÔNG PHẢI
+    tenant A (JWT cũ)."""
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("INSERT INTO core.tenants (name) VALUES (%s) RETURNING id", ("rehome-tenant-a",))
+        row = await cur.fetchone()
+        assert row is not None
+        tenant_a = row[0]
+        cur = await conn.execute("INSERT INTO core.tenants (name) VALUES (%s) RETURNING id", ("rehome-tenant-b",))
+        row = await cur.fetchone()
+        assert row is not None
+        tenant_b = row[0]
+        await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            (tenant_a, "soon-rehomed@acme.com", hash_password("rehomed-admin-password"), ["admin", "public"]),
+        )
+
+    login_res = await client.post(
+        "/api/auth/login", json={"email": "soon-rehomed@acme.com", "password": "rehomed-admin-password"}
+    )
+    assert login_res.status_code == 200
+    stale_tenant_a_token = login_res.json()["access_token"]
+    assert login_res.json()["tenant_id"] == str(tenant_a)
+
+    # Re-home NGOÀI luồng API — JWT vừa phát vẫn mang tenant A, không hề biết chuyện này xảy ra.
+    async with admin_pool.connection() as conn:
+        await conn.execute("UPDATE core.users SET tenant_id = %s WHERE email = %s", (tenant_b, "soon-rehomed@acme.com"))
+
+    res = await client.post(
+        "/api/admin/users",
+        json={"email": "landed-somewhere@acme.com", "password": "password123", "roles": ["public"]},
+        headers={"Authorization": f"Bearer {stale_tenant_a_token}"},
+    )
+    assert res.status_code == 200, f"admin re-home rồi vẫn phải tạo được user (đúng tenant MỚI) — thấy {res.text}"
+    assert res.json()["tenant_id"] == str(tenant_b), (
+        f"user mới phải rơi vào tenant TƯƠI ({tenant_b}), không phải tenant JWT cũ ({tenant_a}) — "
+        f"thấy {res.json()['tenant_id']}"
+    )
+
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("SELECT tenant_id FROM core.users WHERE email = %s", ("landed-somewhere@acme.com",))
+        db_row = await cur.fetchone()
+    assert db_row is not None
+    assert str(db_row[0]) == str(tenant_b), "dòng thật trong DB cũng phải thuộc tenant B, không phải A"
+
+
 async def test_login_rate_limited_per_ip_through_real_http(client: AsyncClient) -> None:
     """Important #2, review `app#17` đợt 8: `bcrypt` cost-12 chạy KHÔNG ĐIỀU KIỆN ở `login()`, kể
     cả nhánh `DUMMY_PASSWORD_HASH` (email không tồn tại) — route KHÔNG cần đăng nhập nên không có
@@ -446,10 +501,16 @@ async def test_login_rate_limited_per_ip_through_real_http(client: AsyncClient) 
     assert limited_res.status_code == 429, f"vượt hạn mức phải 429 — thấy {limited_res.status_code}"
 
 
-async def test_login_rate_limit_is_per_ip_not_global(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_login_rate_limit_is_per_ip_not_global(monkeypatch: pytest.MonkeyPatch, admin_pool: Pool) -> None:
     """Đối trọng bài trên: 1 IP bị 429 KHÔNG được làm IP khác bị vạ lây — rate-limit đúng nghĩa
     "theo IP", không phải 1 bộ đếm toàn cục chặn nhầm người dùng thật khác đang đăng nhập bình
-    thường cùng lúc kẻ tấn công dồn dập từ IP khác."""
+    thường cùng lúc kẻ tấn công dồn dập từ IP khác.
+
+    Cần `admin_pool` dù bài này không seed dữ liệu gì — review `app#17` đợt 9: thiếu fixture này,
+    bài chỉ xanh NHỜ 1 bài KHÁC chạy trước đó đã tự `ensure_all_schemas` (qua `admin_pool` của
+    NÓ) trong CÙNG lần chạy suite; đứng riêng/chạy đầu tiên, `SELECT ... FROM core.users` trong
+    `login()` sẽ vỡ vì bảng chưa tồn tại (relation không tồn tại) -> 500, không phải 401 kỳ vọng."""
+    del admin_pool
     monkeypatch.setattr(jwt_auth, "get_settings", _settings)
     app = create_app()
     body = {"email": "rate-limit-probe-2@acme.com", "password": "whatever-password"}

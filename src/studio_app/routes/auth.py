@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
+from loguru import logger
 from pydantic import BaseModel, field_validator
 from starlette.concurrency import run_in_threadpool
 from studio_workbench.tenant_wall import resolve_session
@@ -27,8 +28,42 @@ from studio_workbench.tenant_wall import resolve_session
 from studio_app import rate_limit
 from studio_app.jwt_auth import DUMMY_PASSWORD_HASH, issue_token, normalize_email, verify_password
 from studio_app.middleware import get_request_connection
+from studio_app.settings import get_settings
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+
+def _resolve_rate_limit_key(request: Request) -> str:
+    """Xác định "IP" dùng làm key rate-limit (review `app#17`, Important #2, đợt 8→9).
+
+    Mặc định `request.client.host` — IP TCP thật của kết nối tới process NÀY. Sau reverse
+    proxy/load balancer, đó là IP của PROXY (giống nhau cho MỌI người dùng thật) chứ không phải
+    IP client gốc — gộp mọi người dùng vào 1 bucket, tự-DoS người dùng hợp lệ. `settings.
+    trust_x_forwarded_for` (mặc định `False`) là escape hatch CÓ CHỦ Ý, KHÔNG bật ngầm định: chỉ
+    bật khi triển khai THẬT có reverse proxy đáng tin cấu hình set cứng `X-Forwarded-For` (không
+    cho client tự khai header đó lọt qua) — bật nhầm trong triển khai không có proxy như vậy sẽ MỞ
+    LẠI đường né rate-limit (client tự gửi `X-Forwarded-For` giả trực tiếp, không qua proxy nào).
+    Lấy hop ĐẦU TIÊN của `X-Forwarded-For` (client gốc, theo quy ước chuẩn — các hop sau là proxy
+    trung gian) khi header có mặt và cờ bật; rỗng/không có header thì rơi về `request.client`.
+
+    `request.client is None` (1 số cấu hình ASGI, vd Unix socket) log WARNING thay vì âm thầm gộp
+    vào 1 bucket `"unknown"` chung cho MỌI request kiểu này — review đợt 9 chỉ ra bản đợt 8 không
+    log gì ở nhánh này, khiến hiện tượng "mọi client rơi vào 1 bucket" (dù do proxy hay do
+    `client is None`) không để lại dấu vết nào để vận hành phát hiện."""
+    settings = get_settings()
+    if settings.trust_x_forwarded_for:
+        forwarded_for = request.headers.get("x-forwarded-for")
+        if forwarded_for:
+            return forwarded_for.split(",")[0].strip()
+
+    if request.client is not None:
+        return request.client.host
+
+    logger.warning(
+        "[AUTH] login: request.client là None — rate-limit rơi về 1 bucket 'unknown' dùng chung "
+        "cho MỌI request kiểu này (có thể tự-DoS người dùng hợp lệ nếu xảy ra thường xuyên)"
+    )
+    return "unknown"
 
 
 class LoginRequest(BaseModel):
@@ -55,14 +90,16 @@ class LoginResponse(BaseModel):
 
 @router.post("/login", response_model=LoginResponse)
 async def login(body: LoginRequest, request: Request) -> LoginResponse:
-    """Rate-limit theo IP TRƯỚC MỌI VIỆC KHÁC (kể cả tra DB) — review `app#17`, Important #2, đợt
-    8: `bcrypt` cost-12 chạy KHÔNG ĐIỀU KIỆN bên dưới, kể cả nhánh `DUMMY_PASSWORD_HASH`, trên
-    AnyIO threadpool DÙNG CHUNG (mặc định 40 thread) với mọi request khác của process. Route này
-    KHÔNG cần đăng nhập (chính nó là cửa đăng nhập) nên không có gì chặn trước nó — ~110 req/s từ
-    1 client ẩn danh đủ giữ bận toàn bộ threadpool, treo NGUYÊN process (`rate_limit.py` giải thích
-    đầy đủ). `request.client.host` — KHÔNG đọc `X-Forwarded-For` (header client tự khai, giả mạo
-    được nếu không có reverse proxy đáng tin cấu hình strip/overwrite nó; dùng thẳng header đó ở
-    đây sẽ MỞ LẠI đường né rate-limit bằng cách tự đổi header mỗi request).
+    """Rate-limit theo IP TRƯỚC KHI CHẠM DB/BCRYPT (KHÔNG phải "trước mọi việc khác" — Pydantic đã
+    validate `body: LoginRequest` xong trước khi vào tới đây, FastAPI tự làm việc đó trước khi gọi
+    route; sửa lại cách nói ở đợt 8, review đợt 9 chỉ ra bản cũ khẳng định quá tay) — review `app#17`,
+    Important #2, đợt 8: `bcrypt` cost-12 chạy KHÔNG ĐIỀU KIỆN bên dưới, kể cả nhánh
+    `DUMMY_PASSWORD_HASH`, trên AnyIO threadpool DÙNG CHUNG (mặc định 40 thread) với mọi request
+    khác của process. Route này KHÔNG cần đăng nhập (chính nó là cửa đăng nhập) nên không có gì
+    chặn trước nó — ~110 req/s từ 1 client ẩn danh đủ giữ bận toàn bộ threadpool, treo NGUYÊN
+    process (`rate_limit.py` giải thích đầy đủ). Key rate-limit qua `_resolve_rate_limit_key()`
+    (xem định nghĩa — mặc định `request.client.host`, có escape hatch `settings.
+    trust_x_forwarded_for` cho triển khai sau reverse proxy đáng tin).
 
     Không tiết lộ "email không tồn tại" vs "sai mật khẩu" qua status code khác nhau (cả hai đều
     401) — tránh cho kẻ tấn công dò được danh sách email tồn tại trong hệ thống bằng cách thử
@@ -90,9 +127,15 @@ async def login(body: LoginRequest, request: Request) -> LoginResponse:
     gọi `/api/auth/login` giữ đồng thời 2 connection trong pool `max_size=8` suốt đời request (1
     của middleware, không dùng tới; 1 của route) — route đăng nhập không cần login vẫn là route
     lưu lượng cao nhất trong hệ thống, review `app#17` đợt 3, Important."""
-    client_ip = request.client.host if request.client is not None else "unknown"
-    if not rate_limit.check_and_consume(client_ip):
-        raise HTTPException(status_code=429, detail="Quá nhiều yêu cầu đăng nhập — thử lại sau.")
+    client_key = _resolve_rate_limit_key(request)
+    if not rate_limit.check_and_consume(client_key):
+        # `Retry-After` = `REFILL_SECONDS` (1 token mới sau đúng ngần đó giây) — cho client thật
+        # (không phải kẻ tấn công) biết chính xác lúc nào thử lại thay vì đoán/poll liên tục.
+        raise HTTPException(
+            status_code=429,
+            detail="Quá nhiều yêu cầu đăng nhập — thử lại sau.",
+            headers={"Retry-After": str(int(rate_limit.REFILL_SECONDS))},
+        )
 
     conn = get_request_connection()
     cur = await conn.execute(

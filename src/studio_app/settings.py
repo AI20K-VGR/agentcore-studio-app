@@ -43,6 +43,16 @@ class Settings(BaseSettings):
     jwt_secret: str = Field(min_length=32)
     jwt_expire_minutes: int = 480
 
+    # `rate_limit.py` keys theo IP cho `POST /api/auth/login` (review `app#17`, Important #2, đợt
+    # 8→9) — mặc định đọc `request.client.host` (IP TCP thật của kết nối tới process này). Sau
+    # reverse proxy/load balancer, MỌI request đều mang cùng 1 IP đó (IP của proxy), gộp MỌI người
+    # dùng thật vào chung 1 bucket 10 req/phút — tự-DoS người dùng hợp lệ, không cần kẻ tấn công
+    # làm gì. Mặc định `False` (an toàn cho triển khai KHÔNG có proxy đáng tin, kể cả `docker-compose
+    # --profile app`) — bật `True` CHỈ khi có reverse proxy đáng tin cấu hình ghi đè/set cứng
+    # `X-Forwarded-For` (không cho client tự khai giá trị đó lọt qua), nếu không bật nhầm sẽ MỞ LẠI
+    # đường né rate-limit bằng cách client tự set header giả trực tiếp (KHÔNG qua proxy nào).
+    trust_x_forwarded_for: bool = False
+
     gemini_api_key: str | None = None
 
     langfuse_public_key: str | None = None

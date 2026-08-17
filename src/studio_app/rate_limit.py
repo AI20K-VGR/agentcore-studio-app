@@ -7,11 +7,15 @@ dùng chung AnyIO threadpool (mặc định 40 thread) với MỌI request khác
 `docs/decisions/real-auth-system.md` — đó là oracle (thời gian/status code), đây là DoS (cạn
 threadpool), khác loại rủi ro.
 
-In-process, KHÔNG phân tán (không Redis/Memcached) — đủ để chặn ĐÚNG kịch bản nêu trên (1 client ẩn
-danh dồn dập), không giải quyết tấn công phân tán nhiều IP (residual risk chấp nhận: thêm 1
-dependency ngoài chỉ cho rate-limit là quá tay so với rủi ro đang chặn, và repo hiện không có hạ
-tầng cache dùng chung nào khác). Nhiều worker/process thì mỗi process giữ bucket riêng — giới hạn
-hiệu quả nhân theo số worker, cùng đánh đổi.
+In-process, KHÔNG phân tán (không dùng Redis) — đủ để chặn ĐÚNG kịch bản nêu trên (1 client ẩn
+danh dồn dập), không giải quyết tấn công phân tán nhiều IP. `docker-compose.yml` CÓ Redis, nhưng
+CHỈ trong `--profile obs` (Langfuse self-host, khối comment `docker-compose.yml:47-48`: "redis/
+clickhouse/minio serve Langfuse ONLY") — KHÔNG bật mặc định, KHÔNG có ở `--profile app` (cách app
+này thật sự chạy). Buộc rate-limit phụ thuộc Redis nghĩa là bắt buộc bật `obs` profile chỉ để login
+hoạt động đúng — coupling sai hướng cho 1 dependency vốn dành riêng cho observability (review
+`app#17` đợt 9: bản đợt 8 nói nhầm "repo không có Redis nào" — có, nhưng không phải hạ tầng dùng
+chung sẵn sàng cho việc này). Nhiều worker/process thì mỗi process giữ bucket riêng — giới hạn hiệu
+quả nhân theo số worker, đánh đổi chấp nhận được cho best-effort trong-process.
 """
 
 from __future__ import annotations
@@ -21,9 +25,13 @@ import time
 _CAPACITY = 10.0
 """Số request tối đa dồn được liên tiếp (burst) trước khi bắt đầu bị chặn."""
 
-_REFILL_SECONDS = 6.0
+REFILL_SECONDS = 6.0
 """1 token mới mỗi 6 giây/IP -> ~10 request/phút bền vững — đủ rộng cho người dùng thật gõ sai mật
-khẩu vài lần, đủ hẹp để triệt tiêu ~110 req/s mà reviewer đo được (còn lại ~0.17 req/s/IP)."""
+khẩu vài lần, đủ hẹp để triệt tiêu ~110 req/s mà reviewer đo được (còn lại ~0.17 req/s/IP).
+
+Public (không `_` — khác `_CAPACITY`/`_MAX_TRACKED_IPS`): caller (`routes/auth.py`) cần giá trị
+này để set header `Retry-After` đúng số giây thật, không đoán mò/hardcode 1 con số lệch khỏi logic
+refill thật."""
 
 _MAX_TRACKED_IPS = 10_000
 """Trần bộ nhớ cho `_buckets` — phòng rò rỉ bộ nhớ nếu 1 client giả mạo IP (khác nhau mỗi request)
@@ -40,20 +48,27 @@ def check_and_consume(key: str, *, now: float | None = None) -> bool:
         now = time.monotonic()
 
     if key not in _buckets and len(_buckets) >= _MAX_TRACKED_IPS:
-        # Không LRU thật — dict giữ thứ tự chèn ở CPython nên `next(iter(...))` là entry CŨ NHẤT
-        # trên thực tế, đủ để chặn phình vô hạn mà không cần thêm cấu trúc dữ liệu riêng.
+        # Dict giữ thứ tự CHÈN ở CPython — `next(iter(...))` là entry cũ nhất theo lần chèn ĐẦU
+        # TIÊN, không phải lần CHẠM gần nhất. Ghi đè giá trị của 1 key đã tồn tại (`_buckets[key] =
+        # ...` bên dưới) KHÔNG dời nó ra cuối — nên nếu chỉ ghi đè, 1 IP bị rate-limit liên tục
+        # (chạm bucket dồn dập) vẫn nằm ở vị trí CŨ (lần đầu nó xuất hiện), tức là ứng viên bị dọn
+        # ĐẦU TIÊN khi chạm trần — kẻ bị chặn nhiều nhất lại được xoá sạch state, reset về đầy bucket
+        # (đợt 8 → 9, review: "attacker bị chặn liên tục là key cũ nhất nên bị evict trước, entry
+        # nhàn rỗi hợp lệ lại sống sót"). Sửa: LUÔN `pop` trước khi ghi (xem 2 chỗ bên dưới) để mọi
+        # lần CHẠM (kể cả bị từ chối) dời key ra cuối — đúng nghĩa LRU: chỉ key nào lâu KHÔNG bị
+        # chạm mới nằm ở đầu, mới là ứng viên evict hợp lý.
         oldest_key = next(iter(_buckets))
         del _buckets[oldest_key]
 
-    tokens, last_update = _buckets.get(key, (_CAPACITY, now))
+    tokens, last_update = _buckets.pop(key, (_CAPACITY, now))
     elapsed = max(0.0, now - last_update)
-    tokens = min(_CAPACITY, tokens + elapsed / _REFILL_SECONDS)
+    tokens = min(_CAPACITY, tokens + elapsed / REFILL_SECONDS)
 
     if tokens < 1.0:
-        _buckets[key] = (tokens, now)
+        _buckets[key] = (tokens, now)  # re-insert -> dời ra cuối (LRU)
         return False
 
-    _buckets[key] = (tokens - 1.0, now)
+    _buckets[key] = (tokens - 1.0, now)  # re-insert -> dời ra cuối (LRU)
     return True
 
 

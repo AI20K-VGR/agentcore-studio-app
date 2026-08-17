@@ -85,6 +85,29 @@ ra 2 đường không độc lập — cửa yếu nhất (`demo-login`, không 
     cầu bảo mật khác đẩy ưu tiên lên), đổi UNIQUE theo tenant là hướng sửa thật — ghi 1 issue riêng
     khi quyết định đó chín, không phải trong `app#17`.
 
+- **Stale JWT roles/tenant — CHỈ đóng cho `POST /api/admin/companies`/`POST /api/admin/users`,
+  CHƯA đóng cho phần còn lại của hệ thống** (review `app#17` đợt 8→9 — đợt 8 sửa 2 route admin, đợt
+  9 review lại chỉ ra khung "zero remaining risk" ngụ ý ở đợt 8 nói quá tay). `session.roles`/
+  `session.tenant_id` là claim JWT — ảnh chụp lúc đăng nhập, sống tới `jwt_expire_minutes` (mặc
+  định 480 phút). 2 route admin giờ tra `roles`/`tenant_id` TƯƠI từ `core.users` mỗi request (đợt
+  8) — nhưng đây là 1 THỂ HIỆN của vấn đề, không phải TOÀN BỘ vấn đề:
+  - `tenant_context_middleware` (`middleware.py:109`) vẫn `SET LOCAL app.tenant_id` từ
+    `session.tenant_id` (JWT) cho MỌI request, làm nguồn duy nhất cho RLS ở `wb.*`/`kb.*`.
+  - `routes/runs.py`, `routes/chat.py`, `routes/publish.py`, content-section role fence ở
+    `packages/engine` đều còn phân quyền bằng `session.roles`/`session.tenant_id` trực tiếp.
+  - **Hệ quả thật**: 1 nhân viên bị thu hồi role `hr` (sửa `core.users.roles` trong DB) vẫn đọc
+    được tài liệu HR qua fence tới khi JWT hết hạn tự nhiên (tối đa 480 phút) — bán kính LỚN HƠN 2
+    route admin vừa vá (đó chỉ chặn được leo quyền TẠO tài khoản/công ty, không chặn được đọc dữ
+    liệu tenant-scoped bằng role đã bị thu hồi).
+  - **Lý do chưa vá trọn ở `app#17`**: vá đúng nghĩa đòi middleware tự tra lại `roles`/`tenant_id`
+    MỖI request (round-trip DB thêm cho MỌI route, không riêng 2 route admin) — đổi hiệu năng của
+    toàn hệ thống (kể cả SSE chat, đường lưu lượng cao), cần đo/thiết kế riêng (cache ngắn hạn? tra
+    mỗi N phút thay vì mỗi request? tenant/roles đổi hiếm tới mức nào?) — không phải sửa rẻ như 2
+    route admin (đã có sẵn round-trip, chỉ cần lấy thêm cột).
+  - **Theo dõi**: cần 1 issue/PR riêng đo đúng phạm vi + phương án (round-trip mỗi request vs cache
+    TTL ngắn vs JWT revocation list) trước khi vá — ghi lại ở đây để không ai đọc code 2 route admin
+    rồi kết luận nhầm "hệ thống đã hết stale-JWT risk".
+
 ## Chữ ký
 
 Theo ADR-D11-01 §"Cơ chế chữ ký": chữ ký thật = Approve trên `app#17`, không phải bảng tự-điền ở
