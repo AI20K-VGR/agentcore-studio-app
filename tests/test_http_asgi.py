@@ -22,7 +22,7 @@ from collections.abc import AsyncIterator
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from studio_app import jwt_auth
+from studio_app import jwt_auth, rate_limit
 from studio_app.app import create_app
 from studio_app.core._db import Pool, close_pools
 from studio_app.jwt_auth import hash_password
@@ -33,6 +33,16 @@ from studio_app.settings import Settings
 async def _close_singleton_pools_after_test() -> AsyncIterator[None]:
     yield
     await close_pools()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _reset_rate_limiter() -> AsyncIterator[None]:
+    """`rate_limit._buckets` là state module-level, KHÔNG tự reset giữa các bài — mọi request qua
+    `ASGITransport` mặc định cùng 1 `client.host` giả (`127.0.0.1`, xem `httpx.ASGITransport`), nên
+    không reset sẽ làm bài sau ăn hết token bucket bài trước để lại (review `app#17`, Important #2,
+    đợt 8)."""
+    rate_limit.reset_all()
+    yield
 
 
 def _settings() -> Settings:
@@ -363,3 +373,97 @@ async def test_create_company_partial_failure_does_not_orphan_tenant_through_rea
         f"tên công ty {company_name!r} phải tạo lại được sau lần lỗi trước — thấy {retry_res.status_code}: "
         f"{retry_res.text}"
     )
+
+
+async def test_demoted_admin_stale_jwt_cannot_create_user_through_real_http(
+    client: AsyncClient, admin_pool: Pool
+) -> None:
+    """Important #1, review `app#17` đợt 8: trước bản vá, `create_user`/`create_company` phân
+    quyền bằng `session.roles` — claim JWT, ảnh chụp lúc đăng nhập, sống tới `jwt_expire_minutes`
+    (mặc định 480 phút = 8 tiếng). 1 admin bị thu hồi quyền giữa chừng (`core.users.roles` đổi
+    trong DB, vd HR khoá tài khoản sau khi nhân viên nghỉ/vi phạm) vẫn còn "admin" trong JWT CŨ tới
+    lúc hết hạn tự nhiên nếu route tin thẳng claim đó — route ĐÃ SẴN 1 lượt round-trip DB (tra
+    `created_by`) nên sửa rẻ: tra thêm cột `roles` ở CÙNG query, dùng giá trị TƯƠI đó để phân quyền
+    thay vì JWT.
+
+    Kịch bản thật qua HTTP: đăng nhập lấy JWT với "admin" -> UPDATE thẳng `core.users.roles` xoá
+    "admin" (mô phỏng demote, KHÔNG qua API — hệ thống hiện chưa có route demote, đây là hành động
+    admin DB trực tiếp) -> DÙNG LẠI đúng JWT cũ (chưa hết hạn) gọi `/api/admin/users` -> PHẢI 403,
+    không phải 200."""
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("INSERT INTO core.tenants (name) VALUES (%s) RETURNING id", ("stale-jwt-tenant",))
+        row = await cur.fetchone()
+        assert row is not None
+        tenant_id = row[0]
+        await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            (tenant_id, "soon-demoted@acme.com", hash_password("demoted-admin-password"), ["admin", "public"]),
+        )
+
+    login_res = await client.post(
+        "/api/auth/login", json={"email": "soon-demoted@acme.com", "password": "demoted-admin-password"}
+    )
+    assert login_res.status_code == 200
+    stale_admin_token = login_res.json()["access_token"]
+
+    # Demote NGOÀI luồng API — JWT vừa phát ở trên KHÔNG hề biết chuyện này xảy ra, vẫn mang
+    # "admin" trong chữ ký của nó tới lúc hết hạn tự nhiên.
+    async with admin_pool.connection() as conn:
+        await conn.execute("UPDATE core.users SET roles = %s WHERE email = %s", (["public"], "soon-demoted@acme.com"))
+
+    res = await client.post(
+        "/api/admin/users",
+        json={"email": "should-not-exist@acme.com", "password": "password123", "roles": ["public"]},
+        headers={"Authorization": f"Bearer {stale_admin_token}"},
+    )
+    assert res.status_code == 403, (
+        f"JWT cũ (còn 'admin') phải bị chặn sau khi DB đã demote — thấy {res.status_code}: {res.text}"
+    )
+
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("SELECT count(*) FROM core.users WHERE email = %s", ("should-not-exist@acme.com",))
+        count_row = await cur.fetchone()
+    assert count_row is not None
+    assert count_row[0] == 0, "user không được tạo dù JWT cũ còn 'admin' — phải tra roles tươi từ DB"
+
+
+async def test_login_rate_limited_per_ip_through_real_http(client: AsyncClient) -> None:
+    """Important #2, review `app#17` đợt 8: `bcrypt` cost-12 chạy KHÔNG ĐIỀU KIỆN ở `login()`, kể
+    cả nhánh `DUMMY_PASSWORD_HASH` (email không tồn tại) — route KHÔNG cần đăng nhập nên không có
+    gì chặn TRƯỚC nó, ~110 req/s từ 1 client ẩn danh đủ giữ bận toàn bộ AnyIO threadpool (mặc định
+    40 thread, dùng chung MỌI request của process). Bài này đi qua `ASGITransport` thật (mặc định
+    `client=("127.0.0.1", 123)`, cố định cho MỌI request qua transport này — xem
+    `httpx.ASGITransport.__init__`), gửi hơn `_CAPACITY` request liên tiếp cùng 1 "IP" và kỳ vọng
+    request thừa bị 429, không phải 401/500 (không cần email/mật khẩu đúng — chặn ở TẦNG rate-limit,
+    trước khi chạm DB/bcrypt)."""
+    body = {"email": "rate-limit-probe@acme.com", "password": "whatever-password"}
+
+    for _ in range(int(rate_limit._CAPACITY)):
+        res = await client.post("/api/auth/login", json=body)
+        assert res.status_code == 401, f"trong hạn mức phải 401 (email không tồn tại) — thấy {res.status_code}"
+
+    limited_res = await client.post("/api/auth/login", json=body)
+    assert limited_res.status_code == 429, f"vượt hạn mức phải 429 — thấy {limited_res.status_code}"
+
+
+async def test_login_rate_limit_is_per_ip_not_global(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Đối trọng bài trên: 1 IP bị 429 KHÔNG được làm IP khác bị vạ lây — rate-limit đúng nghĩa
+    "theo IP", không phải 1 bộ đếm toàn cục chặn nhầm người dùng thật khác đang đăng nhập bình
+    thường cùng lúc kẻ tấn công dồn dập từ IP khác."""
+    monkeypatch.setattr(jwt_auth, "get_settings", _settings)
+    app = create_app()
+    body = {"email": "rate-limit-probe-2@acme.com", "password": "whatever-password"}
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("10.0.0.1", 1)), base_url="http://test"
+    ) as attacker:
+        for _ in range(int(rate_limit._CAPACITY)):
+            await attacker.post("/api/auth/login", json=body)
+        blocked_res = await attacker.post("/api/auth/login", json=body)
+        assert blocked_res.status_code == 429
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app, client=("10.0.0.2", 1)), base_url="http://test"
+    ) as bystander:
+        ok_res = await bystander.post("/api/auth/login", json=body)
+        assert ok_res.status_code == 401, "IP khác không liên quan không được ăn 429 lây"

@@ -79,10 +79,18 @@ async def _seed_admin_user(admin_pool: Pool, tenant_id: UUID, email: str) -> Non
     `created_by = None` ngầm định như trước (đúng cửa mà JWT từ demo-login trước đây lách qua
     được). Nội dung `password_hash` không quan trọng ở đây — `create_user` không verify lại nó,
     chỉ cần dòng TỒN TẠI."""
+    await _seed_user_with_roles(admin_pool, tenant_id, email, ["admin"])
+
+
+async def _seed_user_with_roles(admin_pool: Pool, tenant_id: UUID, email: str, roles: list[str]) -> None:
+    """Cùng lý do `_seed_admin_user` ở trên nhưng cho roles TUỲ Ý — từ đợt 8, `create_company`/
+    `create_user` tra roles TƯƠI từ `core.users` (review `app#17`, Important #1) thay vì tin
+    `session.roles`, nên MỌI bài test gọi 2 hàm này (kể cả bài kỳ vọng bị chặn quyền) đều cần
+    người gọi có dòng thật trong DB — không còn suy ra thẳng từ `session.roles`."""
     async with admin_pool.connection() as conn:
         await conn.execute(
             "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
-            (str(tenant_id), email, "not-a-real-hash", ["admin"]),
+            (str(tenant_id), email, "not-a-real-hash", roles),
         )
 
 
@@ -90,12 +98,16 @@ async def test_non_superadmin_cannot_create_company(admin_pool: Pool) -> None:
     """403 — chỉ superadmin mới tạo được công ty mới. Admin công ty thường (dù có role "admin")
     không được leo lên tạo tenant khác."""
     tenant_id = await _seed_tenant(admin_pool, "probe-non-superadmin")
+    await _seed_admin_user(admin_pool, tenant_id, "admin@acme.com")
     token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
-            await create_company(
-                CreateCompanyRequest(company_name="evil-co", admin_email="evil@evil.com", admin_password="password123")
-            )
+            async with _simulate_request_connection():
+                await create_company(
+                    CreateCompanyRequest(
+                        company_name="evil-co", admin_email="evil@evil.com", admin_password="password123"
+                    )
+                )
         assert exc_info.value.status_code == 403
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
@@ -127,10 +139,14 @@ async def test_company_admin_cannot_grant_superadmin_role(admin_pool: Pool) -> N
     """Mutant leo quyền: company-admin cố tạo 1 user mang role "superadmin" — server phải chặn
     400, "superadmin" KHÔNG nằm trong _USER_ROLE_VOCAB dù người gọi có role "admin"."""
     tenant_id = await _seed_tenant(admin_pool, "probe-no-self-superadmin")
+    await _seed_admin_user(admin_pool, tenant_id, "admin@acme.com")
     token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
-            await create_user(CreateUserRequest(email="wannabe@acme.com", password="password123", roles=["superadmin"]))
+            async with _simulate_request_connection():
+                await create_user(
+                    CreateUserRequest(email="wannabe@acme.com", password="password123", roles=["superadmin"])
+                )
         assert exc_info.value.status_code == 400
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
@@ -140,10 +156,12 @@ async def test_create_user_rejects_role_outside_vocab(admin_pool: Pool) -> None:
     """Đối chứng với bài trên: không chỉ chặn riêng "superadmin", mà chặn MỌI chuỗi ngoài
     SECTION_VOCAB ∪ {"admin"} — vd lỗi gõ hoặc role tự chế không tồn tại."""
     tenant_id = await _seed_tenant(admin_pool, "probe-bad-role-string")
+    await _seed_admin_user(admin_pool, tenant_id, "admin@acme.com")
     token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
-            await create_user(CreateUserRequest(email="typo@acme.com", password="password123", roles=["hrr"]))
+            async with _simulate_request_connection():
+                await create_user(CreateUserRequest(email="typo@acme.com", password="password123", roles=["hrr"]))
         assert exc_info.value.status_code == 400
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
@@ -153,10 +171,12 @@ async def test_non_admin_cannot_create_user(admin_pool: Pool) -> None:
     """403 — nhân viên thường (không "admin"/"superadmin") không tự tạo được tài khoản khác,
     kể cả cho đúng tenant của mình."""
     tenant_id = await _seed_tenant(admin_pool, "probe-non-admin-create-user")
+    await _seed_user_with_roles(admin_pool, tenant_id, "hr@acme.com", ["public", "hr"])
     token = _set_session(tenant_id=tenant_id, user="hr@acme.com", roles=["public", "hr"])
     try:
         with pytest.raises(HTTPException) as exc_info:
-            await create_user(CreateUserRequest(email="another@acme.com", password="password123", roles=["public"]))
+            async with _simulate_request_connection():
+                await create_user(CreateUserRequest(email="another@acme.com", password="password123", roles=["public"]))
         assert exc_info.value.status_code == 403
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
@@ -268,15 +288,23 @@ async def test_create_company_sets_created_by_to_real_superadmin_id(admin_pool: 
     assert created_by == superadmin_id
 
 
-async def test_superadmin_without_company_cannot_create_user() -> None:
+async def test_superadmin_without_company_cannot_create_user(admin_pool: Pool) -> None:
     """Nên-sửa #3, review `app#17`: superadmin CHƯA tạo công ty nào (chỉ có role "superadmin",
     không có "admin") gọi thẳng `/api/admin/users` sẽ tạo user rơi vào tenant `__system__` một
-    cách âm thầm (session.tenant_id lúc bootstrap) — chặn 400, không phải lỗ hổng nhưng là footgun
-    im lặng nếu để lọt."""
-    token = _set_session(tenant_id=UUID(int=0), user="su@sys", roles=["superadmin"])
+    cách âm thầm (tenant_id lúc bootstrap) — chặn 400, không phải lỗ hổng nhưng là footgun im lặng
+    nếu để lọt.
+
+    Cần `admin_pool` + `_simulate_request_connection()` (khác bản trước đợt 8): roles/tenant giờ
+    tra TƯƠI từ `core.users` (review `app#17`, Important #1 — không còn tin thẳng `session.roles`
+    claim JWT), nên "su@sys" PHẢI có dòng thật trong DB để check "admin" not in roles chạy tới
+    được, không còn suy ra thẳng từ `session.roles` như trước."""
+    tenant_id = await _seed_tenant(admin_pool, "probe-superadmin-no-company")
+    await _seed_superadmin_user(admin_pool, tenant_id, "su@sys")
+    token = _set_session(tenant_id=tenant_id, user="su@sys", roles=["superadmin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
-            await create_user(CreateUserRequest(email="orphan@sys", password="password123", roles=["public"]))
+            async with _simulate_request_connection():
+                await create_user(CreateUserRequest(email="orphan@sys", password="password123", roles=["public"]))
         assert exc_info.value.status_code == 400
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
@@ -372,15 +400,19 @@ async def test_create_company_duplicate_admin_email_returns_409_not_500(admin_po
     assert row[0] == 0, "tenant thứ 2 phải bị rollback hoàn toàn, không để lại mồ côi"
 
 
-async def test_create_user_rejects_empty_roles() -> None:
+async def test_create_user_rejects_empty_roles(admin_pool: Pool) -> None:
     """`roles: []` trước bản vá vẫn tạo được tài khoản (không hại — fence trả 0 chunk — nhưng không
     có lý do hợp lệ nào cho tài khoản không role nào tồn tại, review `app#17`, "nên sửa" #5).
-    Chặn này xảy ra TRƯỚC khi chạm connection nào (cùng chỗ với check `invalid_roles`), nên không
-    cần `_simulate_request_connection()`."""
-    token = _set_session(tenant_id=UUID(int=0), user="admin@acme.com", roles=["admin"])
+
+    Cần `_simulate_request_connection()` từ đợt 8: check `invalid_roles`/`roles: []` giờ chạy SAU
+    khi tra roles TƯƠI từ DB (Important #1), không còn trước connection nào như bản đợt 6."""
+    tenant_id = await _seed_tenant(admin_pool, "probe-empty-roles")
+    await _seed_admin_user(admin_pool, tenant_id, "admin@acme.com")
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
-            await create_user(CreateUserRequest(email="no-roles@acme.com", password="password123", roles=[]))
+            async with _simulate_request_connection():
+                await create_user(CreateUserRequest(email="no-roles@acme.com", password="password123", roles=[]))
         assert exc_info.value.status_code == 400
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]

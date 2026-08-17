@@ -25,7 +25,6 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 from studio_kb.doc_factory import SECTION_VOCAB
-from studio_workbench.tenant_wall import ResolvedContext
 
 from studio_app.jwt_auth import hash_password, normalize_email
 from studio_app.middleware import get_request_connection, get_request_session
@@ -56,15 +55,22 @@ def _reject_oversized_password(v: str) -> str:
     return v
 
 
-def require_superadmin(session: ResolvedContext) -> None:
+def require_superadmin(roles: list[str]) -> None:
     """403 — đã đăng nhập rồi (qua get_request_session(), 401 xử lý ở lớp dưới), chỉ thiếu ĐÚNG
-    quyền superadmin. Khác `get_request_session()`'s 401 (chưa chứng minh được là ai)."""
-    if "superadmin" not in session.roles:
+    quyền superadmin. Khác `get_request_session()`'s 401 (chưa chứng minh được là ai).
+
+    `roles` PHẢI là roles TƯƠI tra lại từ `core.users` ngay trong request này, KHÔNG phải
+    `session.roles` (claim JWT) — JWT là ảnh chụp lúc đăng nhập, sống tới `jwt_expire_minutes`
+    (mặc định 480 phút = 8 tiếng). 1 superadmin bị thu hồi quyền giữa chừng (roles đổi trong DB)
+    vẫn còn "superadmin" trong JWT cũ tới lúc hết hạn nếu route tin thẳng `session.roles` — review
+    `app#17`, Important #1 (đợt 8)."""
+    if "superadmin" not in roles:
         raise HTTPException(status_code=403, detail="Cần quyền superadmin.")
 
 
-def require_admin(session: ResolvedContext) -> None:
-    if "admin" not in session.roles and "superadmin" not in session.roles:
+def require_admin(roles: list[str]) -> None:
+    """Cùng lý do `require_superadmin` ở trên — `roles` phải là roles TƯƠI từ DB, không phải JWT."""
+    if "admin" not in roles and "superadmin" not in roles:
         raise HTTPException(status_code=403, detail="Cần quyền admin.")
 
 
@@ -86,25 +92,28 @@ class CreateCompanyResponse(BaseModel):
 
 @router.post("/companies", response_model=CreateCompanyResponse)
 async def create_company(body: CreateCompanyRequest) -> CreateCompanyResponse:
+    # `get_request_session()` ở đây CHỈ để lấy identity (`session.user`, tức email đã qua verify
+    # chữ ký JWT) — KHÔNG dùng `session.roles` để phân quyền (xem SELECT ngay dưới). 401 (chưa
+    # chứng minh được là ai) vẫn xử lý ở đây như cũ.
     session = get_request_session()
-    require_superadmin(session)
-
-    # bcrypt là CPU-bound đồng bộ (~200-370ms) — chạy qua threadpool để không chặn event loop, và
-    # tính TRƯỚC khi mở connection để không giữ 1 connection Postgres suốt thời gian băm (review
-    # `app#17`, đợt 2, mục 4).
-    admin_password_hash = await run_in_threadpool(hash_password, body.admin_password)
 
     # Dùng `get_request_connection()` (connection middleware đã mở sẵn cho request này), KHÔNG tự
-    # mở thêm 1 connection riêng qua `get_pool()` — trước bản vá, mỗi request tới route này giữ
-    # ĐỒNG THỜI 2 connection trong pool `max_size=8` (1 của middleware, không dùng tới; 1 của route)
-    # suốt đời request, y hệt vấn đề `routes/auth.py::login` đã sửa ở đợt 3. Khác `login` (chỉ đọc),
-    # route này còn cần rollback ĐỘC LẬP khi `UniqueViolation` — nhưng đó là việc của SAVEPOINT
-    # (`conn.transaction()`, xem dưới), không phải của việc mở thêm connection (review `app#17`,
-    # đợt 5, Chặn B: 8 request đồng thời gọi route admin làm cả pool deadlock — 4×500 sau 30s, kèm
-    # login của tenant KHÁC bị treo theo cùng khoảng thời gian, vì pool cạn kiệt ảnh hưởng toàn bộ
-    # worker, không riêng gì request đang gọi route này).
+    # mở thêm 1 connection riêng qua `get_pool()` — trước bản vá đợt 6, mỗi request tới route này
+    # giữ ĐỒNG THỜI 2 connection trong pool `max_size=8` suốt đời request, y hệt vấn đề
+    # `routes/auth.py::login` đã sửa ở đợt 3 (review `app#17` đợt 5, Chặn B).
     conn = get_request_connection()
-    cur = await conn.execute("SELECT id FROM core.users WHERE email = %s", (session.user,))
+
+    # Tra `id` + `roles` TƯƠI từ `core.users`, KHÔNG dùng `session.roles` (claim JWT) để phân
+    # quyền — JWT là ảnh chụp lúc đăng nhập, sống tới `jwt_expire_minutes` (mặc định 480 phút).
+    # 1 superadmin bị thu hồi quyền giữa chừng (sửa `roles` trong `core.users`) vẫn còn quyền cũ
+    # trong JWT tới lúc hết hạn nếu route tin thẳng `session.roles` (review `app#17`, Important #1,
+    # đợt 8) — route này ĐÃ SẴN 1 lượt round-trip để lấy `created_by`, nên tra thêm cột `roles`
+    # ở CÙNG query không tốn thêm round-trip nào. Đặt TRƯỚC bcrypt (khác thứ tự cũ) — không còn lý
+    # do giữ hash trước connection nữa: `get_request_connection()` không phải 1 lượt checkout pool
+    # mới (khác `get_pool()` cũ), connection đã được middleware giữ suốt đời request bất kể gọi lúc
+    # nào, nên đổi thứ tự không tốn thêm pool pressure, mà còn fail-fast đúng roles trước khi tốn
+    # ~200-370ms băm mật khẩu cho 1 request sẽ bị 403 dù sao.
+    cur = await conn.execute("SELECT id, roles FROM core.users WHERE email = %s", (session.user,))
     creator_row = await cur.fetchone()
     if creator_row is None:
         # Cùng lưới an toàn với `create_user` bên dưới (Chặn 1, review `app#17`) — trước bản
@@ -115,7 +124,11 @@ async def create_company(body: CreateCompanyRequest) -> CreateCompanyResponse:
             status_code=403,
             detail="Tài khoản gọi API không tồn tại trong core.users.",
         )
-    created_by = creator_row[0]
+    created_by, creator_roles = creator_row
+    require_superadmin(list(creator_roles))
+
+    # bcrypt là CPU-bound đồng bộ (~200-370ms) — chạy qua threadpool để không chặn event loop.
+    admin_password_hash = await run_in_threadpool(hash_password, body.admin_password)
 
     # roles mặc định của admin công ty ĐẦU TIÊN: "admin" (mở canvas) + đủ 4 role nội dung —
     # admin công ty cần đọc được mọi tài liệu để cấu hình agent, khác nhân viên phòng ban chỉ
@@ -167,9 +180,10 @@ class CreateUserRequest(BaseModel):
     password: str = Field(min_length=8)
     roles: list[str]
     # `tenant_id` CỐ Ý KHÔNG có field ở đây — client không có chỗ nào để tự khai tenant, server
-    # LUÔN dùng session.tenant_id của người gọi (company-admin đang đăng nhập). Copy nguyên văn
-    # lý do `RunRequest` (`routes/runs.py:49-52`, INV-1): "request THẬM CHÍ KHÔNG THỂ mang
-    # trường đó, chứ không phải mang được nhưng bị bỏ qua".
+    # LUÔN dùng tenant_id TƯƠI (tra lại từ `core.users` ngay trong request, xem `create_user`)
+    # của người gọi (company-admin đang đăng nhập), KHÔNG phải claim JWT. Copy nguyên văn lý do
+    # `RunRequest` (`routes/runs.py:49-52`, INV-1): "request THẬM CHÍ KHÔNG THỂ mang trường đó,
+    # chứ không phải mang được nhưng bị bỏ qua".
 
     _validate_password = field_validator("password")(_reject_oversized_password)
     _normalize_email = field_validator("email")(normalize_email)
@@ -184,12 +198,49 @@ class CreateUserResponse(BaseModel):
 
 @router.post("/users", response_model=CreateUserResponse)
 async def create_user(body: CreateUserRequest) -> CreateUserResponse:
+    # `get_request_session()` ở đây CHỈ để lấy identity (`session.user`) — KHÔNG dùng
+    # `session.roles`/`session.tenant_id` (claim JWT) để phân quyền/gán tenant, xem SELECT dưới.
     session = get_request_session()
-    require_admin(session)
 
-    if "admin" not in session.roles:
+    # Dùng connection của middleware (`get_request_connection()`) + SAVEPOINT qua `conn.transaction()`
+    # cho rollback độc lập khi `UniqueViolation`, KHÔNG tự mở connection riêng — cùng lý do
+    # `create_company` ở trên (comment đầy đủ tại đó, review `app#17` đợt 5, Chặn B).
+    conn = get_request_connection()
+
+    # Tra `id`/`roles`/`tenant_id` TƯƠI từ `core.users`, KHÔNG dùng `session.roles`/
+    # `session.tenant_id` (claim JWT) — JWT là ảnh chụp lúc đăng nhập, sống tới
+    # `jwt_expire_minutes` (mặc định 480 phút). 2 hệ quả nếu tin thẳng JWT (review `app#17`,
+    # Important #1, đợt 8):
+    # 1. Admin bị thu hồi quyền (`roles` đổi trong DB) vẫn còn "admin" trong JWT cũ tới lúc hết
+    #    hạn — leo quyền tạm thời, không cần làm gì thêm ngoài chờ JWT hết hạn tự nhiên.
+    # 2. Admin bị CHUYỂN CÔNG TY (`tenant_id` đổi trong DB, vd tách/sáp nhập tenant) vẫn ghi user
+    #    mới vào tenant CŨ (từ JWT) thay vì tenant HIỆN TẠI — user mới lạc sang company sai.
+    # Route này ĐÃ SẴN 1 lượt round-trip để lấy `created_by`, nên tra thêm 2 cột này ở CÙNG query
+    # không tốn thêm round-trip nào.
+    cur = await conn.execute(
+        "SELECT id, roles, tenant_id FROM core.users WHERE email = %s",
+        (session.user,),
+    )
+    creator_row = await cur.fetchone()
+    if creator_row is None:
+        # Phòng thủ theo chiều sâu: người gọi có role "admin"/"superadmin" trong JWT hợp lệ
+        # (chữ ký đúng) nhưng KHÔNG có dòng nào trong `core.users` — hiện tại `issue_token()`
+        # chỉ được gọi từ `login()` SAU KHI verify mật khẩu khớp 1 dòng `core.users` thật, nên
+        # nhánh này không còn đường nào tới được trong luồng bình thường (khác giai đoạn còn
+        # `demo-login`, khi đây là lỗ hổng leo quyền thật — review `app#17` Chặn 1: JWT từ
+        # `demo-login` không cần mật khẩu vẫn mint được tài khoản thật bền vững qua route này).
+        # Giữ lại chặn này làm lưới an toàn cho mọi thay đổi tương lai ở `issue_token()`/`login()`.
+        raise HTTPException(
+            status_code=403,
+            detail="Tài khoản gọi API không tồn tại trong core.users.",
+        )
+    created_by, creator_roles_raw, creator_tenant_id = creator_row
+    creator_roles = list(creator_roles_raw)
+    require_admin(creator_roles)
+
+    if "admin" not in creator_roles:
         # Người gọi có "superadmin" nhưng KHÔNG có "admin" — tức chưa từng qua `create_company`,
-        # không thuộc công ty nào (session.tenant_id là tenant `__system__` bootstrap). Nếu cho
+        # không thuộc công ty nào (`creator_tenant_id` là tenant `__system__` bootstrap). Nếu cho
         # tạo tiếp, user mới sẽ rơi vào `__system__` một cách âm thầm — không phải lỗ hổng, nhưng
         # là footgun im lặng (review `app#17`, "nên sửa" #3). Superadmin phải tạo công ty trước.
         raise HTTPException(
@@ -210,41 +261,17 @@ async def create_user(body: CreateUserRequest) -> CreateUserResponse:
         # (review `app#17`, "nên sửa" #5).
         raise HTTPException(status_code=400, detail="roles không được rỗng.")
 
-    # bcrypt là CPU-bound đồng bộ (~200-370ms) — chạy qua threadpool để không chặn event loop, và
-    # tính TRƯỚC khi mở connection để không giữ 1 connection Postgres suốt thời gian băm (review
-    # `app#17`, đợt 2, mục 4).
+    # bcrypt là CPU-bound đồng bộ (~200-370ms) — chạy qua threadpool để không chặn event loop.
+    # Chạy SAU mọi kiểm tra ở trên (đổi thứ tự so với trước đợt 8): fail-fast cho request sẽ bị
+    # 400/403 dù sao, không tốn ~200-370ms băm mật khẩu vô ích.
     password_hash = await run_in_threadpool(hash_password, body.password)
-
-    # Dùng connection của middleware (`get_request_connection()`) + SAVEPOINT qua `conn.transaction()`
-    # cho rollback độc lập khi `UniqueViolation`, KHÔNG tự mở connection riêng — cùng lý do
-    # `create_company` ở trên (comment đầy đủ tại đó, review `app#17` đợt 5, Chặn B).
-    conn = get_request_connection()
-    # session.tenant_id — KHÔNG đọc tenant_id từ body (body không có field đó).
-    cur = await conn.execute(
-        "SELECT id FROM core.users WHERE email = %s",
-        (session.user,),
-    )
-    creator_row = await cur.fetchone()
-    if creator_row is None:
-        # Phòng thủ theo chiều sâu: người gọi có role "admin"/"superadmin" trong JWT hợp lệ
-        # (chữ ký đúng) nhưng KHÔNG có dòng nào trong `core.users` — hiện tại `issue_token()`
-        # chỉ được gọi từ `login()` SAU KHI verify mật khẩu khớp 1 dòng `core.users` thật, nên
-        # nhánh này không còn đường nào tới được trong luồng bình thường (khác giai đoạn còn
-        # `demo-login`, khi đây là lỗ hổng leo quyền thật — review `app#17` Chặn 1: JWT từ
-        # `demo-login` không cần mật khẩu vẫn mint được tài khoản thật bền vững qua route này).
-        # Giữ lại chặn này làm lưới an toàn cho mọi thay đổi tương lai ở `issue_token()`/`login()`.
-        raise HTTPException(
-            status_code=403,
-            detail="Tài khoản gọi API không tồn tại trong core.users.",
-        )
-    created_by = creator_row[0]
 
     try:
         async with conn.transaction():
             cur = await conn.execute(
                 "INSERT INTO core.users (tenant_id, email, password_hash, roles, created_by) "
                 "VALUES (%s, %s, %s, %s, %s) RETURNING id",
-                (str(session.tenant_id), body.email, password_hash, body.roles, created_by),
+                (str(creator_tenant_id), body.email, password_hash, body.roles, created_by),
             )
     except psycopg.errors.UniqueViolation as exc:  # email đã tồn tại — 409, không 500
         raise HTTPException(status_code=409, detail=f"email {body.email!r} đã tồn tại") from exc
@@ -253,5 +280,5 @@ async def create_user(body: CreateUserRequest) -> CreateUserResponse:
     user_id = row[0]
 
     return CreateUserResponse(
-        user_id=str(user_id), email=body.email, tenant_id=str(session.tenant_id), roles=body.roles
+        user_id=str(user_id), email=body.email, tenant_id=str(creator_tenant_id), roles=body.roles
     )

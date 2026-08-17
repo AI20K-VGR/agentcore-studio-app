@@ -19,11 +19,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, field_validator
 from starlette.concurrency import run_in_threadpool
 from studio_workbench.tenant_wall import resolve_session
 
+from studio_app import rate_limit
 from studio_app.jwt_auth import DUMMY_PASSWORD_HASH, issue_token, normalize_email, verify_password
 from studio_app.middleware import get_request_connection
 
@@ -53,8 +54,17 @@ class LoginResponse(BaseModel):
 
 
 @router.post("/login", response_model=LoginResponse)
-async def login(body: LoginRequest) -> LoginResponse:
-    """Không tiết lộ "email không tồn tại" vs "sai mật khẩu" qua status code khác nhau (cả hai đều
+async def login(body: LoginRequest, request: Request) -> LoginResponse:
+    """Rate-limit theo IP TRƯỚC MỌI VIỆC KHÁC (kể cả tra DB) — review `app#17`, Important #2, đợt
+    8: `bcrypt` cost-12 chạy KHÔNG ĐIỀU KIỆN bên dưới, kể cả nhánh `DUMMY_PASSWORD_HASH`, trên
+    AnyIO threadpool DÙNG CHUNG (mặc định 40 thread) với mọi request khác của process. Route này
+    KHÔNG cần đăng nhập (chính nó là cửa đăng nhập) nên không có gì chặn trước nó — ~110 req/s từ
+    1 client ẩn danh đủ giữ bận toàn bộ threadpool, treo NGUYÊN process (`rate_limit.py` giải thích
+    đầy đủ). `request.client.host` — KHÔNG đọc `X-Forwarded-For` (header client tự khai, giả mạo
+    được nếu không có reverse proxy đáng tin cấu hình strip/overwrite nó; dùng thẳng header đó ở
+    đây sẽ MỞ LẠI đường né rate-limit bằng cách tự đổi header mỗi request).
+
+    Không tiết lộ "email không tồn tại" vs "sai mật khẩu" qua status code khác nhau (cả hai đều
     401) — tránh cho kẻ tấn công dò được danh sách email tồn tại trong hệ thống bằng cách thử
     từng email (user enumeration qua timing/status code).
 
@@ -80,6 +90,10 @@ async def login(body: LoginRequest) -> LoginResponse:
     gọi `/api/auth/login` giữ đồng thời 2 connection trong pool `max_size=8` suốt đời request (1
     của middleware, không dùng tới; 1 của route) — route đăng nhập không cần login vẫn là route
     lưu lượng cao nhất trong hệ thống, review `app#17` đợt 3, Important."""
+    client_ip = request.client.host if request.client is not None else "unknown"
+    if not rate_limit.check_and_consume(client_ip):
+        raise HTTPException(status_code=429, detail="Quá nhiều yêu cầu đăng nhập — thử lại sau.")
+
     conn = get_request_connection()
     cur = await conn.execute(
         "SELECT tenant_id, password_hash, roles FROM core.users WHERE email = %s",
