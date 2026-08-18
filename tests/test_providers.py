@@ -9,6 +9,7 @@ import pytest
 from studio_app.obs import tracing
 from studio_app.providers.fakes import FakeEmbedding, FakeLLM
 from studio_app.providers.gemini import GeminiProvider
+from studio_app.providers.openai import OpenAIProvider
 from studio_contracts.protocols import LLM, EmbeddingService
 
 
@@ -34,6 +35,15 @@ def test_gemini_provides_llm_not_embedding() -> None:
     EmbeddingService — that concrete 2-impl (stub-local + gateway) is AIE-1's graded deliverable
     (R-SPEC A1#5/A4); shipping a Gemini embed() here would silently do that work for them."""
     provider = GeminiProvider(api_key="unused-in-this-test")
+    assert isinstance(provider, LLM)
+    assert not isinstance(provider, EmbeddingService)
+    assert not hasattr(provider, "embed")
+
+
+def test_openai_provides_llm_not_embedding() -> None:
+    """KHÓA F3 (provider-boundary): OpenAIProvider implements LLM only — song sinh
+    test_gemini_provides_llm_not_embedding."""
+    provider = OpenAIProvider(api_key="unused-in-this-test")
     assert isinstance(provider, LLM)
     assert not isinstance(provider, EmbeddingService)
     assert not hasattr(provider, "embed")
