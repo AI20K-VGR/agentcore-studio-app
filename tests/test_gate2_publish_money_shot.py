@@ -73,8 +73,10 @@ _THRESHOLD_CITATION = 0.95
 
 
 def _recipe(agent_id: str) -> Recipe:
-    """Recipe thật qua `create_recipe_d4` — cùng hàm `eval_adapter.py:98` dùng, nên bài này đi qua
-    `graph_lint` y như đường thật chứ không qua một DAG dựng riêng cho test."""
+    """Recipe thật qua `create_recipe_d4` — cùng hàm `eval_adapter.py::EngineAgentRunner.
+    certified_recipe` dùng ở nhánh không tiêm `recipe=` (neo bằng tên, không phải số dòng — số
+    dòng ở đây đã trôi từ trước cả bản vá này), nên bài này đi qua `graph_lint` y như đường thật
+    chứ không qua một DAG dựng riêng cho test."""
     return create_recipe_d4(agent_id=agent_id, tenant_id=ANKOR_ID)
 
 

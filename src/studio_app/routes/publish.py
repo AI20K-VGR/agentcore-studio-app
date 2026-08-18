@@ -7,7 +7,7 @@
 (CLI/`apps/studio`/fixture) là chỗ DUY NHẤT biết golden-30 nằm ở đâu" — nên hằng số đường dẫn
 NẰM Ở ĐÂY, đúng chỗ được chỉ định, không phải một vi phạm layering.
 
-**KHÔNG còn LUÔN trả 409** (sửa lại đợt review app#21 — trước bản vá này, `EvalHarness.run()` gọi
+**KHÔNG còn LUÔN trả 409** (sửa lại đợt review app#26 — trước bản vá này, `EvalHarness.run()` gọi
 ở `_evaluate()` bên dưới không truyền `recipe_hash=`, nên `compute_scorecard()` luôn nhận `None`
 và `publish()` fail-closed trên đúng field đó TRƯỚC CẢ khi đọc `gate.verdict`, bất kể agent tốt
 xấu ra sao). `studio_workbench.publish.recipe_hash()` (DEC-03, hoàn thiện tại đây) giờ tính hash
@@ -123,7 +123,9 @@ async def _evaluate(agent_id: str, body: RunRequest, session: ResolvedContext) -
         # nhau về `agent_config`/`dag`/`kb_binding` (đo được: recipe được chấm còn có 1 node
         # `tool-call` admin chưa từng vẽ) — cổng đối chiếu hash ở `publish()` khi đó so hash CANVAS
         # với chính nó, không so được với thứ THẬT SỰ đã chạy, nên luôn khớp một cách vô nghĩa.
-        # `graph_lint(recipe)` đã chạy Ở TRÊN (dòng ~86) — đúng tiền điều kiện `GRAPH-LINT-CONTRACT`
+        # `graph_lint(recipe)` đã chạy Ở TRÊN, ngay sau khi `create_dynamic_recipe(...)` dựng xong
+        # recipe (neo bằng TÊN lệnh gọi, không phải số dòng — số dòng đã trôi thật ngay trong PR
+        # này, review app#26 🟡) — đúng tiền điều kiện `GRAPH-LINT-CONTRACT`
         # mà `run_case` (eval_adapter.py) đòi hỏi cho nhánh `recipe=` được tiêm.
         recipe=recipe,
     )
