@@ -17,6 +17,15 @@ Submodule `apps/studio` của workspace `agentcore-studio-kit`. Owner: **mentor*
 `AI20K-VGR/agentcore-studio-kit/.github/workflows/reusable-domain-ci.yml@main`.
 Muốn đổi quy trình CI thì sửa ở repo cha (1 chỗ).
 
+## LLM provider (app#19)
+`STUDIO_LLM_PROVIDER=openai|gemini` chọn provider LLM thật lúc `STUDIO_USE_FAKE_PROVIDERS=false`
+(`use_fake_providers=True` mặc định luôn thắng trước — biến này chỉ có tác dụng khi tắt fake).
+`Settings.llm_provider` là required, không default: thiếu/sai giá trị raise `ValidationError` ngay
+lúc boot, không âm thầm rơi về nhánh nào (cùng nguyên tắc `jwt_secret`).
+- **Rollback:** đổi 1 biến env (`STUDIO_LLM_PROVIDER`) rồi restart process — không cần đổi code.
+- **API key theo nhánh đang dùng:** set đúng `STUDIO_OPENAI_API_KEY` (nhánh `openai`) hoặc
+  `STUDIO_GEMINI_API_KEY` (nhánh `gemini`); nhánh không dùng có thể để trống (`Optional`).
+
 ## Quy tắc
 - Là composition root nên chạm nhiều domain — ưu tiên wiring, không viết logic domain ở đây.
 - Đổi contract → sang repo `agentcore-studio-contracts` (mentor-approval).
