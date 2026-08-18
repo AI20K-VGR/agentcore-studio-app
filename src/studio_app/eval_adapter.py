@@ -94,14 +94,18 @@ class EngineAgentRunner:
     def certified_recipe(self, *, agent_id: str, tenant_id: UUID, section_roles: list[str]) -> Recipe:
         """Recipe **gốc** của run — thứ mà `recipe_hash` phải băm, và thứ `publish()` phải chứng nhận.
 
-        **Không mang `query`.** Đó là điểm khác duy nhất so với bản trước D20, và là điều làm câu
-        *"scorecard này chứng nhận recipe nào"* có đáp án đơn nhất: `query` là **dữ liệu đề bài của
-        golden-set**, không phải cấu hình agent — một agent đã publish không có query cố định.
+        **Không mang `query` — CHỈ ĐÚNG cho nhánh không tiêm `recipe=` (dựng `create_recipe_d4` rồi
+        gỡ query bên dưới).** Đó là điều làm câu *"scorecard này chứng nhận recipe nào"* có đáp án
+        đơn nhất cho nhánh đó: `query` là **dữ liệu đề bài của golden-set**, không phải cấu hình
+        agent — một agent đã publish không có query cố định. Nhánh tiêm (dòng dưới) KHÔNG áp lại
+        bất biến này: nếu canvas admin vẽ có `params["query"]` gõ sẵn trong 1 node `kb-retrieve`,
+        giá trị đó đi thẳng vào hash — vô hại cho tính nhất quán (cùng object được băm lẫn publish),
+        nhưng là 1 trục canonical-form còn bỏ ngỏ nếu sau này cần so sánh giữa 2 lần chấm.
 
-        Caller truyền `recipe=` ở constructor (đường `routes/publish.py` sẽ dùng: recipe từ canvas)
-        ⇒ trả **đúng recipe đó**, không dựng lại. Đây là chỗ đóng finding của SWE trên `kit#127`:
-        *"recipe được CHẤM và recipe được PUBLISH là hai đối tượng khác nhau về cấu trúc"* — hai cái
-        chỉ bằng nhau khi caller đưa recipe thật vào thay vì để adapter tự dựng.
+        Caller truyền `recipe=` ở constructor (đường `routes/publish.py` ĐANG dùng: recipe từ canvas,
+        từ review `app#26` ⛔) ⇒ trả **đúng recipe đó**, không dựng lại. Đây là chỗ đóng finding của
+        SWE trên `kit#127`: *"recipe được CHẤM và recipe được PUBLISH là hai đối tượng khác nhau về
+        cấu trúc"* — hai cái chỉ bằng nhau khi caller đưa recipe thật vào thay vì để adapter tự dựng.
 
         Không truyền ⇒ dựng `create_recipe_d4` như trước, nhưng **một lần cho cả run** và đã gỡ `query`.
 

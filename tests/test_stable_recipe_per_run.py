@@ -7,10 +7,12 @@ Trước D20, `EngineAgentRunner.run_case` gọi `create_recipe_d4(query=…)` *
 nhất** — bất kể ai băm và băm bằng gì. Đó là thứ chặn `recipe_hash` (`DEC-03`, quá hạn từ D12), không
 phải bản thân phép băm.
 
-SWE đo thêm một vế nặng hơn (`kit#127`): `routes/publish.py` gọi `EvalHarness().run(recipe.agent_id,
-recipe.golden_set_ref, …)` — **không truyền `recipe` canvas vào đâu cả** ⇒ recipe được **chấm** và
-recipe được **publish** là hai đối tượng khác nhau **về cấu trúc**. Dù `recipe_hash` có producer ngay
-hôm nay, `publish()` vẫn chứng nhận **nhầm đối tượng**.
+SWE đo thêm một vế nặng hơn (`kit#127`, ĐÃ ĐÓNG ở review `app#26` ⛔): trước bản vá đó,
+`routes/publish.py` gọi `EvalHarness().run(recipe.agent_id, recipe.golden_set_ref, …)` mà **không
+truyền `recipe` canvas vào đâu cả** ⇒ recipe được **chấm** và recipe được **publish** là hai đối
+tượng khác nhau **về cấu trúc** — dù `recipe_hash` có producer, `publish()` vẫn chứng nhận **nhầm
+đối tượng**. `_evaluate()` giờ truyền `recipe=recipe` vào `EngineAgentRunner` (xem
+`routes/publish.py`), đóng đúng khe mà đoạn dưới đây gọi tên.
 
 ## Bài nào bắt được gì — đo bằng mutant, không tự khai
 
@@ -34,9 +36,11 @@ recipe sắp publish** vào. Khe đó mới là thứ đóng finding của SWE, 
 Nói ra vì bản nháp đầu gọi bài 30-case là *"bài trả lời 🅐"* — **sai**: nó xanh ở cả hai phía mutant.
 Nó được giữ lại với đúng vai thật của nó (xem docstring của chính bài đó), không phải vai đã dán.
 
-**Bài này KHÔNG chứng minh `recipe_hash` đã có.** Nó chứng minh *đã có đúng một thứ để băm* — điều
-kiện **cần**. Băm trên chuỗi byte nào vẫn là câu hỏi mở của SWE (`kit#127` 🅑), và `DEC-D20-02` giữ
-nguyên: evalhub **nhận** giá trị, không tự dẫn xuất.
+**Bài này KHÔNG tự chứng minh `recipe_hash` đã có** — nó chứng minh *đã có đúng một thứ để băm*,
+điều kiện **cần**. Băm trên chuỗi byte nào đã được SWE chốt (`studio_workbench.publish.
+recipe_hash()`: `sha256` trên `model_dump(mode="json", by_alias=True)` + `sort_keys=True`, xem
+docstring hàm đó để biết lý do từng cờ), và `DEC-D20-02` giữ nguyên: evalhub **nhận** giá trị,
+không tự dẫn xuất.
 """
 
 from __future__ import annotations

@@ -35,10 +35,12 @@ _TRUST_MARKER = "GRAPH-LINT-CONTRACT"
 # thích vì sao ngoại lệ an toàn HÔM NAY và điều gì phải còn đúng để nó tiếp tục an toàn. Đừng thêm
 # một mục vào đây trước khi viết marker đó.
 _ALLOWLIST: set[tuple[str, str]] = {
-    # `run_case` không tự gọi graph_lint(): recipe nó dùng hôm nay hoặc là fixture cố định
+    # `run_case` không tự gọi graph_lint(): recipe nó dùng hoặc là fixture cố định
     # (`create_recipe_d4`, không bắt nguồn từ nodes/edges người dùng), hoặc là recipe tiêm từ
-    # constructor mà đường sản xuất DUY NHẤT (`publish.py::_evaluate`) chưa thật sự truyền
-    # (`kit#127`, còn mở). Chi tiết đầy đủ ở marker trong `eval_adapter.py`.
+    # constructor — đường sản xuất DUY NHẤT (`publish.py::_evaluate`) giờ ĐÃ truyền `recipe=`
+    # (`kit#127` đóng ở review `app#26`), và an toàn vì `_evaluate` gọi `graph_lint(recipe)` NGAY
+    # TRƯỚC khi dựng `EngineAgentRunner(recipe=recipe, ...)`. Chi tiết đầy đủ ở marker trong
+    # `eval_adapter.py`.
     ("eval_adapter.py", "EngineAgentRunner.run_case"),
 }
 
