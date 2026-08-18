@@ -430,7 +430,7 @@ async def test_fetch_fresh_identity_rejects_jwt_issued_before_password_change(ad
                 await fetch_fresh_identity(conn, "stale-jwt@acme.com")
             assert exc_info.value.status_code == 401
         finally:
-            middleware._request_token_issued_at.reset(iat_token)  # type: ignore[arg-type]
+            middleware._request_token_issued_at.reset(iat_token)
 
 
 async def test_fetch_fresh_identity_accepts_jwt_issued_after_password_change(admin_pool: Pool) -> None:
@@ -452,5 +452,5 @@ async def test_fetch_fresh_identity_accepts_jwt_issued_after_password_change(adm
         try:
             identity = await fetch_fresh_identity(conn, "fresh-jwt@acme.com")
         finally:
-            middleware._request_token_issued_at.reset(iat_token)  # type: ignore[arg-type]
+            middleware._request_token_issued_at.reset(iat_token)
         assert identity.roles == ["admin"]
