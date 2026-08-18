@@ -10,7 +10,7 @@ from uuid import UUID
 import pytest
 from studio_app import jwt_auth
 from studio_app.middleware import _resolve_jwt_session
-from studio_app.settings import Settings
+from studio_app.settings import LlmProvider, Settings
 from studio_workbench.tenant_wall import ResolvedContext
 
 
@@ -32,6 +32,7 @@ def _settings() -> Settings:
         database_url="postgresql://unused/unused",
         database_url_admin="postgresql://unused/unused",
         jwt_secret="test-secret-middleware-at-least-32-bytes",
+        llm_provider=LlmProvider.GEMINI,
     )
 
 

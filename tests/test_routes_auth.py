@@ -22,7 +22,7 @@ from studio_app.authz import fetch_fresh_identity
 from studio_app.core._db import Pool, close_pools, get_pool
 from studio_app.jwt_auth import hash_password
 from studio_app.routes.auth import ChangePasswordRequest, LoginRequest, change_own_password, login
-from studio_app.settings import Settings
+from studio_app.settings import LlmProvider, Settings
 from studio_workbench.tenant_wall import ResolvedContext
 
 
@@ -76,6 +76,7 @@ def _settings() -> Settings:
         database_url="postgresql://unused/unused",
         database_url_admin="postgresql://unused/unused",
         jwt_secret="test-secret-routes-auth-at-least-32-bytes",
+        llm_provider=LlmProvider.GEMINI,
     )
 
 

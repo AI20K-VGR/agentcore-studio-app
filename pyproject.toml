@@ -30,6 +30,9 @@ obs = [
 gemini = [
     "google-genai",
 ]
+openai = [
+    "openai",
+]
 
 [build-system]
 requires = ["hatchling"]
