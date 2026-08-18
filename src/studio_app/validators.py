@@ -32,9 +32,7 @@ def reject_reserved_section_name(v: str) -> str:
     vào vocab role hợp lệ."""
     stripped = reject_blank(v)
     if stripped in RESERVED_ROLE_NAMES:
-        raise ValueError(
-            f"tên phòng ban không được trùng role hệ thống ({sorted(RESERVED_ROLE_NAMES)})"
-        )
+        raise ValueError(f"tên phòng ban không được trùng role hệ thống ({sorted(RESERVED_ROLE_NAMES)})")
     return stripped
 
 

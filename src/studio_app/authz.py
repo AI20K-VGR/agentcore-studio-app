@@ -84,9 +84,7 @@ async def fetch_fresh_identity(conn: AsyncConnection, email: str) -> FreshIdenti
     # ngay sau khi đổi) có thể có `iat` (đã cắt xuống giây) nhỏ hơn `password_changed_at` (còn
     # phần lẻ micro-giây) dù thực ra được ký SAU. Khoan dung 1 giây tránh false-positive khoá
     # nhầm chính phiên vừa đăng nhập lại, vẫn thừa đủ chặt để loại JWT thật sự cũ (phút/giờ trước).
-    if password_changed_at is not None and get_request_token_issued_at() < password_changed_at - timedelta(
-        seconds=1
-    ):
+    if password_changed_at is not None and get_request_token_issued_at() < password_changed_at - timedelta(seconds=1):
         raise HTTPException(
             status_code=401,
             detail="Mật khẩu đã đổi sau khi phiên này đăng nhập — đăng nhập lại.",
