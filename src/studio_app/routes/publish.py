@@ -7,10 +7,12 @@
 (CLI/`apps/studio`/fixture) là chỗ DUY NHẤT biết golden-30 nằm ở đâu" — nên hằng số đường dẫn
 NẰM Ở ĐÂY, đúng chỗ được chỉ định, không phải một vi phạm layering.
 
-**Sẽ LUÔN trả 409** cho tới khi AIE-2 xong `recipe_hash` producer (DEC-03): `compute_scorecard()`
-(evalhub) hiện không có tham số nào để set `recipe_hash`, luôn `None` — `publish()` fail-closed
-trên đúng field đó TRƯỚC CẢ khi đọc `gate.verdict`. Đây là hành vi ĐÚNG, không phải bug của route
-này — xem `docs/reports`/Kế hoạch 2 Phần 4 (rủi ro team-wide) để biết ai đang chặn việc này.
+**KHÔNG còn LUÔN trả 409** (sửa lại đợt review app#21 — trước bản vá này, `EvalHarness.run()` gọi
+ở `_evaluate()` bên dưới không truyền `recipe_hash=`, nên `compute_scorecard()` luôn nhận `None`
+và `publish()` fail-closed trên đúng field đó TRƯỚC CẢ khi đọc `gate.verdict`, bất kể agent tốt
+xấu ra sao). `studio_workbench.publish.recipe_hash()` (DEC-03, hoàn thiện tại đây) giờ tính hash
+thật trước khi gọi harness — 409 giờ chỉ còn xảy ra khi `gate.verdict == "FAIL"` thật, đúng nghĩa
+"recipe chưa đủ điều kiện xuất bản" mà status code đó mô tả.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ from studio_evalhub.harness import EvalHarness
 from studio_kb.doc_factory import TENANT_IDS
 from studio_kb.postgres import PgKbSearch
 from studio_workbench.builder import create_dynamic_recipe
-from studio_workbench.publish import publish
+from studio_workbench.publish import publish, recipe_hash
 from studio_workbench.tenant_wall import ResolvedContext
 from studio_workbench.validator import graph_lint
 
@@ -118,6 +120,12 @@ async def _evaluate(agent_id: str, body: RunRequest, session: ResolvedContext) -
             tenant_ids=tenant_ids,
             threshold_success=recipe.scorecard_threshold.success,
             threshold_citation_accuracy=recipe.scorecard_threshold.citation_accuracy,
+            # DEC-03 hoàn thiện tại `studio_workbench.publish.recipe_hash()` — đây là mắt xích
+            # DUY NHẤT còn thiếu của đường ống (evalhub đã mở `recipe_hash=` từ D20/`DEC-D20-02`,
+            # chỉ chưa có caller nào tính+truyền giá trị thật). Băm ĐÚNG `recipe` vừa graph_lint
+            # sạch ở trên — Scorecard trả về giờ chứng nhận đúng recipe SẼ publish, không phải một
+            # recipe khác được dựng lại sau đó.
+            recipe_hash=recipe_hash(recipe),
         )
     except ValueError as exc:
         # `load_golden_set` (evalhub) raise ValueError khi file không khớp `golden_set_ref` khai
@@ -150,10 +158,9 @@ async def evaluate_agent(agent_id: str, body: RunRequest) -> dict[str, object]:
 
 @router.post("/{agent_id}/publish")
 async def publish_agent(agent_id: str, body: RunRequest) -> dict[str, object]:
-    """Sẽ LUÔN trả 409 cho tới khi AIE-2 xong `recipe_hash` producer (DEC-03):
-    `compute_scorecard()` (evalhub) hiện không có tham số nào để set `recipe_hash`, luôn `None` —
-    `publish()` fail-closed trên đúng field đó TRƯỚC CẢ khi đọc `gate.verdict`. Đây là hành vi
-    ĐÚNG, không phải bug của route này — xem kit#127 (rủi ro team-wide) để biết ai đang chặn."""
+    """409 giờ chỉ còn nghĩa "recipe chưa qua được gate" (`gate.verdict == 'FAIL'`) — KHÔNG còn
+    LUÔN 409 như trước khi `recipe_hash` (DEC-03) có producer thật (xem docstring module + `_evaluate`
+    ở trên: `EvalHarness().run()` giờ được truyền `recipe_hash=recipe_hash(recipe)` thật)."""
     session = get_request_session()
 
     # Cùng gate role-gap đã đóng ở `routes/runs.py::create_run`.

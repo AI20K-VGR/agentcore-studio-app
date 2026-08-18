@@ -49,13 +49,13 @@ recipe để băm. Băm trên chuỗi byte nào (`by_alias`? `exclude_none`?) v�
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from uuid import UUID
 
-from studio_contracts import LLM, EmbeddingService, KbSearch, NodeType, Recipe, TraceWriter
+from studio_contracts import LLM, EmbeddingService, KbSearch, Recipe, TraceWriter
 from studio_engine import interpreter
 from studio_evalhub.agent_runner import AgentAnswer, CaseRun
 from studio_workbench import create_recipe_d4
+from studio_workbench.recipe_ops import with_query, without_query
 from studio_workbench.tenant_wall import resolve_session
 
 
@@ -66,53 +66,6 @@ def _llm_answer(final_state: dict[str, object]) -> dict[str, object]:
         if isinstance(output, dict) and "answer" in output:
             return output
     raise LookupError("EngineAgentRunner: final_state không có output node llm-step (thiếu 'answer')")
-
-
-_QUERY_KEY = "query"
-
-
-def _map_kb_params(recipe: Recipe, fn: Callable[[dict[str, object]], dict[str, object]]) -> Recipe:
-    """Áp `fn` lên `params` của node `kb-retrieve` **đầu tiên**, trả bản sao. Không có node đó ⇒ trả
-    nguyên trạng.
-
-    Chọn theo **loại** chứ không theo vị trí `nodes[0]`: DAG 6-node của AIE-1 (D20) không bảo đảm node
-    đầu là `kb-retrieve`, còn `create_recipe_d4` thì có — khoá theo loại đúng ở cả hai, khoá theo vị
-    trí chỉ đúng ở một.
-
-    Không raise khi vắng `kb-retrieve`: một DAG không truy xuất KB là hợp lệ (`end`-only,
-    `tool-call`-only). Ném lỗi ở đây sẽ biến một recipe hợp lệ thành lỗi của bộ chấm."""
-    for i, node in enumerate(recipe.dag.nodes):
-        if node.type is not NodeType.KB_RETRIEVE:
-            continue
-        patched = node.model_copy(update={"params": fn(dict(node.params))})
-        nodes = [*recipe.dag.nodes[:i], patched, *recipe.dag.nodes[i + 1 :]]
-        return recipe.model_copy(update={"dag": recipe.dag.model_copy(update={"nodes": nodes})})
-    return recipe
-
-
-def _without_query(recipe: Recipe) -> Recipe:
-    """Gỡ `query` khỏi recipe ⇒ **recipe gốc của run**, thứ `recipe_hash` băm.
-
-    Gỡ hẳn khoá chứ không đặt `""`: hai cái cho **hai chuỗi byte khác nhau** khi serialize, mà chuỗi
-    byte đó chính là đầu vào của hash. Đây là một trong năm trục canonical-form đang chờ SWE chốt
-    (`kit#127` 🅑) — chọn "vắng mặt" ở đây là chọn dạng **không mang dữ liệu đề bài**, nhất quán với
-    lý do tách `query` ra ngay từ đầu."""
-    return _map_kb_params(recipe, lambda params: {k: v for k, v in params.items() if k != _QUERY_KEY})
-
-
-def _with_query(recipe: Recipe, query: str) -> Recipe:
-    """Trả bản sao của `recipe` với `query` bơm vào node `kb-retrieve` **đầu tiên**.
-
-    Không sửa `recipe` gốc — `Recipe` là `frozen=True`, và cái gốc chính là thứ `recipe_hash` sẽ băm,
-    nên nó phải giữ nguyên qua cả 30 case. Một biến thể per-case là **dữ liệu chạy**, không phải một
-    recipe khác.
-
-    Chọn node `kb-retrieve` **đầu tiên** chứ không phải `nodes[0]`: DAG 6-node của AIE-1 (D20) không
-    bảo đảm node đầu là `kb-retrieve`, và `create_recipe_d4` thì có — khoá theo **loại** thì đúng ở cả
-    hai, khoá theo vị trí thì chỉ đúng ở một.
-
-    Không có node `kb-retrieve` nào ⇒ trả recipe **nguyên trạng** (xem `_map_kb_params`)."""
-    return _map_kb_params(recipe, lambda params: {**params, _QUERY_KEY: query})
 
 
 class EngineAgentRunner:
@@ -159,7 +112,7 @@ class EngineAgentRunner:
             return self._recipe
         scope = f"t/{','.join(section_roles)}" if section_roles else "t/"
         built = create_recipe_d4(agent_id=agent_id or self._agent_id, tenant_id=tenant_id, scope=scope)
-        return _without_query(built)
+        return without_query(built)
 
     async def run_case(
         self,
@@ -207,7 +160,7 @@ class EngineAgentRunner:
         `graph_lint(recipe)` ở `_evaluate` chạy TRƯỚC dòng đó — `tests/test_graph_lint_before_interpreter_run.py`
         đang allowlist hàm này theo tên; đọc lại docstring bài test đó trước khi đổi hợp đồng này."""
         base = self.certified_recipe(agent_id=agent_id, tenant_id=tenant_id, section_roles=section_roles)
-        recipe = _with_query(base, query)
+        recipe = with_query(base, query)
         session_context = resolve_session({"tenant_id": tenant_id, "user": "eval-harness", "roles": section_roles})
         result = await interpreter.run(
             recipe,

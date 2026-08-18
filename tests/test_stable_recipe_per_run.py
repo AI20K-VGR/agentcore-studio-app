@@ -51,6 +51,7 @@ from studio_app.providers.fakes import FakeEmbedding
 from studio_contracts import NodeType, Recipe, TraceEvent
 from studio_engine.interpreter import RunResult
 from studio_workbench import create_recipe_d4
+from studio_workbench.recipe_ops import without_query
 
 TENANT_ID = UUID("a0000000-0000-0000-0000-000000000001")
 OTHER_TENANT = UUID("b0000000-0000-0000-0000-000000000001")
@@ -140,7 +141,7 @@ async def test_query_duoc_bom_dung_vao_kb_retrieve(monkeypatch: pytest.MonkeyPat
     Đo trên recipe **interpreter thật sự nhận**, không trên recipe adapter định dựng — hai cái chỉ
     bằng nhau khi không ai `model_copy` ở giữa mà quên.
 
-    Vế thứ hai (`_without_query(nhận) == gốc`) là vế thật sự khoá: nó nói *"khác ĐÚNG một khoá"*, chứ
+    Vế thứ hai (`without_query(nhận) == gốc`) là vế thật sự khoá: nó nói *"khác ĐÚNG một khoá"*, chứ
     không chỉ *"có khoá query"*. Một cài đặt tiện tay đổi thêm `top_k` hay `tenant_id` vẫn xanh nếu
     chỉ assert vế đầu."""
     runner, stub = _patched(monkeypatch)
@@ -151,7 +152,7 @@ async def test_query_duoc_bom_dung_vao_kb_retrieve(monkeypatch: pytest.MonkeyPat
     assert _kb_params(nhan)["query"] == "câu hỏi A"
 
     goc = runner.certified_recipe(agent_id="a1", tenant_id=TENANT_ID, section_roles=["public"])
-    assert eval_adapter._without_query(nhan) == goc
+    assert without_query(nhan) == goc
 
 
 async def test_ba_muoi_case_chi_sinh_MOT_recipe_goc(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -180,7 +181,7 @@ async def test_ba_muoi_case_chi_sinh_MOT_recipe_goc(monkeypatch: pytest.MonkeyPa
     queries = {_kb_params(r)["query"] for r in stub.recipes}
     assert len(queries) == 30, f"30 case phải mang 30 query khác nhau, đo được {len(queries)} — tập đã bị làm phẳng"
 
-    goc_khac_nhau = {eval_adapter._without_query(r).model_dump_json() for r in stub.recipes}
+    goc_khac_nhau = {without_query(r).model_dump_json() for r in stub.recipes}
     assert len(goc_khac_nhau) == 1, f"gỡ query ra thì 30 biến thể phải trùng nhau, đo được {len(goc_khac_nhau)}"
 
 
