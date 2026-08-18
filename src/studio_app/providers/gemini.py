@@ -22,7 +22,7 @@ from __future__ import annotations
 class GeminiProvider:
     """`LLM` Protocol impl only — no `embed()` method exists on this class (F3)."""
 
-    def __init__(self, *, api_key: str, model: str = "gemini-2.0-flash") -> None:
+    def __init__(self, *, api_key: str, model: str = "gemini-2.5-flash") -> None:
         self._api_key = api_key
         self._model = model
 
