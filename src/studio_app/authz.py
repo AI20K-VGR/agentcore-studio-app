@@ -24,6 +24,7 @@ from fastapi import HTTPException
 from psycopg import AsyncConnection
 
 from studio_app.middleware import get_request_token_issued_at
+from studio_app.validators import RESERVED_ROLE_NAMES
 
 FreshRoles = NewType("FreshRoles", list[str])
 """Type riêng cho "roles vừa tra từ `core.users` trong request này" — KHÁC `list[str]` thường (vd
@@ -47,12 +48,21 @@ class FreshIdentity:
 
 
 async def fetch_fresh_identity(conn: AsyncConnection, email: str) -> FreshIdentity:
-    """`SELECT id, roles, tenant_id, password_changed_at FROM core.users WHERE email = %s` —
-    round-trip DUY NHẤT dùng chung cho mọi route cần roles/tenant tươi thay vì tin JWT.
+    """`SELECT id, roles, tenant_id, password_changed_at, is_active FROM core.users WHERE email =
+    %s` — round-trip DUY NHẤT dùng chung cho mọi route cần roles/tenant tươi thay vì tin JWT.
 
     Raise `HTTPException(403)` nếu JWT hợp lệ (chữ ký đúng, chưa hết hạn) nhưng KHÔNG còn dòng nào
     trong `core.users` khớp email đó — phòng thủ theo chiều sâu cho ca tài khoản bị offboard (xoá
     khỏi `core.users`) nhưng JWT cũ (tới 480 phút) vẫn còn hạn dùng (review `app#17`, Chặn 1).
+
+    Raise `HTTPException(403)` nếu `is_active = false` (review `app#21`, phát hiện SAU khi vá
+    `password_changed_at` bên dưới — cùng lớp lỗ "JWT cũ sống sót" nhưng ở trục khác). Trước bản vá
+    này, `deactivate_user` (`routes/admin.py`) tự khai "vô hiệu hoá tài khoản" nhưng chỉ chặn được
+    ĐĂNG NHẬP MỚI (`routes/auth.py::login` kiểm `is_active` — dòng DUY NHẤT trong repo làm việc đó
+    trước bản vá) — JWT CŨ của 1 admin vừa bị vô hiệu hoá vẫn gọi lọt MỌI route qua
+    `fetch_fresh_identity` (admin/sections/agents/runs/publish) tới khi JWT tự hết hạn
+    (`jwt_expire_minutes`, mặc định 480 phút), kể cả tự tạo/xoá user khác hay publish agent mới.
+    Route `PATCH /api/auth/password` có cùng lỗ hở riêng, vá tại `change_own_password`.
 
     Raise `HTTPException(401)` nếu JWT ký TRƯỚC lần đổi mật khẩu gần nhất (`core.users.
     password_changed_at`) — đổi mật khẩu là cách người dùng tự xử lý phiên bị đánh cắp, JWT ký từ
@@ -69,7 +79,7 @@ async def fetch_fresh_identity(conn: AsyncConnection, email: str) -> FreshIdenti
     cầu, cùng dạng nợ kỹ thuật đã ghi nhận công khai ở `routes/admin.py` (comment trên
     `fetch_fresh_identity` ở `create_user`) cho khoảng-hở tenant_context tương tự."""
     cur = await conn.execute(
-        "SELECT id, roles, tenant_id, password_changed_at FROM core.users WHERE email = %s",
+        "SELECT id, roles, tenant_id, password_changed_at, is_active FROM core.users WHERE email = %s",
         (email,),
     )
     row = await cur.fetchone()
@@ -78,7 +88,12 @@ async def fetch_fresh_identity(conn: AsyncConnection, email: str) -> FreshIdenti
             status_code=403,
             detail="Tài khoản gọi API không tồn tại trong core.users.",
         )
-    user_id, roles_raw, tenant_id, password_changed_at = row
+    user_id, roles_raw, tenant_id, password_changed_at, is_active = row
+    if not is_active:
+        raise HTTPException(
+            status_code=403,
+            detail="Tài khoản đã bị vô hiệu hoá.",
+        )
     # `- 1s`: `iat` là unix timestamp NGUYÊN GIÂY (JWT chuẩn), `password_changed_at` là
     # `TIMESTAMPTZ` micro-giây từ `now()` — 1 JWT ký CÙNG giây với lần đổi mật khẩu (login lại
     # ngay sau khi đổi) có thể có `iat` (đã cắt xuống giây) nhỏ hơn `password_changed_at` (còn
@@ -90,6 +105,23 @@ async def fetch_fresh_identity(conn: AsyncConnection, email: str) -> FreshIdenti
             detail="Mật khẩu đã đổi sau khi phiên này đăng nhập — đăng nhập lại.",
         )
     return FreshIdentity(id=user_id, tenant_id=tenant_id, roles=FreshRoles(list(roles_raw)))
+
+
+async def fetch_tenant_section_names(conn: AsyncConnection, tenant_id: object) -> set[str]:
+    """`SELECT name FROM core.sections WHERE tenant_id = %s`, trừ sẵn `RESERVED_ROLE_NAMES`
+    (review `app#21`, tầng 2 lặp lại — phát hiện SAU khi vá `create_user`/`update_user_roles`
+    trong `routes/admin.py`): `routes/auth.py::login` (mở rộng role admin lúc phát JWT) và
+    `routes/chat.py::chat` (validate `as_roles`) đều tự đọc `core.sections` RỒI DÙNG THẲNG, không
+    qua tầng trừ nào — 1 dòng `core.sections` tên `"superadmin"` còn sót từ TRƯỚC layer-1
+    (`validators.reject_reserved_section_name`) sẽ: (a) lọt vào JWT `roles` của MỌI company-admin
+    tenant đó lúc login (UI web định tuyến tầng theo `session.roles`, JWT — admin đó bị đưa nhầm
+    vào Superadmin Console, mọi lời gọi rồi 403 vì backend vẫn tra roles TƯƠI), và (b) lọt vào
+    `as_roles` hợp lệ ở `chat.py`, đi thẳng vào `session_context.roles` — đầu vào của hàng rào nội
+    dung KB ở `interpreter.run()`. Gom về đây 1 hàm DUY NHẤT để call site MỚI không lặp lại đúng
+    lỗ này lần thứ 3 — không dùng cho `routes/admin.py::create_user`/`update_user_roles` (2 chỗ đó
+    còn hợp thêm `{"admin"}` vào vocab, khác hình dạng, giữ nguyên logic riêng của chúng)."""
+    cur = await conn.execute("SELECT name FROM core.sections WHERE tenant_id = %s", (str(tenant_id),))
+    return {row[0] for row in await cur.fetchall()} - RESERVED_ROLE_NAMES
 
 
 def require_superadmin(roles: FreshRoles) -> None:
