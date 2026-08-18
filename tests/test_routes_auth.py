@@ -19,8 +19,9 @@ from starlette.requests import Request
 from studio_app import jwt_auth, middleware, rate_limit
 from studio_app.core._db import Pool, close_pools, get_pool
 from studio_app.jwt_auth import hash_password
-from studio_app.routes.auth import LoginRequest, login
+from studio_app.routes.auth import ChangePasswordRequest, LoginRequest, change_own_password, login
 from studio_app.settings import Settings
+from studio_workbench.tenant_wall import ResolvedContext
 
 
 def _fake_request(client_host: str = "test-client") -> Request:
@@ -194,3 +195,171 @@ async def test_login_regression_verify_password_always_called_even_for_unknown_e
 
     assert exc_info.value.status_code == 401
     assert call_count == 1, "verify_password() phải được gọi ĐÚNG 1 lần kể cả khi email không tồn tại"
+
+
+async def test_login_expands_admin_roles_to_all_tenant_sections(
+    admin_pool: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Quyết định qua AskUserQuestion: admin công ty mặc định thấy MỌI nội dung, không phải tự
+    tick từng phòng ban. `core.users.roles` trong DB vẫn CHỈ lưu `["admin"]` — JWT phát ra mới là
+    nơi mở rộng, đúng phạm vi `apps/studio` (filter nội dung nằm ở `packages/engine`, ngoài phạm
+    vi sửa ở đây)."""
+    monkeypatch.setattr(jwt_auth, "get_settings", _settings)
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("INSERT INTO core.tenants (name) VALUES (%s) RETURNING id", ("acme-admin-expand",))
+        row = await cur.fetchone()
+        assert row is not None
+        tenant_id = row[0]
+        await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            (tenant_id, "admin-expand@acme.com", hash_password("password-123"), ["admin"]),
+        )
+        admin_row = await conn.execute("SELECT id FROM core.users WHERE email = %s", ("admin-expand@acme.com",))
+        admin_id_row = await admin_row.fetchone()
+        assert admin_id_row is not None
+        await conn.execute(
+            "INSERT INTO core.sections (tenant_id, name, created_by) VALUES (%s, %s, %s), (%s, %s, %s)",
+            (tenant_id, "hr", admin_id_row[0], tenant_id, "finance", admin_id_row[0]),
+        )
+
+    async with _simulate_request_connection():
+        response = await login(LoginRequest(email="admin-expand@acme.com", password="password-123"), _fake_request())
+
+    assert set(response.roles) == {"admin", "hr", "finance"}
+
+    # `core.users.roles` trong DB KHÔNG bị ghi đè — chỉ JWT phát ra mới mở rộng.
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("SELECT roles FROM core.users WHERE email = %s", ("admin-expand@acme.com",))
+        row = await cur.fetchone()
+    assert row is not None
+    assert list(row[0]) == ["admin"]
+
+
+async def test_login_does_not_expand_employee_roles(admin_pool: Pool, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Đối chứng: nhân viên KHÔNG có `"admin"` thì roles JWT giữ nguyên đúng như DB — mở rộng chỉ
+    áp dụng cho admin, không phải mọi tài khoản."""
+    monkeypatch.setattr(jwt_auth, "get_settings", _settings)
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute(
+            "INSERT INTO core.tenants (name) VALUES (%s) RETURNING id", ("acme-employee-no-expand",)
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        tenant_id = row[0]
+        await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            (tenant_id, "employee-no-expand@acme.com", hash_password("password-123"), ["hr"]),
+        )
+        employee_row = await conn.execute(
+            "SELECT id FROM core.users WHERE email = %s", ("employee-no-expand@acme.com",)
+        )
+        employee_id_row = await employee_row.fetchone()
+        assert employee_id_row is not None
+        await conn.execute(
+            "INSERT INTO core.sections (tenant_id, name, created_by) VALUES (%s, %s, %s)",
+            (tenant_id, "finance", employee_id_row[0]),
+        )
+
+    async with _simulate_request_connection():
+        response = await login(
+            LoginRequest(email="employee-no-expand@acme.com", password="password-123"), _fake_request()
+        )
+
+    assert response.roles == ["hr"]
+
+
+async def test_login_rejects_deactivated_user(admin_pool: Pool, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`is_active=false` (vô hiệu hoá qua `DELETE /api/admin/users/{id}`) phải chặn login CÙNG
+    401 với sai mật khẩu — không lộ oracle "tài khoản này bị khoá" qua status code riêng."""
+    monkeypatch.setattr(jwt_auth, "get_settings", _settings)
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("INSERT INTO core.tenants (name) VALUES (%s) RETURNING id", ("acme-deactivated",))
+        row = await cur.fetchone()
+        assert row is not None
+        tenant_id = row[0]
+        await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles, is_active) VALUES (%s, %s, %s, %s, false)",
+            (tenant_id, "deactivated@acme.com", hash_password("correct-horse-battery-staple"), ["public"]),
+        )
+
+    with pytest.raises(HTTPException) as exc_info:
+        async with _simulate_request_connection():
+            await login(
+                LoginRequest(email="deactivated@acme.com", password="correct-horse-battery-staple"), _fake_request()
+            )
+    assert exc_info.value.status_code == 401
+
+
+def _set_session(*, tenant_id: object, user: str, roles: list[str]) -> object:
+    session = ResolvedContext(tenant_id=tenant_id, user=user, roles=roles)  # type: ignore[arg-type]
+    return middleware._request_session.set(session)
+
+
+async def test_change_own_password_succeeds_and_new_password_logs_in(
+    admin_pool: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(jwt_auth, "get_settings", _settings)
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("INSERT INTO core.tenants (name) VALUES (%s) RETURNING id", ("acme-changepw",))
+        row = await cur.fetchone()
+        assert row is not None
+        tenant_id = row[0]
+        await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            (tenant_id, "changepw@acme.com", hash_password("old-password-123"), ["admin"]),
+        )
+
+    token = _set_session(tenant_id=tenant_id, user="changepw@acme.com", roles=["admin"])
+    try:
+        async with _simulate_request_connection():
+            result = await change_own_password(
+                ChangePasswordRequest(old_password="old-password-123", new_password="new-password-456")
+            )
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+    assert result == {"detail": "Đã đổi mật khẩu."}
+
+    # Mật khẩu MỚI phải đăng nhập được, mật khẩu CŨ không còn dùng được nữa.
+    async with _simulate_request_connection():
+        login_result = await login(
+            LoginRequest(email="changepw@acme.com", password="new-password-456"), _fake_request()
+        )
+    assert login_result.tenant_id == str(tenant_id)
+
+    with pytest.raises(HTTPException) as exc_info:
+        async with _simulate_request_connection():
+            await login(LoginRequest(email="changepw@acme.com", password="old-password-123"), _fake_request())
+    assert exc_info.value.status_code == 401
+
+
+async def test_change_own_password_rejects_wrong_old_password(
+    admin_pool: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(jwt_auth, "get_settings", _settings)
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("INSERT INTO core.tenants (name) VALUES (%s) RETURNING id", ("acme-changepw-wrong",))
+        row = await cur.fetchone()
+        assert row is not None
+        tenant_id = row[0]
+        await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            (tenant_id, "changepw-wrong@acme.com", hash_password("old-password-123"), ["admin"]),
+        )
+
+    token = _set_session(tenant_id=tenant_id, user="changepw-wrong@acme.com", roles=["admin"])
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            async with _simulate_request_connection():
+                await change_own_password(
+                    ChangePasswordRequest(old_password="totally-wrong-password", new_password="new-password-456")
+                )
+        assert exc_info.value.status_code == 401
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    # Mật khẩu CŨ vẫn phải còn dùng được — request bị từ chối không được ghi gì cả.
+    async with _simulate_request_connection():
+        login_result = await login(
+            LoginRequest(email="changepw-wrong@acme.com", password="old-password-123"), _fake_request()
+        )
+    assert login_result.tenant_id == str(tenant_id)

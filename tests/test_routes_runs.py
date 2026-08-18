@@ -10,13 +10,14 @@ tay, đúng khuôn `test_middleware_jwt.py` đã dùng cho session, cộng `admi
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from contextvars import Token
 from uuid import UUID
 
 import pytest
 import pytest_asyncio
 from studio_app import middleware
-from studio_app.core._db import Pool, close_pools
+from studio_app.core._db import Pool, close_pools, get_pool
 from studio_app.routes.runs import RunRequest, create_run
 from studio_workbench.tenant_wall import ResolvedContext
 
@@ -53,6 +54,30 @@ async def _seed_tenant(admin_pool: Pool, name: str) -> UUID:
     return UUID(str(row[0]))
 
 
+async def _seed_admin_user(admin_pool: Pool, tenant_id: UUID, email: str) -> None:
+    """`create_run` từ bản vá gate role-gap (`authz.fetch_fresh_identity` + `require_admin`) giờ
+    đòi `session.user` có dòng thật trong `core.users` với role `"admin"` — cùng lý do/convention
+    `test_admin_routes.py::_seed_admin_user`."""
+    async with admin_pool.connection() as conn:
+        await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            (str(tenant_id), email, "not-a-real-hash", ["admin"]),
+        )
+
+
+@asynccontextmanager
+async def _simulate_request_connection() -> AsyncIterator[None]:
+    """`create_run` giờ chạm `get_request_connection()` (qua `fetch_fresh_identity`) — cùng
+    convention `test_admin_routes.py::_simulate_request_connection`, xem docstring ở đó."""
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        token = middleware._request_conn.set(conn)
+        try:
+            yield
+        finally:
+            middleware._request_conn.reset(token)
+
+
 def _set_session(tenant_id: UUID) -> Token[ResolvedContext | None]:
     """Set `_request_session` contextvar bằng tay — mô phỏng đúng việc `tenant_context_middleware`
     làm sau khi verify JWT thật, không cần dựng JWT vì đây không phải test của tầng chữ ký
@@ -73,6 +98,7 @@ async def test_create_run_ignores_client_declared_tenant_in_body(admin_pool: Poo
     tenant của SESSION, không phải bất kỳ giá trị nào trong body."""
     tenant_a = await _seed_tenant(admin_pool, "ankor-t1-victim")
     tenant_b_attacker_claims = await _seed_tenant(admin_pool, "borea-t1-attacker-target")
+    await _seed_admin_user(admin_pool, tenant_a, "victim@ankor.vn")
 
     raw_body: dict[str, object] = {
         "agent_id": "agent-t1-idor-probe",
@@ -95,7 +121,8 @@ async def test_create_run_ignores_client_declared_tenant_in_body(admin_pool: Poo
 
     token = _set_session(tenant_a)
     try:
-        response = await create_run(body)
+        async with _simulate_request_connection():
+            response = await create_run(body)
     finally:
         middleware._request_session.reset(token)
 

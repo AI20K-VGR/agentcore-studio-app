@@ -17,7 +17,16 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 from studio_app import middleware
 from studio_app.core._db import Pool, close_pools, get_pool
-from studio_app.routes.admin import CreateCompanyRequest, CreateUserRequest, create_company, create_user
+from studio_app.routes.admin import (
+    CreateCompanyRequest,
+    CreateUserRequest,
+    UpdateUserRolesRequest,
+    create_company,
+    create_user,
+    deactivate_user,
+    reactivate_user,
+    update_user_roles,
+)
 from studio_workbench.tenant_wall import ResolvedContext
 
 
@@ -73,25 +82,41 @@ async def _seed_superadmin_user(admin_pool: Pool, tenant_id: UUID, email: str) -
         )
 
 
-async def _seed_admin_user(admin_pool: Pool, tenant_id: UUID, email: str) -> None:
+async def _seed_admin_user(admin_pool: Pool, tenant_id: UUID, email: str) -> UUID:
     """Chèn 1 dòng `core.users` thật cho người gọi — bắt buộc từ khi vá Chặn 1 (review `app#17`):
     `create_user` giờ đòi `session.user` phải có dòng trong `core.users`, không còn chấp nhận
     `created_by = None` ngầm định như trước (đúng cửa mà JWT từ demo-login trước đây lách qua
     được). Nội dung `password_hash` không quan trọng ở đây — `create_user` không verify lại nó,
-    chỉ cần dòng TỒN TẠI."""
-    await _seed_user_with_roles(admin_pool, tenant_id, email, ["admin"])
+    chỉ cần dòng TỒN TẠI. Trả `id` — caller cũ không đọc giá trị trả về vẫn chạy đúng."""
+    return await _seed_user_with_roles(admin_pool, tenant_id, email, ["admin"])
 
 
-async def _seed_user_with_roles(admin_pool: Pool, tenant_id: UUID, email: str, roles: list[str]) -> None:
+async def _seed_section(admin_pool: Pool, tenant_id: UUID, name: str) -> None:
+    """Từ khi `create_user` tra vocab roles hợp lệ ĐỘNG theo `core.sections` (thay `SECTION_VOCAB`
+    tĩnh cũ), mọi bài test gán role nội dung (vd `"public"`) cho user MỚI phải tự seed section đó
+    trước — role không nằm trong `core.sections` của đúng tenant sẽ bị 400 ngay ở bước validate."""
+    async with admin_pool.connection() as conn:
+        await conn.execute(
+            "INSERT INTO core.sections (tenant_id, name, created_by) "
+            "VALUES (%s, %s, (SELECT id FROM core.users WHERE tenant_id = %s LIMIT 1))",
+            (str(tenant_id), name, str(tenant_id)),
+        )
+
+
+async def _seed_user_with_roles(admin_pool: Pool, tenant_id: UUID, email: str, roles: list[str]) -> UUID:
     """Cùng lý do `_seed_admin_user` ở trên nhưng cho roles TUỲ Ý — từ đợt 8, `create_company`/
     `create_user` tra roles TƯƠI từ `core.users` (review `app#17`, Important #1) thay vì tin
     `session.roles`, nên MỌI bài test gọi 2 hàm này (kể cả bài kỳ vọng bị chặn quyền) đều cần
-    người gọi có dòng thật trong DB — không còn suy ra thẳng từ `session.roles`."""
+    người gọi có dòng thật trong DB — không còn suy ra thẳng từ `session.roles`. Trả `id` (đợt
+    PATCH/DELETE `/api/admin/users/{id}`) — caller cũ không đọc giá trị trả về vẫn chạy đúng."""
     async with admin_pool.connection() as conn:
-        await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+        cur = await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s) RETURNING id",
             (str(tenant_id), email, "not-a-real-hash", roles),
         )
+        row = await cur.fetchone()
+    assert row is not None
+    return UUID(str(row[0]))
 
 
 async def test_non_superadmin_cannot_create_company(admin_pool: Pool) -> None:
@@ -120,6 +145,7 @@ async def test_company_admin_cannot_create_user_in_other_tenant(admin_pool: Pool
     tenant_a = await _seed_tenant(admin_pool, "probe-tenant-a")
     tenant_b = await _seed_tenant(admin_pool, "probe-tenant-b")
     await _seed_admin_user(admin_pool, tenant_a, "admin@acme.com")
+    await _seed_section(admin_pool, tenant_a, "public")
 
     body = CreateUserRequest(email="new-hire@acme.com", password="password123", roles=["public"])
     assert not hasattr(body, "tenant_id")  # không có đường nào để khai — đúng như RunRequest
@@ -154,7 +180,9 @@ async def test_company_admin_cannot_grant_superadmin_role(admin_pool: Pool) -> N
 
 async def test_create_user_rejects_role_outside_vocab(admin_pool: Pool) -> None:
     """Đối chứng với bài trên: không chỉ chặn riêng "superadmin", mà chặn MỌI chuỗi ngoài
-    SECTION_VOCAB ∪ {"admin"} — vd lỗi gõ hoặc role tự chế không tồn tại."""
+    (core.sections của tenant) ∪ {"admin"} — vd lỗi gõ hoặc role tự chế không tồn tại. Tenant này
+    CỐ Ý không seed section nào — "hrr" phải bị chặn dù có seed section thật hay không, vì bản
+    thân "hrr" (lỗi gõ của "hr") không khớp bất kỳ tên section nào."""
     tenant_id = await _seed_tenant(admin_pool, "probe-bad-role-string")
     await _seed_admin_user(admin_pool, tenant_id, "admin@acme.com")
     token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
@@ -438,6 +466,96 @@ def test_create_company_admin_email_normalized() -> None:
         company_name="normalize-co", admin_email="  Admin@ACME.example  ", admin_password="password123"
     )
     assert body.admin_email == "admin@acme.example"
+
+
+async def test_admin_updates_employee_roles(admin_pool: Pool) -> None:
+    tenant_id = await _seed_tenant(admin_pool, "probe-update-roles")
+    await _seed_admin_user(admin_pool, tenant_id, "admin@acme.com")
+    await _seed_section(admin_pool, tenant_id, "finance")
+    employee_id = await _seed_user_with_roles(admin_pool, tenant_id, "employee@acme.com", ["public"])
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        async with _simulate_request_connection():
+            result = await update_user_roles(str(employee_id), UpdateUserRolesRequest(roles=["finance"]))
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert result.roles == ["finance"]
+
+
+async def test_admin_cannot_update_own_roles(admin_pool: Pool) -> None:
+    """Cùng lý do `test_admin_cannot_deactivate_own_account` — lỡ bỏ `"admin"` khỏi chính roles
+    của mình sẽ tự khoá quyền quản trị công ty vĩnh viễn, không route nào sửa lại được."""
+    tenant_id = await _seed_tenant(admin_pool, "probe-self-update-roles")
+    admin_id = await _seed_admin_user(admin_pool, tenant_id, "admin@acme.com")
+    await _seed_section(admin_pool, tenant_id, "finance")
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            async with _simulate_request_connection():
+                await update_user_roles(str(admin_id), UpdateUserRolesRequest(roles=["finance"]))
+        assert exc_info.value.status_code == 400
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+
+async def test_admin_cannot_update_roles_of_user_in_other_tenant(admin_pool: Pool) -> None:
+    tenant_a = await _seed_tenant(admin_pool, "probe-update-roles-a")
+    tenant_b = await _seed_tenant(admin_pool, "probe-update-roles-b")
+    await _seed_admin_user(admin_pool, tenant_a, "admin-a@acme.com")
+    victim_id = await _seed_user_with_roles(admin_pool, tenant_b, "victim@acme.com", ["public"])
+
+    token = _set_session(tenant_id=tenant_a, user="admin-a@acme.com", roles=["admin"])
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            async with _simulate_request_connection():
+                await update_user_roles(str(victim_id), UpdateUserRolesRequest(roles=["public"]))
+        assert exc_info.value.status_code == 404
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+
+async def test_admin_deactivates_and_reactivates_employee(admin_pool: Pool) -> None:
+    tenant_id = await _seed_tenant(admin_pool, "probe-deactivate")
+    await _seed_admin_user(admin_pool, tenant_id, "admin@acme.com")
+    employee_id = await _seed_user_with_roles(admin_pool, tenant_id, "employee@acme.com", ["public"])
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        async with _simulate_request_connection():
+            await deactivate_user(str(employee_id))
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("SELECT is_active FROM core.users WHERE id = %s", (str(employee_id),))
+        row = await cur.fetchone()
+    assert row is not None
+    assert row[0] is False
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        async with _simulate_request_connection():
+            result = await reactivate_user(str(employee_id))
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+    assert result.is_active is True
+
+
+async def test_admin_cannot_deactivate_own_account(admin_pool: Pool) -> None:
+    tenant_id = await _seed_tenant(admin_pool, "probe-self-deactivate")
+    admin_id = await _seed_user_with_roles(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            async with _simulate_request_connection():
+                await deactivate_user(str(admin_id))
+        assert exc_info.value.status_code == 400
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
 
 
 def test_create_user_rejects_blank_email() -> None:

@@ -21,14 +21,15 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from loguru import logger
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 from studio_workbench.tenant_wall import resolve_session
 
 from studio_app import rate_limit
-from studio_app.jwt_auth import DUMMY_PASSWORD_HASH, issue_token, normalize_email, verify_password
-from studio_app.middleware import get_request_connection
+from studio_app.jwt_auth import DUMMY_PASSWORD_HASH, hash_password, issue_token, normalize_email, verify_password
+from studio_app.middleware import get_request_connection, get_request_session
 from studio_app.settings import get_settings
+from studio_app.validators import reject_oversized_password
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -82,6 +83,11 @@ class LoginResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     tenant_id: str
+    tenant_name: str
+    """Tên công ty thật (`core.tenants.name`) — thêm để UI hiện tên công ty thay vì UUID
+    `tenant_id` (redesign UI: `tenant_id` không có ý nghĩa gì với người dùng thật). Với superadmin
+    đây là `"__system__"` — UI tầng superadmin không hiện field này ở đâu cả nên không thành vấn
+    đề."""
     user: str
     roles: list[str]
     """CỐ Ý không có `password`/`password_hash` ở bất kỳ đâu trong response — xem
@@ -139,18 +145,38 @@ async def login(body: LoginRequest, request: Request) -> LoginResponse:
 
     conn = get_request_connection()
     cur = await conn.execute(
-        "SELECT tenant_id, password_hash, roles FROM core.users WHERE email = %s",
+        "SELECT u.tenant_id, u.password_hash, u.roles, u.is_active, t.name "
+        "FROM core.users u JOIN core.tenants t ON t.id = u.tenant_id WHERE u.email = %s",
         (body.email,),
     )
     row = await cur.fetchone()
 
     password_hash = row[1] if row is not None else DUMMY_PASSWORD_HASH
     password_ok = await run_in_threadpool(verify_password, body.password, password_hash)
-    if row is None or not password_ok:
+    # `is_active` kiểm SAU verify_password, không trước — cả 2 nhánh (active/inactive) đã tốn đúng
+    # 1 lần bcrypt như nhau, không mở oracle mới (thời gian/status code) phân biệt "tài khoản bị vô
+    # hiệu hoá" với "sai mật khẩu"; cả 3 lý do thất bại (không tồn tại/sai mật khẩu/bị vô hiệu hoá)
+    # trả CÙNG 401, cùng thông điệp — đúng nguyên tắc chống oracle đã áp cho email/mật khẩu.
+    if row is None or not password_ok or not row[3]:
         raise HTTPException(status_code=401, detail="Email hoặc mật khẩu không đúng.")
 
-    tenant_id, _password_hash, roles = row
-    session: dict[str, Any] = {"tenant_id": str(tenant_id), "user": body.email, "roles": list(roles)}
+    tenant_id, _password_hash, roles, _is_active, tenant_name = row
+    effective_roles = list(roles)
+    if "admin" in effective_roles:
+        # Admin công ty = quyền cao nhất TRONG tenant đó — mặc định thấy MỌI nội dung KB, không
+        # phải tự tick từng phòng ban như nhân viên (quyết định qua AskUserQuestion). Filter nội
+        # dung lúc chat nằm ở `packages/engine::interpreter.run()` (ngoài `apps/studio`, team
+        # khác sở hữu), đọc thẳng `session.roles` của JWT đã verify — nên mở rộng NGAY TẠI ĐÂY,
+        # lúc phát JWT, là chỗ đúng phạm vi apps/studio, không cần sửa package khác. `core.users.
+        # roles` trong DB VẪN chỉ lưu đúng `["admin"]` (không ghi đè) — đây chỉ là ảnh chụp trong
+        # JWT của phiên đăng nhập này, tự làm mới ở lần đăng nhập kế tiếp nếu công ty có thêm
+        # section mới (cùng bản chất "role là ảnh chụp lúc login" đã áp dụng xuyên suốt).
+        cur = await conn.execute("SELECT name FROM core.sections WHERE tenant_id = %s", (str(tenant_id),))
+        section_names = [row[0] for row in await cur.fetchall()]
+        # `dict.fromkeys` giữ ĐÚNG thứ tự chèn (khác `set`, thứ tự không xác định) — roles gốc từ
+        # DB đứng trước, section mới bổ sung nối sau, không xáo trộn thứ tự đã seed/lưu.
+        effective_roles = list(dict.fromkeys([*effective_roles, *section_names]))
+    session: dict[str, Any] = {"tenant_id": str(tenant_id), "user": body.email, "roles": effective_roles}
     try:
         resolved = resolve_session(session)
     except PermissionError as exc:
@@ -160,6 +186,51 @@ async def login(body: LoginRequest, request: Request) -> LoginResponse:
     return LoginResponse(
         access_token=token,
         tenant_id=str(resolved.tenant_id),
+        tenant_name=tenant_name,
         user=resolved.user,
         roles=resolved.roles,
     )
+
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str
+    new_password: str = Field(min_length=8)
+
+    _validate_new_password = field_validator("new_password")(reject_oversized_password)
+
+
+@router.patch("/password")
+async def change_own_password(body: ChangePasswordRequest) -> dict[str, str]:
+    """Đổi mật khẩu CỦA CHÍNH MÌNH — dùng chung cho CẢ 3 tầng (superadmin/admin/employee), không
+    đặc cách/ngoại lệ cho ai. Khác hẳn "tự tạo/tự phong superadmin" (vẫn cấm tuyệt đối, chỉ qua
+    `scripts/seed_superadmin.py`) — đổi mật khẩu KHÔNG cấp thêm quyền nào, chỉ xoay credential của
+    1 tài khoản ĐÃ xác thực (JWT hợp lệ) qua session hiện tại.
+
+    Bắt buộc đúng `old_password` trước khi ghi — không chỉ tin JWT còn hạn. JWT chứng minh "đã từng
+    đăng nhập", không chứng minh "vẫn đang cầm điện thoại/máy này" (phiên có thể bị đánh cắp/để mở
+    quên) — bắt gõ lại mật khẩu cũ là bước xác thực-lại (step-up), không phải kiểm tra thừa. Không
+    mở thêm bề mặt tấn công nào: kẻ tấn công có cả JWT LẪN mật khẩu cũ đã đủ sức tự đăng nhập lại,
+    không cần qua route này."""
+    session = get_request_session()
+    conn = get_request_connection()
+
+    cur = await conn.execute(
+        "SELECT password_hash FROM core.users WHERE email = %s",
+        (session.user,),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        # JWT hợp lệ nhưng không còn dòng trong core.users (tài khoản bị offboard giữa chừng) —
+        # cùng lưới an toàn `authz.fetch_fresh_identity` đã dùng ở các route khác.
+        raise HTTPException(status_code=403, detail="Tài khoản gọi API không tồn tại trong core.users.")
+
+    old_ok = await run_in_threadpool(verify_password, body.old_password, row[0])
+    if not old_ok:
+        raise HTTPException(status_code=401, detail="Mật khẩu hiện tại không đúng.")
+
+    new_hash = await run_in_threadpool(hash_password, body.new_password)
+    await conn.execute(
+        "UPDATE core.users SET password_hash = %s WHERE email = %s",
+        (new_hash, session.user),
+    )
+    return {"detail": "Đã đổi mật khẩu."}

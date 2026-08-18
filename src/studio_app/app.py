@@ -30,10 +30,12 @@ from studio_app.core._db import close_pools, get_admin_pool
 from studio_app.core.schema import ensure_all_schemas, grant_app_privileges
 from studio_app.middleware import tenant_context_middleware
 from studio_app.routes import admin as admin_routes
+from studio_app.routes import agents as agents_routes
 from studio_app.routes import auth as auth_routes
 from studio_app.routes import chat as chat_routes
 from studio_app.routes import publish as publish_routes
 from studio_app.routes import runs as runs_routes
+from studio_app.routes import sections as sections_routes
 
 # `CreateUserRequest.password`/`CreateCompanyRequest.admin_password` — tên field CÓ mật khẩu, ở
 # BẤT KỲ route nào tương lai thêm field mật khẩu mới cũng nên đặt tên khớp 1 trong 2 chuỗi này
@@ -190,6 +192,8 @@ def create_app() -> FastAPI:
     # logic" đã ghi ở docstring module này).
     app.include_router(auth_routes.router)
     app.include_router(admin_routes.router)
+    app.include_router(sections_routes.router)
+    app.include_router(agents_routes.router)
     app.include_router(runs_routes.router)
     app.include_router(publish_routes.router)
     app.include_router(chat_routes.router)
