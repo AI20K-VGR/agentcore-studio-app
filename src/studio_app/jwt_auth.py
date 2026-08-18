@@ -14,6 +14,7 @@ khẩu thật, không còn là identity provider để trống như giai đoạn
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID
 
 import bcrypt
@@ -111,16 +112,23 @@ def issue_token(session: ResolvedContext) -> str:
     return jwt.encode(claims, settings.jwt_secret, algorithm=_ALGORITHM)
 
 
+def _decode_claims(token: str) -> dict[str, Any]:
+    """Verify chữ ký + hạn dùng, trả claims thô — dùng chung cho `verify_token()` (public, trả
+    `ResolvedContext`) và `issued_at()` (lấy riêng `iat`) để không decode 2 lần với 2 cách chặn lỗi
+    lệch nhau."""
+    settings = get_settings()
+    try:
+        return jwt.decode(token, settings.jwt_secret, algorithms=[_ALGORITHM])
+    except jwt.PyJWTError as exc:
+        raise InvalidTokenError(f"JWT không hợp lệ: {exc}") from exc
+
+
 def verify_token(token: str) -> ResolvedContext:
     """Verify chữ ký + hạn dùng, decode ra `ResolvedContext`. Raise `InvalidTokenError` cho MỌI
     lỗi (chữ ký sai, hết hạn, thiếu claim, `tenant_id` không phải UUID) — không có nhánh "đoán giá
     trị mặc định", đúng nguyên tắc fail-closed đã dùng xuyên suốt (`tenant_wall.resolve_session`).
     """
-    settings = get_settings()
-    try:
-        claims = jwt.decode(token, settings.jwt_secret, algorithms=[_ALGORITHM])
-    except jwt.PyJWTError as exc:
-        raise InvalidTokenError(f"JWT không hợp lệ: {exc}") from exc
+    claims = _decode_claims(token)
 
     try:
         tenant_id = UUID(str(claims["tenant_id"]))
@@ -130,3 +138,18 @@ def verify_token(token: str) -> ResolvedContext:
         raise InvalidTokenError(f"JWT thiếu/sai claim bắt buộc: {exc}") from exc
 
     return ResolvedContext(tenant_id=tenant_id, user=user, roles=roles)
+
+
+def issued_at(token: str) -> datetime:
+    """Giải mã lại `iat` của 1 JWT (chữ ký/hạn dùng đã qua `_decode_claims` y hệt `verify_token`).
+    Tách riêng khỏi `verify_token()` thay vì đổi chữ ký hàm đó — nhiều call site/test hiện đọc
+    thẳng `.tenant_id`/`.user`/`.roles` trên kết quả `verify_token()`, đổi thành tuple sẽ vỡ hết.
+
+    Dùng ở `middleware.py` để `authz.fetch_fresh_identity` so được `iat` với `core.users.
+    password_changed_at` — JWT ký TRƯỚC lần đổi mật khẩu gần nhất phải bị coi là hết hiệu lực
+    (review `app#21` 🔶, xem `core/schema.py` ngay trên cột `password_changed_at`)."""
+    claims = _decode_claims(token)
+    try:
+        return datetime.fromtimestamp(float(claims["iat"]), tz=UTC)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise InvalidTokenError(f"JWT thiếu/sai claim iat: {exc}") from exc

@@ -73,6 +73,14 @@ CREATE TABLE IF NOT EXISTS core.users (
 -- động (đúng ngữ nghĩa, không phải giá trị bịa như cảnh báo tương tự ở `eval.golden_sets.tenant_id`).
 ALTER TABLE core.users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true;
 
+-- `NULL` = "chưa từng đổi mật khẩu tự phục vụ kể từ khi cột này tồn tại" -> không JWT nào bị coi
+-- là cũ (không có mốc nào để so `iat`). `routes/auth.py::change_own_password` ghi `now()` vào đây
+-- CÙNG lúc ghi `password_hash` mới; `authz.fetch_fresh_identity` so cột này với `iat` của JWT đang
+-- gọi (`jwt_auth.issued_at`) — JWT ký TRƯỚC lần đổi mật khẩu gần nhất bị coi là hết hiệu lực dù
+-- chưa qua `exp` (review app#21 🔶: đổi mật khẩu là cách người dùng tự xử lý phiên bị đánh cắp,
+-- nhưng trước bản vá này JWT cũ vẫn sống nguyên tới hết `jwt_expire_minutes`, mặc định 480 phút).
+ALTER TABLE core.users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMPTZ NULL;
+
 -- "Phòng ban"/section per tenant (thay SECTION_VOCAB toàn cục cứng của studio_kb.doc_factory) —
 -- routes/sections.py: chỉ superadmin tạo/sửa/xoá, routes/admin.py::create_user tra động bảng này
 -- để validate roles thay vì frozenset tĩnh.

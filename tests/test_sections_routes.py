@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
+from pydantic import ValidationError
 from studio_app import middleware
 from studio_app.core._db import Pool, close_pools, get_pool
 from studio_app.routes.sections import (
@@ -92,6 +93,22 @@ async def test_superadmin_creates_section(admin_pool: Pool) -> None:
 
     assert result.name == "finance"
     assert result.tenant_id == str(tenant_id)
+
+
+@pytest.mark.parametrize("reserved_name", ["admin", "superadmin"])
+def test_create_section_rejects_reserved_name(reserved_name: str) -> None:
+    """Tầng 1 của bản vá `app#21` ⛔ — `name` trùng 1 role hệ thống bị chặn ngay ở Pydantic
+    (422 khi qua HTTP thật), TRƯỚC khi có cơ hội chèn vào `core.sections` rồi lọt vào `valid_role_
+    vocab` (`routes/admin.py::create_user`). Test THUẦN model, không cần DB — cùng
+    `test_create_section_rejects_reserved_name_on_rename` bên dưới cho `RenameSectionRequest`."""
+    with pytest.raises(ValidationError):
+        CreateSectionRequest(tenant_id=str(uuid4()), name=reserved_name)
+
+
+@pytest.mark.parametrize("reserved_name", ["admin", "superadmin"])
+def test_rename_section_rejects_reserved_name(reserved_name: str) -> None:
+    with pytest.raises(ValidationError):
+        RenameSectionRequest(name=reserved_name)
 
 
 async def test_create_section_rejects_unknown_tenant(admin_pool: Pool) -> None:

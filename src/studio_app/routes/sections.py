@@ -17,7 +17,7 @@ from pydantic import BaseModel, field_validator
 
 from studio_app.authz import fetch_fresh_identity, require_superadmin
 from studio_app.middleware import get_request_connection, get_request_session
-from studio_app.validators import reject_blank
+from studio_app.validators import reject_reserved_section_name
 
 router = APIRouter(prefix="/api/admin/sections", tags=["sections"])
 
@@ -39,13 +39,13 @@ class CreateSectionRequest(BaseModel):
     tenant_id: str
     name: str
 
-    _validate_name = field_validator("name")(reject_blank)
+    _validate_name = field_validator("name")(reject_reserved_section_name)
 
 
 class RenameSectionRequest(BaseModel):
     name: str
 
-    _validate_name = field_validator("name")(reject_blank)
+    _validate_name = field_validator("name")(reject_reserved_section_name)
 
 
 @router.post("", response_model=SectionResponse)

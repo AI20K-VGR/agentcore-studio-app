@@ -16,11 +16,14 @@ core.users WHERE email=%s` lặp lại ở 7+ route handler — gom về đây 1
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import NewType
 from uuid import UUID
 
 from fastapi import HTTPException
 from psycopg import AsyncConnection
+
+from studio_app.middleware import get_request_token_issued_at
 
 FreshRoles = NewType("FreshRoles", list[str])
 """Type riêng cho "roles vừa tra từ `core.users` trong request này" — KHÁC `list[str]` thường (vd
@@ -44,14 +47,29 @@ class FreshIdentity:
 
 
 async def fetch_fresh_identity(conn: AsyncConnection, email: str) -> FreshIdentity:
-    """`SELECT id, roles, tenant_id FROM core.users WHERE email = %s` — round-trip DUY NHẤT dùng
-    chung cho mọi route cần roles/tenant tươi thay vì tin JWT.
+    """`SELECT id, roles, tenant_id, password_changed_at FROM core.users WHERE email = %s` —
+    round-trip DUY NHẤT dùng chung cho mọi route cần roles/tenant tươi thay vì tin JWT.
 
     Raise `HTTPException(403)` nếu JWT hợp lệ (chữ ký đúng, chưa hết hạn) nhưng KHÔNG còn dòng nào
     trong `core.users` khớp email đó — phòng thủ theo chiều sâu cho ca tài khoản bị offboard (xoá
-    khỏi `core.users`) nhưng JWT cũ (tới 480 phút) vẫn còn hạn dùng (review `app#17`, Chặn 1)."""
+    khỏi `core.users`) nhưng JWT cũ (tới 480 phút) vẫn còn hạn dùng (review `app#17`, Chặn 1).
+
+    Raise `HTTPException(401)` nếu JWT ký TRƯỚC lần đổi mật khẩu gần nhất (`core.users.
+    password_changed_at`) — đổi mật khẩu là cách người dùng tự xử lý phiên bị đánh cắp, JWT ký từ
+    trước đó phải hết hiệu lực ngay, không đợi tới hết `jwt_expire_minutes` (review `app#21` 🔶,
+    xem `core/schema.py` ngay trên cột này). `password_changed_at IS NULL` (chưa từng đổi mật khẩu
+    tự phục vụ) bỏ qua kiểm tra — không có mốc nào để so.
+
+    LƯU Ý PHẠM VI: chỉ áp dụng cho route nào GỌI hàm này (admin/sections/agents/runs/publish, và
+    nhánh `as_roles` của chat) — đường chat MẶC ĐỊNH của nhân viên (`routes/chat.py::chat`,
+    `body.as_roles is None`) dùng thẳng `session` (JWT) làm `session_context` cho interpreter,
+    KHÔNG đi qua hàm này, nên JWT nhân viên bị đánh cắp vẫn chat được tới khi hết hạn dù chủ tài
+    khoản đã đổi mật khẩu. Vá trọn vẹn đòi kiểm tra này chạy ở `tenant_context_middleware` (mọi
+    request, thêm 1 round-trip DB cho MỌI route) — ngoài phạm vi bản vá "rẻ nhất" mà review yêu
+    cầu, cùng dạng nợ kỹ thuật đã ghi nhận công khai ở `routes/admin.py` (comment trên
+    `fetch_fresh_identity` ở `create_user`) cho khoảng-hở tenant_context tương tự."""
     cur = await conn.execute(
-        "SELECT id, roles, tenant_id FROM core.users WHERE email = %s",
+        "SELECT id, roles, tenant_id, password_changed_at FROM core.users WHERE email = %s",
         (email,),
     )
     row = await cur.fetchone()
@@ -60,7 +78,19 @@ async def fetch_fresh_identity(conn: AsyncConnection, email: str) -> FreshIdenti
             status_code=403,
             detail="Tài khoản gọi API không tồn tại trong core.users.",
         )
-    user_id, roles_raw, tenant_id = row
+    user_id, roles_raw, tenant_id, password_changed_at = row
+    # `- 1s`: `iat` là unix timestamp NGUYÊN GIÂY (JWT chuẩn), `password_changed_at` là
+    # `TIMESTAMPTZ` micro-giây từ `now()` — 1 JWT ký CÙNG giây với lần đổi mật khẩu (login lại
+    # ngay sau khi đổi) có thể có `iat` (đã cắt xuống giây) nhỏ hơn `password_changed_at` (còn
+    # phần lẻ micro-giây) dù thực ra được ký SAU. Khoan dung 1 giây tránh false-positive khoá
+    # nhầm chính phiên vừa đăng nhập lại, vẫn thừa đủ chặt để loại JWT thật sự cũ (phút/giờ trước).
+    if password_changed_at is not None and get_request_token_issued_at() < password_changed_at - timedelta(
+        seconds=1
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Mật khẩu đã đổi sau khi phiên này đăng nhập — đăng nhập lại.",
+        )
     return FreshIdentity(id=user_id, tenant_id=tenant_id, roles=FreshRoles(list(roles_raw)))
 
 

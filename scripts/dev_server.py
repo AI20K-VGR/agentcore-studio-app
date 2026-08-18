@@ -30,10 +30,11 @@ def main() -> None:
         host="127.0.0.1",
         port=8000,
         reload=True,
-        # Khớp `--no-proxy-headers` ở README/Dockerfile (kit#18) — thiếu cờ này thì
+        # Khớp `--no-proxy-headers` ở README/Dockerfile (app#18 — SỬA lại đợt review app#21 🔸:
+        # bản cũ dẫn nhầm "kit#18", đó là issue KHÁC của Day-4 về `kb_binding`) — thiếu cờ này thì
         # `ProxyHeadersMiddleware` mặc định của uvicorn vẫn tin `X-Forwarded-For` từ MỌI kết nối
         # tới từ 127.0.0.1, ghi đè `request.client` TRƯỚC KHI app thấy request — mở lại đúng
-        # đường né rate-limit `/api/auth/login` mà issue #18 mô tả, riêng cho đường chạy Windows
+        # đường né rate-limit `/api/auth/login` mà app#18 mô tả, riêng cho đường chạy Windows
         # dev này (script cố ý thay thế lệnh uvicorn trần trong README, nên phải mang đủ cờ đó).
         proxy_headers=False,
     )

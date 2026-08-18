@@ -34,7 +34,7 @@ from starlette.concurrency import run_in_threadpool
 from studio_app.authz import fetch_fresh_identity, require_admin, require_superadmin
 from studio_app.jwt_auth import hash_password, normalize_email
 from studio_app.middleware import get_request_connection, get_request_session
-from studio_app.validators import reject_blank, reject_oversized_password
+from studio_app.validators import RESERVED_ROLE_NAMES, reject_blank, reject_oversized_password
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -221,7 +221,12 @@ async def create_user(body: CreateUserRequest) -> CreateUserResponse:
         (str(creator_tenant_id),),
     )
     section_names = {row[0] for row in await cur.fetchall()}
-    valid_role_vocab = section_names | {"admin"}
+    # Trừ `RESERVED_ROLE_NAMES` khỏi `section_names` TRƯỚC khi hợp với `{"admin"}` — tầng 2 của
+    # bản vá app#21 ⛔ (tầng 1: `reject_reserved_section_name` chặn tạo/đổi tên section trùng role
+    # hệ thống). Cần tầng này RIÊNG vì DB có thể đã có sẵn 1 dòng `core.sections` tên `"superadmin"`
+    # từ TRƯỚC khi tầng 1 tồn tại — không trừ ở đây thì dòng cũ đó vẫn âm thầm cấp quyền tạo/gán
+    # superadmin cho mọi company-admin của tenant đó, bất kể validator mới đã chặn được record MỚI.
+    valid_role_vocab = (section_names - RESERVED_ROLE_NAMES) | {"admin"}
 
     invalid_roles = set(body.roles) - valid_role_vocab
     if invalid_roles:
@@ -351,7 +356,12 @@ async def update_user_roles(user_id: str, body: UpdateUserRolesRequest) -> UserS
         (str(identity.tenant_id),),
     )
     section_names = {row[0] for row in await cur.fetchall()}
-    valid_role_vocab = section_names | {"admin"}
+    # Trừ `RESERVED_ROLE_NAMES` khỏi `section_names` TRƯỚC khi hợp với `{"admin"}` — tầng 2 của
+    # bản vá app#21 ⛔ (tầng 1: `reject_reserved_section_name` chặn tạo/đổi tên section trùng role
+    # hệ thống). Cần tầng này RIÊNG vì DB có thể đã có sẵn 1 dòng `core.sections` tên `"superadmin"`
+    # từ TRƯỚC khi tầng 1 tồn tại — không trừ ở đây thì dòng cũ đó vẫn âm thầm cấp quyền tạo/gán
+    # superadmin cho mọi company-admin của tenant đó, bất kể validator mới đã chặn được record MỚI.
+    valid_role_vocab = (section_names - RESERVED_ROLE_NAMES) | {"admin"}
 
     invalid_roles = set(body.roles) - valid_role_vocab
     if invalid_roles:

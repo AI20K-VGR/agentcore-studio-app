@@ -52,7 +52,8 @@ class Settings(BaseSettings):
     # `X-Forwarded-For` (không cho client tự khai giá trị đó lọt qua), nếu không bật nhầm sẽ MỞ LẠI
     # đường né rate-limit bằng cách client tự set header giả trực tiếp (KHÔNG qua proxy nào).
     #
-    # KHÔNG phải van độc lập duy nhất (sửa lại sau `app#17`, issue kit#18): uvicorn tự có cơ chế
+    # KHÔNG phải van độc lập duy nhất (sửa lại sau `app#17`, issue app#18 — SỬA lại đợt review
+    # app#21 🔸: bản cũ dẫn nhầm "kit#18", đó là issue KHÁC của Day-4 về `kb_binding`): uvicorn tự có cơ chế
     # `ProxyHeadersMiddleware` RIÊNG, bật mặc định, tự tin `X-Forwarded-For` từ bất kỳ kết nối nào
     # tới từ `127.0.0.1` (mặc định `--forwarded-allow-ips`) và ghi đè `request.client` TRƯỚC KHI
     # app (và cờ này) thấy request — độc lập hoàn toàn với cờ `trust_x_forwarded_for`. Vì vậy

@@ -178,6 +178,34 @@ async def test_company_admin_cannot_grant_superadmin_role(admin_pool: Pool) -> N
         middleware._request_session.reset(token)  # type: ignore[arg-type]
 
 
+async def test_section_named_superadmin_cannot_be_used_to_grant_superadmin_role(admin_pool: Pool) -> None:
+    """Khoá lại đúng lỗ hổng review `app#21` ⛔: dựng lại được trên Postgres thật TRƯỚC bản vá —
+    superadmin tạo 1 section tên `"superadmin"` cho tenant (`routes/sections.py` khi đó chỉ chặn
+    rỗng, không chặn tên trùng role hệ thống) → `create_user` ghép `section_names | {"admin"}` làm
+    vocab role, "superadmin" lọt vào đó → company-admin tạo được user roles=["superadmin"] → user
+    đó gọi lọt route superadmin-only cho TENANT KHÁC.
+
+    Bài này seed THẲNG section tên `"superadmin"` bằng SQL (bỏ qua `CreateSectionRequest`/
+    `reject_reserved_section_name`, tầng 1 của bản vá) — mô phỏng ĐÚNG ca "DB đã có sẵn dòng cũ từ
+    trước khi tầng 1 tồn tại" mà review nêu, để PIN riêng tầng 2 (`routes/admin.py::create_user`
+    trừ `RESERVED_ROLE_NAMES` khỏi `section_names` trước khi hợp `{"admin"}`) — tầng 1 có test
+    riêng ở `test_sections_routes.py::test_create_section_rejects_reserved_name`."""
+    tenant_id = await _seed_tenant(admin_pool, "probe-legacy-superadmin-section")
+    await _seed_admin_user(admin_pool, tenant_id, "admin@acme.com")
+    await _seed_section(admin_pool, tenant_id, "superadmin")
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            async with _simulate_request_connection():
+                await create_user(
+                    CreateUserRequest(email="wannabe2@acme.com", password="password123", roles=["superadmin"])
+                )
+        assert exc_info.value.status_code == 400
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+
 async def test_create_user_rejects_role_outside_vocab(admin_pool: Pool) -> None:
     """Đối chứng với bài trên: không chỉ chặn riêng "superadmin", mà chặn MỌI chuỗi ngoài
     (core.sections của tenant) ∪ {"admin"} — vd lỗi gõ hoặc role tự chế không tồn tại. Tenant này

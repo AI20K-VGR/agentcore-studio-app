@@ -208,11 +208,27 @@ async def change_own_password(body: ChangePasswordRequest) -> dict[str, str]:
 
     Bắt buộc đúng `old_password` trước khi ghi — không chỉ tin JWT còn hạn. JWT chứng minh "đã từng
     đăng nhập", không chứng minh "vẫn đang cầm điện thoại/máy này" (phiên có thể bị đánh cắp/để mở
-    quên) — bắt gõ lại mật khẩu cũ là bước xác thực-lại (step-up), không phải kiểm tra thừa. Không
-    mở thêm bề mặt tấn công nào: kẻ tấn công có cả JWT LẪN mật khẩu cũ đã đủ sức tự đăng nhập lại,
-    không cần qua route này."""
+    quên) — bắt gõ lại mật khẩu cũ là bước xác thực-lại (step-up), không phải kiểm tra thừa.
+
+    **Rate-limit theo email người gọi** (review `app#21` 🔶 — sửa lại 1 câu SAI ở docstring cũ:
+    route này KHÔNG "không mở thêm bề mặt tấn công nào". Kẻ cầm JWT ĐÁNH CẮP (không phải chủ tài
+    khoản) không có `old_password` — route này chính là oracle cho phép hắn BRUTE-FORCE nó, không
+    giới hạn số lần thử, trong khi `/api/auth/login` đã bị chặn ở 10 lần/phút cho đúng kịch bản
+    "đoán mật khẩu". Cùng lớp DoS cạn threadpool đã chặn ở login (`rate_limit.py` giải thích đầy
+    đủ): mỗi lần gọi tốn ~200-370ms bcrypt (`verify_password` bên dưới) trên AnyIO threadpool dùng
+    chung — route này CẦN JWT hợp lệ nên không ẩn danh được như login, bucket theo IP như login sẽ
+    dễ bị 1 IP đứng sau NAT/proxy công ty tự làm nghẽn lẫn nhau; bucket theo EMAIL người gọi (đã
+    xác thực qua JWT, không phải client tự khai) vừa đủ hẹp cho đúng 1 tài khoản, vừa không cần
+    thêm khái niệm key mới trong `rate_limit.py`."""
     session = get_request_session()
     conn = get_request_connection()
+
+    if not rate_limit.check_and_consume(f"password-change:{session.user}"):
+        raise HTTPException(
+            status_code=429,
+            detail="Quá nhiều yêu cầu đổi mật khẩu — thử lại sau.",
+            headers={"Retry-After": str(int(rate_limit.REFILL_SECONDS))},
+        )
 
     cur = await conn.execute(
         "SELECT password_hash FROM core.users WHERE email = %s",
@@ -229,8 +245,11 @@ async def change_own_password(body: ChangePasswordRequest) -> dict[str, str]:
         raise HTTPException(status_code=401, detail="Mật khẩu hiện tại không đúng.")
 
     new_hash = await run_in_threadpool(hash_password, body.new_password)
+    # `password_changed_at = now()` CÙNG câu UPDATE với `password_hash` — mốc này là thứ
+    # `authz.fetch_fresh_identity` so với `iat` của MỌI JWT gọi vào sau đó để hết hiệu lực JWT ký
+    # từ trước lần đổi này (review app#21 🔶, xem `core/schema.py`).
     await conn.execute(
-        "UPDATE core.users SET password_hash = %s WHERE email = %s",
+        "UPDATE core.users SET password_hash = %s, password_changed_at = now() WHERE email = %s",
         (new_hash, session.user),
     )
     return {"detail": "Đã đổi mật khẩu."}

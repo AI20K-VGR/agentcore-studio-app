@@ -11,12 +11,14 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
 from starlette.requests import Request
 from studio_app import jwt_auth, middleware, rate_limit
+from studio_app.authz import fetch_fresh_identity
 from studio_app.core._db import Pool, close_pools, get_pool
 from studio_app.jwt_auth import hash_password
 from studio_app.routes.auth import ChangePasswordRequest, LoginRequest, change_own_password, login
@@ -363,3 +365,92 @@ async def test_change_own_password_rejects_wrong_old_password(
             LoginRequest(email="changepw-wrong@acme.com", password="old-password-123"), _fake_request()
         )
     assert login_result.tenant_id == str(tenant_id)
+
+
+async def test_change_own_password_rate_limited_after_repeated_wrong_attempts(
+    admin_pool: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review `app#21` 🔶 — trước bản vá, `PATCH /api/auth/password` không giới hạn số lần thử
+    `old_password`, khác `POST /api/auth/login` đã bị chặn ở 10 lần/phút (`rate_limit._CAPACITY`)
+    cho đúng kịch bản "kẻ cầm JWT đánh cắp brute-force old_password". Bucket theo EMAIL người gọi
+    (`f"password-change:{email}"`, khác keyspace bucket IP của login) — 10 lần đầu vẫn chạm
+    `verify_password` thật (401, sai mật khẩu), lần thứ 11 phải bị chặn TRƯỚC đó (429)."""
+    monkeypatch.setattr(jwt_auth, "get_settings", _settings)
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("INSERT INTO core.tenants (name) VALUES (%s) RETURNING id", ("acme-changepw-rl",))
+        row = await cur.fetchone()
+        assert row is not None
+        tenant_id = row[0]
+        await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            (tenant_id, "changepw-rl@acme.com", hash_password("old-password-123"), ["admin"]),
+        )
+
+    token = _set_session(tenant_id=tenant_id, user="changepw-rl@acme.com", roles=["admin"])
+    try:
+        for _ in range(10):  # đúng `rate_limit._CAPACITY` — burst này còn token, verify chạy thật
+            with pytest.raises(HTTPException) as exc_info:
+                async with _simulate_request_connection():
+                    await change_own_password(
+                        ChangePasswordRequest(old_password="wrong-password", new_password="new-password-456")
+                    )
+            assert exc_info.value.status_code == 401
+
+        with pytest.raises(HTTPException) as exc_info:
+            async with _simulate_request_connection():
+                await change_own_password(
+                    ChangePasswordRequest(old_password="wrong-password", new_password="new-password-456")
+                )
+        assert exc_info.value.status_code == 429
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+
+async def test_fetch_fresh_identity_rejects_jwt_issued_before_password_change(admin_pool: Pool) -> None:
+    """review `app#21` 🔶 — JWT ký TRƯỚC lần đổi mật khẩu gần nhất phải hết hiệu lực ngay ở route
+    nào gọi `authz.fetch_fresh_identity` (admin/sections/agents/runs/publish), không đợi hết
+    `jwt_expire_minutes` (mặc định 480 phút). Mô phỏng "JWT cũ" bằng cách set thẳng ContextVar
+    `_request_token_issued_at` về 1 mốc TRƯỚC `password_changed_at` — không cần ký JWT thật/chờ
+    đồng hồ trôi để có 1 token với `iat` trong quá khứ."""
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("INSERT INTO core.tenants (name) VALUES (%s) RETURNING id", ("acme-stale-jwt",))
+        row = await cur.fetchone()
+        assert row is not None
+        tenant_id = row[0]
+        await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles, password_changed_at) "
+            "VALUES (%s, %s, %s, %s, now())",
+            (tenant_id, "stale-jwt@acme.com", hash_password("whatever"), ["admin"]),
+        )
+
+        stale_iat = datetime.now(UTC) - timedelta(hours=1)
+        iat_token = middleware._request_token_issued_at.set(stale_iat)
+        try:
+            with pytest.raises(HTTPException) as exc_info:
+                await fetch_fresh_identity(conn, "stale-jwt@acme.com")
+            assert exc_info.value.status_code == 401
+        finally:
+            middleware._request_token_issued_at.reset(iat_token)  # type: ignore[arg-type]
+
+
+async def test_fetch_fresh_identity_accepts_jwt_issued_after_password_change(admin_pool: Pool) -> None:
+    """Đối chứng bài trên — JWT ký SAU lần đổi mật khẩu (vd đăng nhập lại) phải đi qua bình
+    thường, tránh bản vá quá tay khoá luôn cả phiên hợp lệ mới nhất."""
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("INSERT INTO core.tenants (name) VALUES (%s) RETURNING id", ("acme-fresh-jwt",))
+        row = await cur.fetchone()
+        assert row is not None
+        tenant_id = row[0]
+        await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles, password_changed_at) "
+            "VALUES (%s, %s, %s, %s, now())",
+            (tenant_id, "fresh-jwt@acme.com", hash_password("whatever"), ["admin"]),
+        )
+
+        fresh_iat = datetime.now(UTC) + timedelta(seconds=5)
+        iat_token = middleware._request_token_issued_at.set(fresh_iat)
+        try:
+            identity = await fetch_fresh_identity(conn, "fresh-jwt@acme.com")
+        finally:
+            middleware._request_token_issued_at.reset(iat_token)  # type: ignore[arg-type]
+        assert identity.roles == ["admin"]
