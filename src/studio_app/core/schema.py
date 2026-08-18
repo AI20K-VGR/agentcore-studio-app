@@ -62,7 +62,42 @@ CREATE TABLE IF NOT EXISTS core.users (
     password_hash TEXT NOT NULL,
     roles TEXT[] NOT NULL DEFAULT '{}',
     created_by UUID NULL REFERENCES core.users(id),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    is_active BOOLEAN NOT NULL DEFAULT true
+);
+
+-- Đường thứ hai cho DB đã tồn tại từ trước cột `is_active` (`routes/admin.py::delete_user` —
+-- vô hiệu hoá thay vì DELETE cứng, xem docstring route đó) — `CREATE TABLE IF NOT EXISTS` ở trên
+-- là no-op trên bảng đã có, nên thiếu dòng này thì máy đồng đội/DB cũ không bao giờ có cột.
+-- `DEFAULT true` an toàn ngay cả trên bảng đã có dữ liệu — mọi user đã tồn tại coi như đang hoạt
+-- động (đúng ngữ nghĩa, không phải giá trị bịa như cảnh báo tương tự ở `eval.golden_sets.tenant_id`).
+ALTER TABLE core.users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true;
+
+-- `NULL` = "chưa từng đổi mật khẩu tự phục vụ kể từ khi cột này tồn tại" -> không JWT nào bị coi
+-- là cũ (không có mốc nào để so `iat`). `routes/auth.py::change_own_password` ghi `now()` vào đây
+-- CÙNG lúc ghi `password_hash` mới; `authz.fetch_fresh_identity` so cột này với `iat` của JWT đang
+-- gọi (`jwt_auth.issued_at`) — JWT ký TRƯỚC lần đổi mật khẩu gần nhất bị coi là hết hiệu lực dù
+-- chưa qua `exp` (review app#21 🔶: đổi mật khẩu là cách người dùng tự xử lý phiên bị đánh cắp,
+-- nhưng trước bản vá này JWT cũ vẫn sống nguyên tới hết `jwt_expire_minutes`, mặc định 480 phút).
+ALTER TABLE core.users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMPTZ NULL;
+
+-- "Phòng ban"/section per tenant (thay SECTION_VOCAB toàn cục cứng của studio_kb.doc_factory) —
+-- routes/sections.py: chỉ superadmin tạo/sửa/xoá, routes/admin.py::create_user tra động bảng này
+-- để validate roles thay vì frozenset tĩnh.
+--
+-- KHÔNG RLS (khác wb.recipes/kb.chunks, GIỐNG core.users/core.tenants) — cố ý: superadmin quản
+-- section của TENANT KHÁC tenant JWT của chính họ (JWT superadmin trỏ `__system__`,
+-- scripts/seed_superadmin.py). RLS khoá theo current_setting('app.tenant_id') sẽ tự chặn nhầm
+-- CHÍNH superadmin khỏi mọi tenant không phải __system__ — hỏng thẳng tính năng. Ranh giới tenant
+-- enforce ở tầng application (routes/sections.py so tenant_id tường minh), đúng tiền lệ core.users
+-- đã dùng (xem comment ngay trên CREATE TABLE core.users ở trên).
+CREATE TABLE IF NOT EXISTS core.sections (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES core.tenants(id),
+    name TEXT NOT NULL,
+    created_by UUID NOT NULL REFERENCES core.users(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, name)
 );
 
 CREATE TABLE IF NOT EXISTS core.jobs (

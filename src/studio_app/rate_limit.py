@@ -35,7 +35,9 @@ refill thật."""
 
 _MAX_TRACKED_IPS = 10_000
 """Trần bộ nhớ cho `_buckets` — phòng rò rỉ bộ nhớ nếu 1 client giả mạo IP (khác nhau mỗi request)
-để né bucket, không phải LRU thật (không đáng để thêm cấu trúc dữ liệu cho 1 giới hạn best-effort)."""
+để né bucket. `check_and_consume` bên dưới ĐÃ là LRU thật (đợt 9: mọi lần chạm, kể cả bị từ chối,
+đều re-insert để dời key ra cuối `dict` — chỉ key lâu không bị chạm mới bị evict) — sửa lại docstring
+này cho khớp, bản cũ (đợt 8) viết "không phải LRU thật" trước khi hành vi đó được vá."""
 
 _buckets: dict[str, tuple[float, float]] = {}
 """`key -> (tokens hiện có, lúc cập nhật gần nhất theo time.monotonic())`."""

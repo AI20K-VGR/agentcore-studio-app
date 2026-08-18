@@ -48,15 +48,20 @@ def test_no_authorization_header_returns_none(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_valid_bearer_token_resolves_full_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_resolve_jwt_session` giờ trả `(ResolvedContext, iat)` thay vì `ResolvedContext` trần
+    (app#21 🔶 — `iat` cần đi kèm để `authz.fetch_fresh_identity` so được với `password_changed_at`
+    và hết hiệu lực JWT ký trước lần đổi mật khẩu gần nhất, xem `middleware.py`/`authz.py`)."""
     monkeypatch.setattr(jwt_auth, "get_settings", _settings)
     token = jwt_auth.issue_token(ResolvedContext(tenant_id=_TENANT_ID, user="dozyboy", roles=["public"]))
 
     result = _resolve_jwt_session(_FakeRequest({"authorization": f"Bearer {token}"}))  # type: ignore[arg-type]
 
     assert result is not None
-    assert result.tenant_id == _TENANT_ID
-    assert result.user == "dozyboy"
-    assert result.roles == ["public"]
+    session, token_issued_at = result
+    assert session.tenant_id == _TENANT_ID
+    assert session.user == "dozyboy"
+    assert session.roles == ["public"]
+    assert token_issued_at == jwt_auth.issued_at(token)
 
 
 def test_bearer_prefix_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -67,7 +72,7 @@ def test_bearer_prefix_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None
 
     result = _resolve_jwt_session(_FakeRequest({"authorization": f"bearer {token}"}))  # type: ignore[arg-type]
     assert result is not None
-    assert result.tenant_id == _TENANT_ID
+    assert result[0].tenant_id == _TENANT_ID
 
 
 def test_missing_bearer_prefix_falls_through_to_none(monkeypatch: pytest.MonkeyPatch) -> None:

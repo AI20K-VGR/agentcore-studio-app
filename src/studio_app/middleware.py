@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
+from datetime import datetime
 from typing import Any
 
 from fastapi import HTTPException
@@ -26,10 +27,11 @@ from starlette.responses import JSONResponse, Response
 from studio_workbench.tenant_wall import ResolvedContext
 
 from studio_app.core._db import get_pool
-from studio_app.jwt_auth import InvalidTokenError, verify_token
+from studio_app.jwt_auth import InvalidTokenError, issued_at, verify_token
 
 _request_conn: ContextVar[AsyncConnection[Any] | None] = ContextVar("_request_conn", default=None)
 _request_session: ContextVar[ResolvedContext | None] = ContextVar("_request_session", default=None)
+_request_token_issued_at: ContextVar[datetime | None] = ContextVar("_request_token_issued_at", default=None)
 
 
 def get_request_connection() -> AsyncConnection[Any]:
@@ -68,7 +70,21 @@ def get_request_session() -> ResolvedContext:
     return session
 
 
-def _resolve_jwt_session(request: Request) -> ResolvedContext | None:
+def get_request_token_issued_at() -> datetime:
+    """`iat` của JWT request hiện tại — cùng lưới bảo vệ với `get_request_session()` (401 nếu
+    không có phiên nào, không phải `RuntimeError` cho caller tự try/except). Dùng ở `authz.
+    fetch_fresh_identity` để so với `core.users.password_changed_at` (review `app#21` 🔶 — JWT ký
+    trước lần đổi mật khẩu gần nhất phải hết hiệu lực, xem `core/schema.py`)."""
+    value = _request_token_issued_at.get()
+    if value is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Thiếu hoặc sai `Authorization: Bearer <jwt>` — cần đăng nhập trước (`POST /api/auth/login`).",
+        )
+    return value
+
+
+def _resolve_jwt_session(request: Request) -> tuple[ResolvedContext, datetime] | None:
     """`Authorization: Bearer <token>` seam (Kế hoạch 2, A1) — as of `kit#129` §3.2 remediation
     (VinSOC AV-203064/AV-203754, High cả 2 lượt quét), đây là NGUỒN DUY NHẤT xác định tenant của
     một request. Đường cũ `x-tenant-id` header (dev-stub, tin thẳng client, không verify) đã bị
@@ -90,12 +106,12 @@ def _resolve_jwt_session(request: Request) -> ResolvedContext | None:
     if not raw or not raw.lower().startswith("bearer "):
         return None
     token = raw[len("bearer ") :].strip()
-    return verify_token(token)
+    return verify_token(token), issued_at(token)
 
 
 async def tenant_context_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
     try:
-        session = _resolve_jwt_session(request)
+        resolved = _resolve_jwt_session(request)
     except InvalidTokenError as exc:
         return JSONResponse(status_code=401, content={"detail": str(exc)})
 
@@ -105,18 +121,23 @@ async def tenant_context_middleware(request: Request, call_next: Callable[[Reque
         # không có tenant, hết. Fail-closed (Decision #3), không phải "còn 1 nguồn dự phòng".
         tenant_id: str | None = None
         session_token = None
-        if session is not None:
+        issued_at_token = None
+        if resolved is not None:
+            session, token_issued_at = resolved
             tenant_id = str(session.tenant_id)
             session_token = _request_session.set(session)
+            issued_at_token = _request_token_issued_at.set(token_issued_at)
         if tenant_id is not None:
             # SET LOCAL does not accept bind parameters over the wire protocol (it is a utility
             # statement, not a DML query) — sql.Literal safely inline-quotes the value instead.
             await conn.execute(sql.SQL("SET LOCAL app.tenant_id = {}").format(sql.Literal(tenant_id)))
-        token = _request_conn.set(conn)
+        conn_token = _request_conn.set(conn)
         try:
             response = await call_next(request)
         finally:
-            _request_conn.reset(token)
+            _request_conn.reset(conn_token)
             if session_token is not None:
                 _request_session.reset(session_token)
+            if issued_at_token is not None:
+                _request_token_issued_at.reset(issued_at_token)
     return response

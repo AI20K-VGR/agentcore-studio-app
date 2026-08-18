@@ -448,9 +448,19 @@ async def test_rehomed_admin_stale_jwt_creates_user_in_fresh_tenant_not_stale_on
         row = await cur.fetchone()
         assert row is not None
         tenant_b = row[0]
-        await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+        cur = await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s) RETURNING id",
             (tenant_a, "soon-rehomed@acme.com", hash_password("rehomed-admin-password"), ["admin", "public"]),
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        rehomed_admin_id = row[0]
+        # Vocab roles hợp lệ giờ tra động theo `core.sections` CỦA TENANT ĐÍCH (tenant_b, tenant
+        # TƯƠI sau re-home) — seed sẵn "public" cho tenant_b, không phải tenant_a, để request cuối
+        # bài (tạo user role=["public"] SAU khi re-home) qua được vocab check.
+        await conn.execute(
+            "INSERT INTO core.sections (tenant_id, name, created_by) VALUES (%s, %s, %s)",
+            (tenant_b, "public", rehomed_admin_id),
         )
 
     login_res = await client.post(

@@ -21,6 +21,7 @@ Chạy:
 from __future__ import annotations
 
 import asyncio
+import sys
 from uuid import UUID
 
 from studio_app.core._db import close_pools, get_admin_pool
@@ -76,4 +77,10 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        # Windows mặc định ProactorEventLoop; psycopg async từ chối thẳng ("Psycopg cannot use
+        # the 'ProactorEventLoop' to run in async mode"). Selector* là loop chính lỗi đó khuyến
+        # nghị, có sẵn trong stdlib mọi hệ điều hành script này chạy — không thêm dependency nào.
+        # Cùng workaround `scripts/seed_superadmin.py` + `tests/conftest.py` đã dùng.
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())
