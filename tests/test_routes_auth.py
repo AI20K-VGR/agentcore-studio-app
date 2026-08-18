@@ -454,3 +454,106 @@ async def test_fetch_fresh_identity_accepts_jwt_issued_after_password_change(adm
         finally:
             middleware._request_token_issued_at.reset(iat_token)
         assert identity.roles == ["admin"]
+
+
+async def test_fetch_fresh_identity_rejects_deactivated_account(admin_pool: Pool) -> None:
+    """review `app#21` (phát hiện qua review độc lập, SAU đợt vá `password_changed_at` ở trên) —
+    `deactivate_user` (`routes/admin.py`) tự khai "vô hiệu hoá tài khoản" nhưng trước bản vá này
+    chỉ chặn được ĐĂNG NHẬP MỚI (`routes/auth.py::login` kiểm `is_active`) — JWT CŨ của 1 tài
+    khoản VỪA bị vô hiệu hoá vẫn gọi lọt mọi route qua `fetch_fresh_identity` (admin/sections/
+    agents/runs/publish) tới khi JWT tự hết hạn. `password_changed_at` để `NULL` (cố ý — bài này
+    chỉ khoá đúng 1 trục `is_active`, không trộn với trục `password_changed_at` đã có bài riêng)."""
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("INSERT INTO core.tenants (name) VALUES (%s) RETURNING id", ("acme-deactivated",))
+        row = await cur.fetchone()
+        assert row is not None
+        tenant_id = row[0]
+        await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles, is_active) VALUES (%s, %s, %s, %s, false)",
+            (tenant_id, "deactivated@acme.com", hash_password("whatever"), ["admin"]),
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await fetch_fresh_identity(conn, "deactivated@acme.com")
+        assert exc_info.value.status_code == 403
+
+
+async def test_fetch_fresh_identity_accepts_active_account(admin_pool: Pool) -> None:
+    """Đối chứng bài trên — tài khoản `is_active=true` (mặc định cột) đi qua bình thường, tránh
+    bản vá quá tay khoá luôn tài khoản đang hoạt động bình thường."""
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("INSERT INTO core.tenants (name) VALUES (%s) RETURNING id", ("acme-active",))
+        row = await cur.fetchone()
+        assert row is not None
+        tenant_id = row[0]
+        await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            (tenant_id, "active@acme.com", hash_password("whatever"), ["admin"]),
+        )
+
+        identity = await fetch_fresh_identity(conn, "active@acme.com")
+        assert identity.roles == ["admin"]
+
+
+async def test_change_own_password_rejects_deactivated_account(
+    admin_pool: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cùng lỗ `is_active` ở trên nhưng cho `PATCH /api/auth/password` — route này tự đọc
+    `core.users` riêng (không qua `fetch_fresh_identity`), nên cần chặn riêng. Trước bản vá, 1 JWT
+    cũ của tài khoản VỪA bị vô hiệu hoá vẫn tự xoay được `password_hash` bằng `old_password` đúng —
+    hành vi ghi dữ liệu mà `deactivate_user` không hề định cho phép."""
+    monkeypatch.setattr(jwt_auth, "get_settings", _settings)
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("INSERT INTO core.tenants (name) VALUES (%s) RETURNING id", ("acme-deact-pw",))
+        row = await cur.fetchone()
+        assert row is not None
+        tenant_id = row[0]
+        await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles, is_active) VALUES (%s, %s, %s, %s, false)",
+            (tenant_id, "deact-pw@acme.com", hash_password("old-password-123"), ["admin"]),
+        )
+
+    token = _set_session(tenant_id=tenant_id, user="deact-pw@acme.com", roles=["admin"])
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            async with _simulate_request_connection():
+                await change_own_password(
+                    ChangePasswordRequest(old_password="old-password-123", new_password="new-password-456")
+                )
+        assert exc_info.value.status_code == 403
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+
+async def test_login_does_not_leak_reserved_role_name_from_legacy_section(
+    admin_pool: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review `app#21` (phát hiện qua review độc lập) — `login()` mở rộng JWT roles của admin bằng
+    MỌI `core.sections` của tenant. Trước bản vá, 1 dòng `core.sections` CŨ (từ trước layer-1
+    `validators.reject_reserved_section_name` tồn tại) tên `"superadmin"` sẽ lọt thẳng vào JWT
+    `roles` — không cấp quyền backend thật (mọi route nhạy cảm tra roles TƯƠI qua `fetch_fresh_
+    identity`), nhưng UI web định tuyến tầng THUẦN theo `session.roles` (JWT), nên admin đó bị đưa
+    nhầm vào Superadmin Console rồi mọi lời gọi 403. Seed thẳng section "superadmin" bằng SQL (bỏ
+    qua validator, mô phỏng đúng ca dòng cũ) để PIN riêng `fetch_tenant_section_names`."""
+    monkeypatch.setattr(jwt_auth, "get_settings", _settings)
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("INSERT INTO core.tenants (name) VALUES (%s) RETURNING id", ("acme-legacy-sa",))
+        row = await cur.fetchone()
+        assert row is not None
+        tenant_id = row[0]
+        cur = await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s) RETURNING id",
+            (tenant_id, "admin-legacy-sa@acme.com", hash_password("password-123"), ["admin"]),
+        )
+        admin_row = await cur.fetchone()
+        assert admin_row is not None
+        await conn.execute(
+            "INSERT INTO core.sections (tenant_id, name, created_by) VALUES (%s, %s, %s)",
+            (tenant_id, "superadmin", admin_row[0]),
+        )
+
+    async with _simulate_request_connection():
+        response = await login(LoginRequest(email="admin-legacy-sa@acme.com", password="password-123"), _fake_request())
+
+    assert "superadmin" not in response.roles
+    assert set(response.roles) == {"admin"}

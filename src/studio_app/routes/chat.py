@@ -24,7 +24,7 @@ from studio_kb.postgres import PgKbSearch
 from studio_workbench.tenant_wall import ResolvedContext
 from studio_workbench.validator import graph_lint
 
-from studio_app.authz import fetch_fresh_identity, require_admin
+from studio_app.authz import fetch_fresh_identity, fetch_tenant_section_names, require_admin
 from studio_app.core._db import get_pool
 from studio_app.eval_adapter import _llm_answer
 from studio_app.middleware import get_request_connection, get_request_session
@@ -105,8 +105,11 @@ async def chat(agent_id: str, body: ChatRequest) -> ChatResponse:
         conn = get_request_connection()
         identity = await fetch_fresh_identity(conn, session.user)
         require_admin(identity.roles)
-        cur = await conn.execute("SELECT name FROM core.sections WHERE tenant_id = %s", (str(session.tenant_id),))
-        valid_section_names = {row[0] for row in await cur.fetchall()}
+        # `fetch_tenant_section_names` tự trừ `RESERVED_ROLE_NAMES` (review app#21 — tầng 2 lặp
+        # lại, xem docstring hàm đó): trước bản vá, 1 dòng `core.sections` cũ tên "superadmin" sẽ
+        # lọt vào `valid_section_names`, cho phép `as_roles=["superadmin"]` đi thẳng vào
+        # `session_context.roles` — đầu vào của hàng rào nội dung KB ở `interpreter.run()`.
+        valid_section_names = await fetch_tenant_section_names(conn, session.tenant_id)
         invalid = set(body.as_roles) - valid_section_names
         if invalid:
             raise HTTPException(

@@ -101,3 +101,31 @@ async def test_chat_as_roles_rejects_unknown_section(admin_pool: Pool) -> None:
         assert exc_info.value.status_code == 400
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+
+async def test_chat_as_roles_rejects_reserved_role_name_even_if_section_exists(admin_pool: Pool) -> None:
+    """review `app#21` (phát hiện qua review độc lập) — `fetch_tenant_section_names` (dùng ở đây
+    qua `chat.py`) tự trừ `RESERVED_ROLE_NAMES`. Seed thẳng section "superadmin" bằng SQL (bỏ qua
+    validator layer-1, mô phỏng đúng ca dòng cũ từ trước layer-1 tồn tại): `as_roles=["superadmin"]`
+    vẫn phải bị 400 dù section đó CÓ THẬT trong `core.sections` — nếu không, giá trị đó đi thẳng
+    vào `session_context.roles`, đầu vào của hàng rào nội dung KB ở `interpreter.run()`."""
+    tenant_id = await _seed_tenant(admin_pool, "chat-as-roles-probe-c")
+    await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+    await _seed_published_recipe(admin_pool, tenant_id, "agent-as-roles-c")
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("SELECT id FROM core.users WHERE email = %s", ("admin@acme.com",))
+        admin_row = await cur.fetchone()
+        assert admin_row is not None
+        await conn.execute(
+            "INSERT INTO core.sections (tenant_id, name, created_by) VALUES (%s, %s, %s)",
+            (str(tenant_id), "superadmin", admin_row[0]),
+        )
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            async with _simulate_request_connection(tenant_id):
+                await chat("agent-as-roles-c", ChatRequest(message="hi", as_roles=["superadmin"]))
+        assert exc_info.value.status_code == 400
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]

@@ -389,7 +389,14 @@ async def deactivate_user(user_id: str) -> None:
     created_by` tham chiếu ngược (`REFERENCES core.users(id)`, không `ON DELETE CASCADE`); xoá cứng
     1 admin đã từng tạo nhân viên/section khác sẽ vỡ FK. Vô hiệu hoá giữ nguyên audit trail, và
     `routes/auth.py::login` chặn đăng nhập cho tài khoản `is_active=false` (coi như sai mật khẩu,
-    không lộ khác biệt qua status code — cùng nguyên tắc chống oracle `login()` đã dùng)."""
+    không lộ khác biệt qua status code — cùng nguyên tắc chống oracle `login()` đã dùng).
+
+    **Chặn cả JWT CŨ, không chỉ đăng nhập mới** (sửa lại đợt review `app#21` — bản trước chỉ nói
+    đúng nửa sự thật ở câu trên, để hở nửa còn lại): `authz.fetch_fresh_identity` (mọi route admin/
+    sections/agents/runs/publish gọi qua) VÀ `routes/auth.py::change_own_password` giờ cũng kiểm
+    `is_active`. Trước bản vá đó, 1 admin vừa bị vô hiệu hoá ở ĐÂY vẫn gọi lọt mọi route đó bằng
+    JWT cũ tới khi JWT tự hết hạn (`jwt_expire_minutes`, mặc định 480 phút) — endpoint này tưởng
+    như cắt quyền ngay lập tức nhưng thực ra chỉ chặn được lần đăng nhập TIẾP THEO."""
     session = get_request_session()
     conn = get_request_connection()
     identity = await fetch_fresh_identity(conn, session.user)

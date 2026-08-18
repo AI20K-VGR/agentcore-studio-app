@@ -26,6 +26,7 @@ from starlette.concurrency import run_in_threadpool
 from studio_workbench.tenant_wall import resolve_session
 
 from studio_app import rate_limit
+from studio_app.authz import fetch_tenant_section_names
 from studio_app.jwt_auth import DUMMY_PASSWORD_HASH, hash_password, issue_token, normalize_email, verify_password
 from studio_app.middleware import get_request_connection, get_request_session
 from studio_app.settings import get_settings
@@ -171,11 +172,15 @@ async def login(body: LoginRequest, request: Request) -> LoginResponse:
         # roles` trong DB VẪN chỉ lưu đúng `["admin"]` (không ghi đè) — đây chỉ là ảnh chụp trong
         # JWT của phiên đăng nhập này, tự làm mới ở lần đăng nhập kế tiếp nếu công ty có thêm
         # section mới (cùng bản chất "role là ảnh chụp lúc login" đã áp dụng xuyên suốt).
-        cur = await conn.execute("SELECT name FROM core.sections WHERE tenant_id = %s", (str(tenant_id),))
-        section_names = [row[0] for row in await cur.fetchall()]
+        # `fetch_tenant_section_names` tự trừ `RESERVED_ROLE_NAMES` (review app#21 — tầng 2 lặp
+        # lại, xem docstring hàm đó): 1 dòng `core.sections` cũ tên "superadmin" không còn lọt
+        # được vào JWT roles của company-admin qua đường này nữa.
+        section_names = await fetch_tenant_section_names(conn, tenant_id)
         # `dict.fromkeys` giữ ĐÚNG thứ tự chèn (khác `set`, thứ tự không xác định) — roles gốc từ
-        # DB đứng trước, section mới bổ sung nối sau, không xáo trộn thứ tự đã seed/lưu.
-        effective_roles = list(dict.fromkeys([*effective_roles, *section_names]))
+        # DB đứng trước, section mới bổ sung nối sau, không xáo trộn thứ tự đã seed/lưu. `sorted()`
+        # trên `section_names` (giờ là `set`, thứ tự không xác định) để thứ tự PHẦN NỐI THÊM ít
+        # nhất còn xác định/lặp lại được giữa các lần login, dù không mang ý nghĩa gì đặc biệt.
+        effective_roles = list(dict.fromkeys([*effective_roles, *sorted(section_names)]))
     session: dict[str, Any] = {"tenant_id": str(tenant_id), "user": body.email, "roles": effective_roles}
     try:
         resolved = resolve_session(session)
@@ -231,7 +236,7 @@ async def change_own_password(body: ChangePasswordRequest) -> dict[str, str]:
         )
 
     cur = await conn.execute(
-        "SELECT password_hash FROM core.users WHERE email = %s",
+        "SELECT password_hash, is_active FROM core.users WHERE email = %s",
         (session.user,),
     )
     row = await cur.fetchone()
@@ -243,6 +248,19 @@ async def change_own_password(body: ChangePasswordRequest) -> dict[str, str]:
     old_ok = await run_in_threadpool(verify_password, body.old_password, row[0])
     if not old_ok:
         raise HTTPException(status_code=401, detail="Mật khẩu hiện tại không đúng.")
+
+    # Kiểm SAU verify_password (cùng thứ tự `routes/auth.py::login`) — route này đã đòi JWT hợp lệ
+    # của CHÍNH tài khoản này nên không có oracle enumeration nào để tránh ở đây (khác `login`, nơi
+    # bất kỳ ai chưa đăng nhập cũng gọi được với email bất kỳ); thứ tự này chỉ để nhất quán, không
+    # phải để né oracle. Vá đúng lỗ `is_active` mà `fetch_fresh_identity` vừa đóng (review app#21):
+    # KHÔNG phải để chặn đăng nhập lại (đường đó `login()` đã tự chặn riêng qua `is_active`, không
+    # phụ thuộc route này) — mà vì "tài khoản đã vô hiệu hoá" phải nghĩa là KHÔNG còn tự sửa được
+    # gì của chính nó nữa, kể cả mật khẩu của chính nó, nhất quán với mọi route đã gate qua
+    # `fetch_fresh_identity`. Thiếu chặn này, JWT cũ của 1 tài khoản vừa bị vô hiệu hoá vẫn tự do
+    # xoay `password_hash` bất kỳ lúc nào tới khi JWT hết hạn — hành vi ghi dữ liệu mà
+    # `deactivate_user` không hề định cho phép.
+    if not row[1]:
+        raise HTTPException(status_code=403, detail="Tài khoản đã bị vô hiệu hoá.")
 
     new_hash = await run_in_threadpool(hash_password, body.new_password)
     # `password_changed_at = now()` CÙNG câu UPDATE với `password_hash` — mốc này là thứ
