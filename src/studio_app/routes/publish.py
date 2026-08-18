@@ -30,6 +30,7 @@ from studio_workbench.publish import publish
 from studio_workbench.tenant_wall import ResolvedContext
 from studio_workbench.validator import graph_lint
 
+from studio_app.authz import fetch_fresh_identity, require_admin
 from studio_app.core._db import get_pool
 from studio_app.eval_adapter import EngineAgentRunner
 from studio_app.middleware import get_request_connection, get_request_session
@@ -133,6 +134,12 @@ async def evaluate_agent(agent_id: str, body: RunRequest) -> dict[str, object]:
     `publish()`, không ghi `wb.recipes`. Dùng cho UI hiện điểm TRƯỚC khi quyết bấm Publish, để nút
     Publish có căn cứ bật/tắt mà không phải "bấm thử xem có được không"."""
     session = get_request_session()
+
+    # Cùng gate role-gap đã đóng ở `routes/runs.py::create_run` — route này trước bản vá cũng gọi
+    # được bởi bất kỳ ai đã đăng nhập, không riêng admin.
+    identity = await fetch_fresh_identity(get_request_connection(), session.user)
+    require_admin(identity.roles)
+
     recipe, scorecard = await _evaluate(agent_id, body, session)
     return {
         "agent_id": recipe.agent_id,
@@ -148,6 +155,11 @@ async def publish_agent(agent_id: str, body: RunRequest) -> dict[str, object]:
     `publish()` fail-closed trên đúng field đó TRƯỚC CẢ khi đọc `gate.verdict`. Đây là hành vi
     ĐÚNG, không phải bug của route này — xem kit#127 (rủi ro team-wide) để biết ai đang chặn."""
     session = get_request_session()
+
+    # Cùng gate role-gap đã đóng ở `routes/runs.py::create_run`.
+    identity = await fetch_fresh_identity(get_request_connection(), session.user)
+    require_admin(identity.roles)
+
     recipe, scorecard = await _evaluate(agent_id, body, session)
 
     try:

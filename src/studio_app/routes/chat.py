@@ -21,8 +21,10 @@ from pydantic import BaseModel
 from studio_contracts import NodeType, Recipe
 from studio_engine import interpreter
 from studio_kb.postgres import PgKbSearch
+from studio_workbench.tenant_wall import ResolvedContext
 from studio_workbench.validator import graph_lint
 
+from studio_app.authz import fetch_fresh_identity, require_admin
 from studio_app.core._db import get_pool
 from studio_app.eval_adapter import _llm_answer
 from studio_app.middleware import get_request_connection, get_request_session
@@ -34,6 +36,11 @@ router = APIRouter(prefix="/api/agents", tags=["chat"])
 
 class ChatRequest(BaseModel):
     message: str
+    # Admin-only (kiểm ở route, không tin client) — "giả lập" chat như 1 nhân viên chỉ có ĐÚNG tập
+    # role này, để admin tự kiểm nội dung nhân viên phòng ban X thấy được gì TRƯỚC khi tin agent,
+    # KHÔNG cần tạo tài khoản nhân viên thật để test. `None` (mặc định) = dùng nguyên roles thật
+    # của người gọi (đã mở rộng đủ mọi section nếu là admin, xem `routes/auth.py::login`).
+    as_roles: list[str] | None = None
 
 
 class ChatResponse(BaseModel):
@@ -89,6 +96,25 @@ async def chat(agent_id: str, body: ChatRequest) -> ChatResponse:
     except ValueError as exc:
         raise HTTPException(status_code=500, detail=f"recipe đã published nhưng graph_lint() đỏ: {exc}") from exc
 
+    # `body.as_roles` — CHỈ admin/superadmin được giả lập role khác (tra TƯƠI từ DB, không tin
+    # `session.roles`/JWT, cùng nguyên tắc mọi route nhạy cảm khác). Validate mỗi role giả lập phải
+    # là 1 section THẬT của tenant hiện tại — chặn gõ nhầm/role rác, không phải mở rộng quyền (chỉ
+    # THU HẸP xuống 1 tập con, không bao giờ tự thêm được role không tồn tại).
+    session_context: ResolvedContext = session
+    if body.as_roles is not None:
+        conn = get_request_connection()
+        identity = await fetch_fresh_identity(conn, session.user)
+        require_admin(identity.roles)
+        cur = await conn.execute("SELECT name FROM core.sections WHERE tenant_id = %s", (str(session.tenant_id),))
+        valid_section_names = {row[0] for row in await cur.fetchall()}
+        invalid = set(body.as_roles) - valid_section_names
+        if invalid:
+            raise HTTPException(
+                status_code=400,
+                detail=f"role {sorted(invalid)} không hợp lệ để giả lập — chỉ chấp nhận {sorted(valid_section_names)}",
+            )
+        session_context = ResolvedContext(tenant_id=session.tenant_id, user=session.user, roles=body.as_roles)
+
     # `Pool` (không phải `get_request_connection()`) — rủi ro pool self-deadlock CHƯA được giải
     # quyết ở route này, xem giải thích đầy đủ + lý do ở `routes/runs.py` (review `app#17` đợt 4,
     # sửa lại 1 lập luận SAI ở đợt 3: `get_pool()` là connection THỨ HAI cộng thêm vào connection
@@ -97,7 +123,7 @@ async def chat(agent_id: str, body: ChatRequest) -> ChatResponse:
     embedding = CallistoEmbedding()
     result = await interpreter.run(
         recipe,
-        session_context=session,
+        session_context=session_context,
         kb_search=PgKbSearch(pool, embedding),
         llm=build_llm(),
         embedding=embedding,

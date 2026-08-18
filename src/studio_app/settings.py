@@ -61,6 +61,17 @@ class Settings(BaseSettings):
     # --profile app`) — bật `True` CHỈ khi có reverse proxy đáng tin cấu hình ghi đè/set cứng
     # `X-Forwarded-For` (không cho client tự khai giá trị đó lọt qua), nếu không bật nhầm sẽ MỞ LẠI
     # đường né rate-limit bằng cách client tự set header giả trực tiếp (KHÔNG qua proxy nào).
+    #
+    # KHÔNG phải van độc lập duy nhất (sửa lại sau `app#17`, issue app#18 — SỬA lại đợt review
+    # app#21 🔸: bản cũ dẫn nhầm "kit#18", đó là issue KHÁC của Day-4 về `kb_binding`): uvicorn tự có cơ chế
+    # `ProxyHeadersMiddleware` RIÊNG, bật mặc định, tự tin `X-Forwarded-For` từ bất kỳ kết nối nào
+    # tới từ `127.0.0.1` (mặc định `--forwarded-allow-ips`) và ghi đè `request.client` TRƯỚC KHI
+    # app (và cờ này) thấy request — độc lập hoàn toàn với cờ `trust_x_forwarded_for`. Vì vậy
+    # `Dockerfile`/lệnh `uvicorn` chạy backend PHẢI kèm `--no-proxy-headers`, để lại đúng 1 nguồn
+    # sự thật (cờ này) — nếu không, `trust_x_forwarded_for=False` không đủ để chặn client tự giả
+    # `X-Forwarded-For` khi kết nối từ `127.0.0.1` (vd reverse proxy đứng cùng host qua loopback).
+    # Bật cờ này `True` PHẢI đi kèm bỏ `--no-proxy-headers` VÀ có reverse proxy thật GHI ĐÈ (không
+    # nối thêm) `X-Forwarded-For` trước khi tới app.
     trust_x_forwarded_for: bool = False
 
     # Discriminator provider thật (app#19) — required, KHÔNG `Field(default=...)`: cùng lý lẽ

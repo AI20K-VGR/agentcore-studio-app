@@ -1,0 +1,103 @@
+"""`routes/chat.py::chat` — `body.as_roles` (admin giả lập role để test chat, xem docstring
+`ChatRequest.as_roles`). Chỉ test 2 nhánh CHẶN (403 không-admin, 400 role-giả-lập-không-tồn-tại) —
+cả 2 raise TRƯỚC KHI chạm `interpreter.run()`, nên không cần dựng đủ KB/LLM thật, chỉ cần 1 recipe
+published hợp lệ để qua được `_load_published_recipe()` + `graph_lint()`."""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from uuid import UUID
+
+import pytest
+import pytest_asyncio
+from fastapi import HTTPException
+from studio_app import middleware
+from studio_app.core._db import Pool, close_pools, get_pool
+from studio_app.routes.chat import ChatRequest, chat
+from studio_workbench import create_recipe_d4
+from studio_workbench.tenant_wall import ResolvedContext
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _close_singleton_pools_after_test() -> AsyncIterator[None]:
+    yield
+    await close_pools()
+
+
+def _set_session(*, tenant_id: UUID, user: str, roles: list[str]) -> object:
+    session = ResolvedContext(tenant_id=tenant_id, user=user, roles=roles)
+    return middleware._request_session.set(session)
+
+
+async def _bind_tenant(conn: object, tenant_id: UUID) -> None:
+    await conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(tenant_id),))  # type: ignore[attr-defined]
+
+
+@asynccontextmanager
+async def _simulate_request_connection(tenant_id: UUID) -> AsyncIterator[None]:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await _bind_tenant(conn, tenant_id)
+        token = middleware._request_conn.set(conn)
+        try:
+            yield
+        finally:
+            middleware._request_conn.reset(token)
+
+
+async def _seed_tenant(admin_pool: Pool, name: str) -> UUID:
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("INSERT INTO core.tenants (name) VALUES (%s) RETURNING id", (name,))
+        row = await cur.fetchone()
+    assert row is not None
+    return UUID(str(row[0]))
+
+
+async def _seed_user(admin_pool: Pool, tenant_id: UUID, email: str, roles: list[str]) -> None:
+    async with admin_pool.connection() as conn:
+        await conn.execute(
+            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            (str(tenant_id), email, "not-a-real-hash", roles),
+        )
+
+
+async def _seed_published_recipe(admin_pool: Pool, tenant_id: UUID, agent_id: str) -> None:
+    recipe = create_recipe_d4(agent_id=agent_id, tenant_id=tenant_id)
+    async with admin_pool.connection() as conn, conn.transaction():
+        await _bind_tenant(conn, tenant_id)
+        await conn.execute(
+            "INSERT INTO wb.recipes (agent_id, tenant_id, recipe, version, status) "
+            "VALUES (%s, %s, %s::jsonb, 1, 'published')",
+            (agent_id, str(tenant_id), recipe.model_dump_json()),
+        )
+
+
+async def test_chat_as_roles_requires_admin(admin_pool: Pool) -> None:
+    tenant_id = await _seed_tenant(admin_pool, "chat-as-roles-probe-a")
+    await _seed_user(admin_pool, tenant_id, "employee@acme.com", ["hr"])
+    await _seed_published_recipe(admin_pool, tenant_id, "agent-as-roles-a")
+
+    token = _set_session(tenant_id=tenant_id, user="employee@acme.com", roles=["hr"])
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            async with _simulate_request_connection(tenant_id):
+                await chat("agent-as-roles-a", ChatRequest(message="hi", as_roles=["hr"]))
+        assert exc_info.value.status_code == 403
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+
+async def test_chat_as_roles_rejects_unknown_section(admin_pool: Pool) -> None:
+    tenant_id = await _seed_tenant(admin_pool, "chat-as-roles-probe-b")
+    await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+    await _seed_published_recipe(admin_pool, tenant_id, "agent-as-roles-b")
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            async with _simulate_request_connection(tenant_id):
+                await chat("agent-as-roles-b", ChatRequest(message="hi", as_roles=["khong-ton-tai"]))
+        assert exc_info.value.status_code == 400
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]

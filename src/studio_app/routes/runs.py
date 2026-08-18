@@ -26,8 +26,9 @@ from studio_kb.trace_reader import PgTraceReader, render_timeline, walk_from_dag
 from studio_workbench.builder import create_dynamic_recipe
 from studio_workbench.validator import graph_lint
 
+from studio_app.authz import fetch_fresh_identity, require_admin
 from studio_app.core._db import get_pool
-from studio_app.middleware import get_request_session
+from studio_app.middleware import get_request_connection, get_request_session
 from studio_app.obs.trace_writer import PgTraceWriter
 from studio_app.providers.factory import CallistoEmbedding, build_llm
 
@@ -68,6 +69,13 @@ class RunResponse(BaseModel):
 @router.post("", response_model=RunResponse)
 async def create_run(body: RunRequest) -> RunResponse:
     session = get_request_session()
+
+    # Gate role-gap đã phát hiện (trước bản vá này, BẤT KỲ tài khoản đã đăng nhập nào — kể cả
+    # employee chỉ có role nội dung, không "admin" — gọi thẳng được route này qua API dù UI không
+    # hiện nút Test cho họ). `require_admin` tra roles TƯƠI từ DB, không tin `session.roles` (JWT)
+    # — cùng nguyên tắc `routes/admin.py` đã dùng xuyên suốt.
+    identity = await fetch_fresh_identity(get_request_connection(), session.user)
+    require_admin(identity.roles)
 
     try:
         nodes = [Node.model_validate(n) for n in body.nodes]
