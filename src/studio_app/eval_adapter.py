@@ -150,15 +150,19 @@ class EngineAgentRunner:
         không phải một người dùng thật; nói dối chỗ này sẽ làm trace khó truy nguồn.
 
         GRAPH-LINT-CONTRACT (kit#129 item 3, thẩm định VinSOC finding C / DEC-A): hàm này KHÔNG tự
-        gọi `graph_lint()`. An toàn hôm nay vì `certified_recipe()` ở trên chỉ có hai nhánh: (a) trả
-        `self._recipe` — recipe được tiêm ở constructor — NGUYÊN VẸN, nhưng caller sản xuất DUY NHẤT
-        trong production (`routes/publish.py::_evaluate`) hiện KHÔNG truyền `recipe=` (đó chính là
-        `kit#127`, còn mở, khác việc đang đóng ở đây) nên nhánh này chưa từng chạy thật; hoặc (b) tự
+        gọi `graph_lint()`. `certified_recipe()` ở trên có hai nhánh: (a) trả `self._recipe` —
+        recipe được tiêm ở constructor — NGUYÊN VẸN; caller sản xuất DUY NHẤT trong production
+        (`routes/publish.py::_evaluate`) giờ ĐÃ truyền `recipe=` (`kit#127` đóng ở review `app#26`
+        ⛔ — trước đó nhánh này chưa từng chạy thật, KHÔNG truyền, khiến recipe được CHẤM khác hẳn
+        recipe được PUBLISH), và an toàn vì `_evaluate` gọi `graph_lint(recipe)` NGAY TRƯỚC khi dựng
+        `EngineAgentRunner(recipe=recipe, ...)`, đúng tiền điều kiện dòng dưới đòi hỏi; hoặc (b) tự
         dựng `create_recipe_d4(...)` — một recipe cố định, KHÔNG bắt nguồn từ `nodes`/`edges` người
-        dùng gửi lên, nên không có DAG chưa-kiểm nào của người dùng chạm tới `interpreter.run()` qua
-        đường này. Ai đóng `kit#127` bằng cách truyền `recipe=` canvas thật vào constructor PHẢI giữ
-        `graph_lint(recipe)` ở `_evaluate` chạy TRƯỚC dòng đó — `tests/test_graph_lint_before_interpreter_run.py`
-        đang allowlist hàm này theo tên; đọc lại docstring bài test đó trước khi đổi hợp đồng này."""
+        dùng gửi lên (đường còn lại, dùng khi caller không tiêm `recipe=`, ví dụ eval-harness chạy
+        rời khỏi route thật), nên không có DAG chưa-kiểm nào của người dùng chạm tới
+        `interpreter.run()` qua đường này. Đổi thứ tự 2 lệnh gọi đó ở `_evaluate` (graph_lint sau
+        khi dựng runner, thay vì trước) làm mất tiền điều kiện này —
+        `tests/test_graph_lint_before_interpreter_run.py` đang allowlist hàm này theo tên; đọc lại
+        docstring bài test đó trước khi đổi hợp đồng này."""
         base = self.certified_recipe(agent_id=agent_id, tenant_id=tenant_id, section_roles=section_roles)
         recipe = with_query(base, query)
         session_context = resolve_session({"tenant_id": tenant_id, "user": "eval-harness", "roles": section_roles})

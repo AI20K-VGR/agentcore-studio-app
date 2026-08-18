@@ -5,23 +5,26 @@
     6 · verdict PASS → publish thành công
     7 · verdict FAIL → chặn publish + rollback
 
-Đọc thứ tự hai cổng trong `publish()`:
+Đọc thứ tự 4 cổng trong `publish()` (`studio_workbench.publish`, neo bằng TÊN ĐIỀU KIỆN chứ không
+phải số dòng — số dòng trôi mỗi lần file đó đổi, và đã từng trôi thật ở chính docstring này, xem
+review `app#26` 🟡):
 
-    :72  if scorecard.recipe_hash is None:                    raise ValueError(… "recipe_hash" …)
-    :7x  if scorecard.recipe_hash != recipe_hash(recipe):      raise ValueError(… "chứng nhận một recipe KHÁC" …)
-    :78  if scorecard.gate.verdict == "FAIL":   await _reassert_last_published(…)   ← rollback ở ĐÂY
-    :79                                         raise ValueError(… "verdict" …)
+    1. graph_lint(recipe)                              raise ValueError(… lỗi graph-lint …)
+    2. scorecard.recipe_hash is None                    raise ValueError(… "recipe_hash" …)
+    3. scorecard.recipe_hash != recipe_hash(recipe)     raise ValueError(… "chứng nhận một recipe KHÁC" …)
+    4. scorecard.gate.verdict == "FAIL"                 await _reassert_last_published(…) rồi
+                                                          raise ValueError(… "verdict" …)
 
 **`DEC-03` giờ ĐÃ có producer** (`studio_workbench.publish.recipe_hash()`, review `workbench#27`) —
-3 bài dưới đây từng ghim trạng thái "trước-producer" (mọi `publish()` đều bị chặn ở cổng `:72` vì
+3 bài dưới đây từng ghim trạng thái "trước-producer" (mọi `publish()` đều bị chặn ở cổng 2 vì
 `compute_scorecard` mặc định `recipe_hash=None`, nên bước 6/7 của money-shot chưa từng chạy tới
 `gate.verdict` thật). Giờ caller (bài test, và thật hơn là `apps/studio/routes/publish.py`) TỰ băm
-`recipe_hash(recipe)` rồi truyền vào — cổng `:72`/`:7x` đi qua được, và cổng `:78` (verdict) mới là
-thứ quyết định bước 6/7, đúng ý nghĩa gốc của money-shot.
+`recipe_hash(recipe)` rồi truyền vào — cổng 2/3 đi qua được, và cổng 4 (verdict) mới là thứ quyết
+định bước 6/7, đúng ý nghĩa gốc của money-shot.
 
 Bước 7 là ô dễ tuyên bố nhất của cả gate (*"đã chặn đấy thôi"*), và trước bản vá này nó xanh vì một
-lý do khác với lý do được demo (chặn ở `:72`, không phải `:78`). File này là chỗ phân biệt hai lý do
-đó bằng phép đo — vẫn giữ nguyên giá trị dù `:72` giờ đã đi qua được, vì nó khoá đúng **cổng nào
+lý do khác với lý do được demo (chặn ở cổng 2, không phải cổng 4). File này là chỗ phân biệt hai lý
+do đó bằng phép đo — vẫn giữ nguyên giá trị dù cổng 2 giờ đã đi qua được, vì nó khoá đúng **cổng nào
 thật sự quyết định** bước 7, không phải chỉ "có bị chặn hay không".
 
 ## Vì sao ba bài này KHÔNG trùng `workbench/tests/test_publish.py`
@@ -41,9 +44,9 @@ Nhưng 6/8 bài cổng của SWE chạy trên `FakeConn` (double in-memory), cò
 
 ## `DEC-D20-02` — hash ở đây DÙNG PRODUCER THẬT từ workbench
 
-Đã có producer `recipe_hash` thật từ `studio_workbench.publish`, cổng `:72` và `:78`
-bây giờ sẽ đối chiếu hash thật sự. Ta dùng `_recipe_hash` để băm trực tiếp `Recipe` ở
-bài test để pass cổng validate, chứng minh đường publish chạy trót lọt khi hash khớp.
+Đã có producer `recipe_hash` thật từ `studio_workbench.publish`, cổng 2 (`is None`) và cổng 3
+(`!= recipe_hash(recipe)`) bây giờ sẽ đối chiếu hash thật sự. Ta dùng `_recipe_hash` để băm trực
+tiếp `Recipe` ở bài test để qua được 2 cổng đó, chứng minh đường publish chạy trót lọt khi hash khớp.
 
 **Không uốn run thật của T3 để ra `PASS`** (`DEC-D20-03` ranh giới 4): nhánh `PASS` ở bài 3 là một
 `Scorecard` dựng từ `CaseResult` fixture có nhãn, không phải một run được hiệu chỉnh cho đẹp.
@@ -116,14 +119,15 @@ async def _rows(pool: Any, agent_id: str) -> list[tuple[int, str]]:
 async def test_bai1_scorecard_hom_nay_bi_chan_o_cong_recipe_hash(pool: Any) -> None:
     """**Bài 1 — ghim trạng thái hôm nay để nó không trôi trong im lặng.**
 
-    `compute_scorecard` **không truyền** `recipe_hash` ⇒ `None` ⇒ `publish()` từ chối ở cổng `:72`,
-    **trước khi đọc verdict**. Đây là lý do bước 6 của money-shot không chạy được hôm nay.
+    `compute_scorecard` **không truyền** `recipe_hash` ⇒ `None` ⇒ `publish()` từ chối ở cổng
+    `recipe_hash is None`, **trước khi đọc verdict**. Đây là lý do bước 6 của money-shot không chạy
+    được hôm nay.
 
     Assert **chuỗi thông điệp**, không chỉ `pytest.raises(ValueError)`: cả hai cổng raise **cùng một
     kiểu**, nên một bài chỉ bắt kiểu sẽ **xanh với cả hai lý do** — đúng lớp lỗi cả tuần đi tìm, và
     đúng chỗ ô demo bước 7 đang xanh vì lý do sai.
 
-    `verdict="PASS"` có chủ đích: nó chứng minh cổng `:72` chặn **kể cả khi verdict hoàn toàn đạt**,
+    `verdict="PASS"` có chủ đích: nó chứng minh cổng `recipe_hash is None` chặn **kể cả khi verdict hoàn toàn đạt**,
     tức thứ chặn thật sự là `recipe_hash` chứ không phải chất lượng bản build. Bài này KHÔNG bị ảnh
     hưởng bởi việc `DEC-03` có producer hay không — nó cố tình gọi `_scorecard(recipe_hash=None,
     ...)`, tức tự khai KHÔNG truyền giá trị, nên vẫn ghim đúng gate `is None` bất kể producer đã
@@ -152,17 +156,18 @@ async def test_bai1_scorecard_hom_nay_bi_chan_o_cong_recipe_hash(pool: Any) -> N
 async def test_bai2_verdict_fail_chan_va_rollback_that_su_chay(pool: Any) -> None:
     """**Bài 2 — bước 7 money-shot, lần đầu chạy ĐÚNG LÝ DO.**
 
-    `recipe_hash(recipe)` băm THẬT, khớp đúng recipe đang publish ⇒ qua được cổng `:72`/`:7x` ⇒
-    cổng `:78` mới là thứ chặn, và `_reassert_last_published` (`:79`) **thật sự chạy**.
+    `recipe_hash(recipe)` băm THẬT, khớp đúng recipe đang publish ⇒ qua được cổng `recipe_hash is
+    None`/`recipe_hash != recipe_hash(recipe)` ⇒ cổng `verdict == "FAIL"` mới là thứ chặn, và
+    `_reassert_last_published` **thật sự chạy**.
 
     Đo rollback bằng **dữ liệu trong `wb.recipes`**, không bằng *"không có row mới"*: seed v1
     `published` trước, rồi thử publish một bản `FAIL`. Nếu chỉ assert *"không có v2"* thì một cài đặt
     `return` sớm trước `_reassert_last_published` cũng xanh — mà đó chính xác là hành vi hôm nay đang
-    xảy ra vì cổng `:72` bắn trước. Assert v1 vẫn `published` là thứ phân biệt *"chặn rồi bỏ đấy"*
-    với *"chặn rồi khôi phục bản đã biết là tốt"*.
+    xảy ra vì cổng `recipe_hash is None` bắn trước. Assert v1 vẫn `published` là thứ phân biệt
+    *"chặn rồi bỏ đấy"* với *"chặn rồi khôi phục bản đã biết là tốt"*.
 
     Hai assert chuỗi, đối xứng với bài 1: thông điệp phải nhắc **lý do verdict** và **không** được
-    nhắc `recipe_hash`. `match=` neo vào `gate.verdict='FAIL'` — cụm chỉ có ở thông điệp cổng `:78` —
+    nhắc `recipe_hash`. `match=` neo vào `gate.verdict='FAIL'` — cụm chỉ có ở thông điệp cổng verdict —
     chứ không vào từ `verdict` trần: `publish()` nội suy `agent_id` vào thông điệp, nên một
     `agent_id` mang tên nhánh sẽ làm `match=` khớp vào chính cái tên mình đặt. Đo được: bản đầu của
     bài này đặt `agent_id="gate2-bai2-verdict-fail"` và `match="verdict"` **vẫn khớp** khi gieo
@@ -203,7 +208,7 @@ async def test_bai3_verdict_pass_publish_thanh_cong(pool: Any) -> None:
     được *"cổng chặn đúng"* với *"cổng chặn tất"*.
 
     Cũng đo được `DEC-D20-02` đi trọn vòng: chuỗi hash do caller đưa vào `compute_scorecard` là
-    đúng chuỗi `publish()` đọc ở `:72`/`:7x` — không có ai băm lại ở giữa."""
+    đúng chuỗi `publish()` đọc ở 2 cổng `recipe_hash` — không có ai băm lại ở giữa."""
     agent_id = "gate2-case3-published"
     recipe = _recipe(agent_id)
     r_hash = _recipe_hash(recipe)
