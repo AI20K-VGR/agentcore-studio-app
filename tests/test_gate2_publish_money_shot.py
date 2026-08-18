@@ -39,12 +39,11 @@ Nhưng 6/8 bài cổng của SWE chạy trên `FakeConn` (double in-memory), cò
 3. **RLS đang bật trên `wb.recipes`** ⇒ `publish()` phải chạy trong transaction có
    `app.tenant_id`. Một double bỏ qua tầng đó.
 
-## `DEC-D20-02` — hash ở đây là **stand-in trong fixture**, có nhãn, không phải producer
+## `DEC-D20-02` — hash ở đây DÙNG PRODUCER THẬT từ workbench
 
-`_STAND_IN` cố tình **không** phải một hex-digest hợp lệ. Nó đủ để chứng minh cổng `:78` phân biệt
-được `PASS`/`FAIL`, và **không** giả vờ là một producer. Chừng nào ask ① câu 🅐 (*"recipe NÀO được
-chứng nhận cho một run N case"* — `eval_adapter` dựng recipe **mỗi case** ⇒ golden-30 sinh 30 recipe)
-chưa có đáp án, một hash đi từ đường eval không mang nghĩa, bất kể băm bằng gì.
+Đã có producer `recipe_hash` thật từ `studio_workbench.publish`, cổng `:72` và `:78`
+bây giờ sẽ đối chiếu hash thật sự. Ta dùng `_recipe_hash` để băm trực tiếp `Recipe` ở
+bài test để pass cổng validate, chứng minh đường publish chạy trót lọt khi hash khớp.
 
 **Không uốn run thật của T3 để ra `PASS`** (`DEC-D20-03` ranh giới 4): nhánh `PASS` ở bài 3 là một
 `Scorecard` dựng từ `CaseResult` fixture có nhãn, không phải một run được hiệu chỉnh cho đẹp.
@@ -62,12 +61,9 @@ from studio_contracts import CaseResult, Recipe, Scorecard
 from studio_evalhub.compute import compute_scorecard
 from studio_workbench import create_recipe_d4
 from studio_workbench.publish import publish
+from studio_workbench.publish import recipe_hash as _recipe_hash
 
 ANKOR_ID = UUID("a0000000-0000-0000-0000-000000000001")
-
-# Nhãn rõ ràng, và chuỗi tự khai chính nó. `DEC-D20-02`: evalhub NHẬN giá trị, không tự dẫn xuất —
-# nên thứ duy nhất trung thực hôm nay là một stand-in có nhãn, không phải một digest trông-như-thật.
-_STAND_IN = "stand-in-not-a-producer-see-DEC-03"
 
 _THRESHOLD_SUCCESS = 0.9
 _THRESHOLD_CITATION = 0.95
@@ -172,19 +168,21 @@ async def test_bai2_verdict_fail_chan_va_rollback_that_su_chay(pool: Any) -> Non
     `M-G4`, tức cổng đã chặn sai chỗ mà `pytest.raises` không hề thấy. Thứ giết `M-G4` là assert phủ
     định bên dưới, không phải `match=`."""
     agent_id = "gate2-case2-blocked-branch"
+    recipe = _recipe(agent_id)
+    r_hash = _recipe_hash(recipe)
 
     # Seed: một bản PASS đã publish — rollback cần một thứ để khôi phục VỀ.
     async with pool.connection() as conn, conn.transaction():
         await _bind_tenant(conn, ANKOR_ID)
-        await publish(_recipe(agent_id), _scorecard(verdict="PASS", recipe_hash=_STAND_IN, agent_id=agent_id), conn)
+        await publish(recipe, _scorecard(verdict="PASS", recipe_hash=r_hash, agent_id=agent_id), conn)
     assert await _rows(pool, agent_id) == [(1, "published")]
 
     with pytest.raises(ValueError, match=r"gate\.verdict='FAIL'") as bat:
         async with pool.connection() as conn, conn.transaction():
             await _bind_tenant(conn, ANKOR_ID)
             await publish(
-                _recipe(agent_id),
-                _scorecard(verdict="FAIL", recipe_hash=_STAND_IN, agent_id=agent_id),
+                recipe,
+                _scorecard(verdict="FAIL", recipe_hash=r_hash, agent_id=agent_id),
                 conn,
             )
 
@@ -206,11 +204,13 @@ async def test_bai3_verdict_pass_publish_thanh_cong(pool: Any) -> None:
     Cũng đo được `DEC-D20-02` đi trọn vòng: chuỗi stand-in do caller đưa vào `compute_scorecard` là
     chuỗi `publish()` đọc ở `:72` — không có ai băm lại ở giữa."""
     agent_id = "gate2-case3-published"
-    scorecard = _scorecard(verdict="PASS", recipe_hash=_STAND_IN, agent_id=agent_id)
-    assert scorecard.recipe_hash == _STAND_IN, "giá trị caller đưa phải đi thẳng, không bị dẫn xuất lại"
+    recipe = _recipe(agent_id)
+    r_hash = _recipe_hash(recipe)
+    scorecard = _scorecard(verdict="PASS", recipe_hash=r_hash, agent_id=agent_id)
+    assert scorecard.recipe_hash == r_hash, "giá trị caller đưa phải đi thẳng, không bị dẫn xuất lại"
 
     async with pool.connection() as conn, conn.transaction():
         await _bind_tenant(conn, ANKOR_ID)
-        await publish(_recipe(agent_id), scorecard, conn)
+        await publish(recipe, scorecard, conn)
 
     assert await _rows(pool, agent_id) == [(1, "published")]
