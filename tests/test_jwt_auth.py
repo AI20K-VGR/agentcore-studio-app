@@ -13,7 +13,7 @@ import jwt as pyjwt
 import pytest
 from loguru import logger as loguru_logger
 from studio_app import jwt_auth
-from studio_app.settings import Settings
+from studio_app.settings import LlmProvider, Settings
 from studio_workbench.tenant_wall import ResolvedContext
 
 _TENANT_ID = UUID("a0000000-0000-0000-0000-000000000001")
@@ -25,6 +25,7 @@ def _settings(*, secret: str = "test-secret-at-least-32-bytes-long", expire_minu
         database_url_admin="postgresql://unused/unused",
         jwt_secret=secret,
         jwt_expire_minutes=expire_minutes,
+        llm_provider=LlmProvider.GEMINI,
     )
 
 

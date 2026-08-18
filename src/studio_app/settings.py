@@ -3,10 +3,20 @@ flags). `.env.example` at the repo root documents every field this class reads."
 
 from __future__ import annotations
 
+from enum import StrEnum
 from functools import lru_cache
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class LlmProvider(StrEnum):
+    """Closed vocabulary cho provider LLM thật app#19 sẽ chọn — cùng cap cứng của `NodeType`
+    (`packages/contracts/src/studio_contracts/nodes.py`): thêm giá trị thứ 3 là quyết định có
+    chủ đích, không phải string tự do."""
+
+    OPENAI = "openai"
+    GEMINI = "gemini"
 
 
 class Settings(BaseSettings):
@@ -53,6 +63,13 @@ class Settings(BaseSettings):
     # đường né rate-limit bằng cách client tự set header giả trực tiếp (KHÔNG qua proxy nào).
     trust_x_forwarded_for: bool = False
 
+    # Discriminator provider thật (app#19) — required, KHÔNG `Field(default=...)`: cùng lý lẽ
+    # `jwt_secret` ở trên (dòng 29-31), thiếu biến môi trường phải raise rõ ràng lúc khởi động,
+    # không được đoán/rơi về nhánh mặc định nào. Một default (vd luôn rơi về Gemini khi thiếu
+    # biến) sẽ ẩn lỗi cấu hình triển khai thật đến tận lúc gọi LLM mới lộ ra — trái với "giá trị
+    # lạ phải ồn" (cùng lý lẽ `_VOCABULARY` của `agreement.py:64`, `DEC-D18-01`).
+    llm_provider: LlmProvider
+    openai_api_key: str | None = None
     gemini_api_key: str | None = None
 
     langfuse_public_key: str | None = None

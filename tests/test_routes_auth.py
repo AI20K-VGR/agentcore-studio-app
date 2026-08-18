@@ -20,7 +20,7 @@ from studio_app import jwt_auth, middleware, rate_limit
 from studio_app.core._db import Pool, close_pools, get_pool
 from studio_app.jwt_auth import hash_password
 from studio_app.routes.auth import LoginRequest, login
-from studio_app.settings import Settings
+from studio_app.settings import LlmProvider, Settings
 
 
 def _fake_request(client_host: str = "test-client") -> Request:
@@ -73,6 +73,7 @@ def _settings() -> Settings:
         database_url="postgresql://unused/unused",
         database_url_admin="postgresql://unused/unused",
         jwt_secret="test-secret-routes-auth-at-least-32-bytes",
+        llm_provider=LlmProvider.GEMINI,
     )
 
 

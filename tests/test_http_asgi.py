@@ -26,7 +26,7 @@ from studio_app import jwt_auth, rate_limit
 from studio_app.app import create_app
 from studio_app.core._db import Pool, close_pools
 from studio_app.jwt_auth import hash_password
-from studio_app.settings import Settings
+from studio_app.settings import LlmProvider, Settings
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -50,6 +50,7 @@ def _settings() -> Settings:
         database_url="postgresql://unused/unused",
         database_url_admin="postgresql://unused/unused",
         jwt_secret="test-secret-http-asgi-at-least-32-bytes",
+        llm_provider=LlmProvider.GEMINI,
     )
 
 
