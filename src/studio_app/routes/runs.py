@@ -44,7 +44,22 @@ class RunRequest(BaseModel):
     scope: str
     nodes: list[dict[str, Any]]
     edges: list[dict[str, Any]]
-    golden_set_ref: str = "callisto-golden-30-v1"
+    # PR-4 của `plans/real_embedding_plan.md` (lane AIE-2): mặc định chuyển sang bộ **2.0**.
+    #
+    # Đây là chỗ DUY NHẤT production chọn bộ golden — `apps/web` gửi field này (recipe mẫu
+    # `sample.ts`) nên UI ghi đè được, còn mọi caller không khai thì rơi vào đây.
+    #
+    # Vì sao đổi: bộ 1.0 chấm trên corpus 1.0 (140 chunk) mà `packages/kb` đã cutover sang corpus
+    # 2.0 (800 chunk, `kb#32`) và sang embedding thật 2048 chiều (`kb#43`). Giữ 1.0 là chấm một
+    # thước đo không còn khớp dữ liệu production. Số đo ở `evalhub#31` trên đúng bộ 2.0 + embedding
+    # thật: `success_rate 0.9889` · `citation_accuracy 1.0000` · verdict PASS (3/3 lượt), so với
+    # `0.4333`/`0.3636` của 1.0 + `derive_vector` dim-8.
+    #
+    # **Điều kiện land:** phải sau `app#30` (nối EmbeddingService thật vào 4 call-site). Trước đó
+    # corpus là vector Gemini còn query vẫn nhúng bằng `derive_vector` ⇒ hai không gian khác nhau,
+    # đo được `recall@3 = 1/22` (ngẫu nhiên) và KHÔNG lỗi nào nổ. Đổi ref trước app#30 = chấm câu
+    # hỏi 2.0 trên retrieval lệch không gian.
+    golden_set_ref: str = "callisto-2.0-golden-30-v1"
     # `ge=0.0, le=1.0` (kit#129 §3.1, vấn đề A, VinSOC AV-203052) — trước bản vá: client gửi
     # `success_threshold: -999` được chấp nhận thẳng, mọi agent "đạt" bất kể chất lượng thật.
     # Ràng buộc CHÍNH nằm ở contract (`ScorecardThreshold`, `create_dynamic_recipe` sẽ raise khi
