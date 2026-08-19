@@ -58,8 +58,6 @@ from studio_workbench import create_recipe_d4
 from studio_workbench.recipe_ops import with_query, without_query
 from studio_workbench.tenant_wall import resolve_session
 
-from studio_app.providers.factory import build_tool_dispatch
-
 
 def _llm_answer(final_state: dict[str, object]) -> dict[str, object]:
     """Nhặt output node llm-step từ final_state (không hardcode node id — tìm dict có key 'answer',
@@ -179,7 +177,6 @@ class EngineAgentRunner:
             embedding=self._embedding,
             trace_writer=self._trace_writer,
             session_context=session_context,
-            tool_dispatch=build_tool_dispatch(recipe, self._kb_search, session_context),
         )
         llm_out = _llm_answer(result.final_state)
         raw_citations = llm_out.get("citations")
