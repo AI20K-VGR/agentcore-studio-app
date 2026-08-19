@@ -111,6 +111,17 @@ class Settings(BaseSettings):
     openai_model: str | None = None
     gemini_api_key: str | None = None
 
+    # `GatewayEmbedding` (app#30, providers/embeddings.py) — OpenRouter, model
+    # "google/gemini-embedding-001" @2048. Khuôn optional-kiểm-tại-use-site giống `openai_api_key`/
+    # `gemini_api_key` ở trên (KHÔNG khuôn required-no-default như `jwt_secret`/`llm_provider`):
+    # đường mặc định `use_fake_providers=True` không cần key và phải chạy được offline (INV-4).
+    #
+    # CÙNG một key OpenRouter có thể đang nằm ở `openai_api_key` (LLM, qua
+    # `openai_base_url=https://openrouter.ai/api/v1` — xem `:110`). Hai biến là CỐ Ý: embedding là
+    # seam riêng của AIE-1 (`.env.example`), đừng gộp — `build_embedding()` (Phase 4) chỉ đọc field
+    # này, không bao giờ đọc `openai_api_key`.
+    openrouter_api_key: str | None = None
+
     langfuse_public_key: str | None = None
     langfuse_secret_key: str | None = None
     langfuse_host: str | None = None
