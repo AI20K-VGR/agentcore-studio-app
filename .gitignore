@@ -11,3 +11,6 @@ __pycache__/
 .env
 .env.*
 # uv.lock sống ở repo cha (agentcore-studio-kit), KHÔNG ở submodule này
+
+# `LLMJudge` cap/cache state khi dev override đường dẫn về repo-local (`apps/studio#20`).
+state/

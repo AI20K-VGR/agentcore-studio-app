@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -28,6 +29,28 @@ class Settings(BaseSettings):
     database_url_admin: str
 
     enable_tracing: bool = False
+
+    # `LLMJudge` state (`apps/studio#20`) — 2 đường, cùng lớp "không nhạy cảm nên default chấp
+    # nhận được" như `enable_tracing`/`use_fake_providers`, khác lớp `jwt_secret`/`llm_provider`
+    # vốn cố ý required-no-default.
+    #
+    # **TUYỆT ĐỐI, không tương đối** — và đây là chỗ đã suy sai một lần rồi. Đường tương đối
+    # (`state/judge-cap.json`) giải theo **CWD**, nên chạy từ hai thư mục khác nhau trên CÙNG một
+    # máy cho **hai** file cap ⇒ `cap ≤100/ngày` (`INV-4`) thành `≤200` mà không dòng code nào sai.
+    # Đó là biến thể thứ ba của cùng một lớp lỗi: đồng thời (`DEC-D23-02`), redeploy (mất volume),
+    # và giờ là CWD. Cũng KHÔNG neo vào vị trí module như `_GOLDEN_SET_DIR` — trò đó đang hỏng
+    # trong image (`kit#181`): `--no-editable` đặt package vào `site-packages` nên đi ngược 3 cấp
+    # là đi lố.
+    #
+    # `/app` là `WORKDIR` của image, và `docker-compose.yml` (repo kit) mount
+    # `studio_judge_state:/app/state` để `cap_path` **sống qua redeploy** — thiếu volume thì mỗi
+    # `up -d --build` reset cap về 0 trong ngày, đúng thứ counter-trong-file sinh ra để chặn.
+    #
+    # Dev chạy ngoài container PHẢI override qua env (xem `.env.example` ở gốc kit): không override
+    # thì lần gọi judge đầu ném `PermissionError` từ `_ghi_counter` — hàm đó nằm NGOÀI `try` trong
+    # `LLMJudge.judge()` nên nó thành 500 chưa bắt. Ồn ào, không im lặng.
+    judge_cache_path: Path = Path("/app/state/judge-cache.json")
+    judge_cap_path: Path = Path("/app/state/judge-cap.json")
     use_fake_providers: bool = True
 
     # JWT ký/verify identity (Kế hoạch 3) — `issue_token()` giờ CHỈ được gọi từ `routes/auth.py::login`
