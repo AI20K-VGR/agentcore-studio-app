@@ -47,7 +47,7 @@ from studio_kb.doc_factory import TENANT_IDS
 from studio_kb.static_search import StaticKbSearch
 
 _ROOT = __import__("pathlib").Path(__file__).resolve().parents[3]
-_GOLDEN_30 = _ROOT / "packages" / "kb" / "golden" / "callisto-golden-30-v1.yaml"
+_GOLDEN_30 = _ROOT / "packages" / "kb" / "src" / "studio_kb" / "golden" / "callisto-golden-30-v1.yaml"
 _REF = "callisto-golden-30-v1"
 _AGENT = "agent-callisto-d4"
 

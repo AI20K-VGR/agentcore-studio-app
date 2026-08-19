@@ -73,7 +73,15 @@ from studio_kb.doc_factory import TENANT_IDS, load_callisto
 from studio_kb.embeddings import derive_vector
 from studio_kb.postgres import KbIngest, PgKbSearch
 
-_GOLDEN_30 = Path(__file__).resolve().parents[3] / "packages" / "kb" / "golden" / "callisto-golden-30-v1.yaml"
+_GOLDEN_30 = (
+    Path(__file__).resolve().parents[3]
+    / "packages"
+    / "kb"
+    / "src"
+    / "studio_kb"
+    / "golden"
+    / "callisto-golden-30-v1.yaml"
+)
 _REF = "callisto-golden-30-v1"
 _AGENT = "agent-callisto-d4"
 
