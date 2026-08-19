@@ -33,6 +33,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import ValidationError
 from studio_contracts import Edge, Node, Recipe, Scorecard
 from studio_evalhub.harness import EvalHarness
+from studio_evalhub.judge import LLMJudge
 from studio_kb.doc_factory import TENANT_IDS
 from studio_kb.postgres import PgKbSearch
 from studio_workbench.builder import create_dynamic_recipe
@@ -47,6 +48,7 @@ from studio_app.middleware import get_request_connection, get_request_session
 from studio_app.obs.trace_writer import PgTraceWriter
 from studio_app.providers.factory import CallistoEmbedding, build_llm
 from studio_app.routes.runs import RunRequest
+from studio_app.settings import get_settings
 
 router = APIRouter(prefix="/api/agents", tags=["publish"])
 
@@ -110,6 +112,7 @@ async def _evaluate(agent_id: str, body: RunRequest, session: ResolvedContext) -
     # conn=get_request_connection())` dưới) — đúng, đó KHÔNG cộng thêm connection nào (tái dùng
     # connection middleware đã giữ), khác hẳn `get_pool()` ở đây.
     pool = await get_pool()
+    settings = get_settings()
     embedding = CallistoEmbedding()
     runner = EngineAgentRunner(
         kb_search=PgKbSearch(pool, embedding),
@@ -149,6 +152,24 @@ async def _evaluate(agent_id: str, body: RunRequest, session: ResolvedContext) -
             # chạy, và hash ở đây sẽ chứng nhận nhầm đối tượng dù bản thân phép so ở `publish()`
             # vẫn "khớp" một cách vô nghĩa).
             recipe_hash=recipe_hash(recipe),
+            # `apps/studio#20` — nhánh judge từng bị bỏ IM LẶNG: `EvalHarness.run` nhận `judge=`
+            # từ D18 (`kit#118`) nhưng đường production chưa bao giờ truyền, nên
+            # `if judge is not None and …` (`harness.py`) không bao giờ đúng. Không lỗi, không
+            # cảnh báo — chỉ là một tầng chấm chưa từng chạy.
+            #
+            # Judge dựng ở ĐÂY chứ không trong `studio_evalhub`: `DEC-D18-02` cấm `judge.py` đọc
+            # env hay dựng provider, và composition root là chỗ DUY NHẤT biết provider thật nào
+            # được dựng — cùng hình seam với `AgentRunner`.
+            #
+            # An toàn nhờ `evalhub#30` đã vào con trỏ TRƯỚC bản vá này: `_duoc_hoi_judge` chặn
+            # judge lật cổng `DEC-05` (`no-trace-no-proof`). Nối `judge=` khi cổng đó chưa có là
+            # bật một fail-open — case `events == []` mà `answer` chứa đúng cụm `expected` sẽ được
+            # judge cho PASS, tất định. Thứ tự đó là điều kiện, không phải sở thích.
+            judge=LLMJudge(
+                build_llm(),
+                cache_path=settings.judge_cache_path,
+                cap_path=settings.judge_cap_path,
+            ),
         )
     except ValueError as exc:
         # `load_golden_set` (evalhub) raise ValueError khi file không khớp `golden_set_ref` khai
