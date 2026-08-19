@@ -20,6 +20,7 @@ nếu bản mới có ÍT section hơn bản cũ, các `chunk_id` dư sẽ mồ 
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 from uuid import UUID
@@ -72,6 +73,13 @@ async def upload_document(
             raise HTTPException(
                 status_code=400, detail="superadmin phải khai tenant_id để upload tài liệu cho công ty nào"
             )
+        # Parse UUID TRƯỚC khi query — review app#27 (dholmes0207): parse SAU query để chuỗi thô
+        # (vd "abc") đi thẳng vào `WHERE id = %s` trên cột UUID, psycopg raise lỗi cú pháp CHƯA BẮT
+        # ⇒ 500 thay vì 400 mà nhánh except bên dưới chuẩn bị sẵn.
+        try:
+            tenant_uuid = UUID(tenant_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"tenant_id không phải UUID hợp lệ: {tenant_id!r}") from exc
         target_tenant_id = tenant_id
         cur = await conn.execute(
             "SELECT 1 FROM core.tenants WHERE id = %s AND name != '__system__'",
@@ -83,11 +91,7 @@ async def upload_document(
         if tenant_id is not None and tenant_id != str(identity.tenant_id):
             raise HTTPException(status_code=403, detail="company-admin chỉ upload được cho tenant mình")
         target_tenant_id = str(identity.tenant_id)
-
-    try:
-        tenant_uuid = UUID(target_tenant_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"tenant_id không phải UUID hợp lệ: {target_tenant_id!r}") from exc
+        tenant_uuid = identity.tenant_id
 
     valid_section_names = await fetch_tenant_section_names(conn, target_tenant_id)
     if section_role not in valid_section_names:
@@ -99,9 +103,22 @@ async def upload_document(
     if not file.filename or not file.filename.lower().endswith(".md"):
         raise HTTPException(status_code=422, detail="chỉ chấp nhận file .md")
 
-    raw = await file.read()
-    if len(raw) > _MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=422, detail=f"file vượt quá giới hạn {_MAX_UPLOAD_BYTES} byte")
+    # Đọc theo chunk có chặn, huỷ NGAY khi vượt hạn mức — review app#27 (dholmes0207): đọc hết
+    # `file.read()` vào bộ đệm rồi mới so `len(raw)` khiến `_MAX_UPLOAD_BYTES` chỉ là một phép
+    # validate SAU khi đã nhận trọn (starlette spool ra đĩa khi vượt ngưỡng), không phải hàng rào —
+    # body vài GB vẫn được nhận hết trước khi bị 422. Không dựa vào `file.size`/`Content-Length`
+    # (client có thể không gửi, hoặc sai với chunked transfer encoding) — đọc dần là hàng rào thật.
+    pieces: list[bytes] = []
+    total = 0
+    while True:
+        piece = await file.read(64 * 1024)
+        if not piece:
+            break
+        total += len(piece)
+        if total > _MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=422, detail=f"file vượt quá giới hạn {_MAX_UPLOAD_BYTES} byte")
+        pieces.append(piece)
+    raw = b"".join(pieces)
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -110,8 +127,14 @@ async def upload_document(
     # Tiền tố `tenant_uuid.hex` bắt buộc: `chunk_id` (`{doc_id}#c{n}`) là PRIMARY KEY toàn bảng
     # `kb.chunks`, KHÔNG tenant-scoped — 2 tenant cùng `doc_id` sẽ `ON CONFLICT DO UPDATE` đè lẫn
     # nhau (`postgres.py::_UPSERT`). Không dùng tên hiển thị công ty (có thể trùng giữa 2 tenant).
+    # Hậu tố hash 8-hex của TÊN FILE GỐC (trước `_slugify`) — review app#27 (dholmes0207): 2 tên
+    # file khác nhau (vd "HR-Policy.md" / "hr policy.md", hay tên tiếng Việt có dấu bị `_slugify`
+    # gộp hết thành "-") có thể slugify ra CÙNG chuỗi, khiến tài liệu sau ghi đè im lặng tài liệu
+    # trước qua `ON CONFLICT DO UPDATE` dù là 2 tài liệu khác nhau. Hash bám theo tên gốc nên cùng
+    # 1 file re-upload nguyên tên vẫn ra đúng `doc_id` cũ (idempotent), chỉ tên khác mới tách riêng.
     stem = Path(file.filename).stem
-    doc_id = f"{tenant_uuid.hex}-{_slugify(section_role)}-{_slugify(stem)}"
+    name_hash = hashlib.sha256(file.filename.encode("utf-8")).hexdigest()[:8]
+    doc_id = f"{tenant_uuid.hex}-{_slugify(section_role)}-{_slugify(stem)}-{name_hash}"
 
     pipeline = KbPipeline(await get_pool(), CallistoEmbedding())
     try:
