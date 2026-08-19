@@ -116,9 +116,28 @@ class GatewayEmbedding:
 
         missing_texts = [t for t in unique_texts if key_by_text[t] not in vector_by_key]
         if missing_texts:
-            fetched = await self._fetch_all(missing_texts)
+            await self._fetch_and_cache(missing_texts, pool, key_by_text, vector_by_key)
+
+        return [vector_by_key[key_by_text[t]] for t in texts]
+
+    async def _fetch_and_cache(
+        self,
+        texts: list[str],
+        pool: Pool,
+        key_by_text: dict[str, str],
+        vector_by_key: dict[str, list[float]],
+    ) -> None:
+        """Gọi API theo lô ≤90, ghi cache NGAY SAU MỖI LÔ THÀNH CÔNG — không đợi mọi lô xong rồi
+        mới ghi (review PR#32, Important #1). `_BATCH`'s docstring hứa "một lần đứt mạng chỉ mất
+        một lô" — trước bản vá này lời hứa đó SAI: `embed()` gọi hết mọi lô rồi mới ghi cache MỘT
+        LẦN, nên lô thứ N/M lỗi làm mất TOÀN BỘ (N-1) lô đã trả tiền gọi API trước đó, không chỉ
+        lô cuối. Ghi ngay sau mỗi lô giữ đúng lời hứa: một lần đứt giữa chừng chỉ mất lô đang chạy
+        dở, các lô trước đã persist xong."""
+        for start in range(0, len(texts), _BATCH):
+            batch = texts[start : start + _BATCH]
+            vectors = await self._call_api(batch)
             async with pool.connection() as conn:
-                for text, vector in zip(missing_texts, fetched, strict=True):
+                for text, vector in zip(batch, vectors, strict=True):
                     cache_key_value = key_by_text[text]
                     vector_by_key[cache_key_value] = vector
                     await conn.execute(
@@ -126,15 +145,6 @@ class GatewayEmbedding:
                         "VALUES (%s, %s, %s, %s::vector) ON CONFLICT (cache_key) DO NOTHING",
                         (cache_key_value, self._model, self._dim, _vector_literal(vector)),
                     )
-
-        return [vector_by_key[key_by_text[t]] for t in texts]
-
-    async def _fetch_all(self, texts: list[str]) -> list[list[float]]:
-        out: list[list[float]] = []
-        for start in range(0, len(texts), _BATCH):
-            batch = texts[start : start + _BATCH]
-            out.extend(await self._call_api(batch))
-        return out
 
     async def _call_api(self, batch: list[str]) -> list[list[float]]:
         client = self._client
@@ -153,27 +163,54 @@ class GatewayEmbedding:
                 raise EmbeddingGatewayError(f"OpenRouter embeddings request lỗi mạng: {exc}") from exc
 
             if response.status_code != 200:
-                raise EmbeddingGatewayError(
-                    f"OpenRouter embeddings trả HTTP {response.status_code}: {response.text[:200]}"
-                )
+                # KHÔNG forward response.text ra client: đó là nội dung upstream chưa kiểm soát
+                # (review PR#32, Important) — có thể chứa chi tiết vendor không nên lộ qua API
+                # public của chính app này. Chi tiết đầy đủ vẫn nằm trong log server (uvicorn access
+                # log ghi status; thân exception này chỉ mang status code, không mang body).
+                raise EmbeddingGatewayError(f"OpenRouter embeddings trả HTTP {response.status_code}")
 
-            payload = response.json()
-            data = payload.get("data")
-            if data is None or len(data) != len(batch):
-                got = 0 if data is None else len(data)
-                raise EmbeddingGatewayError(f"OpenRouter embeddings trả {got} vector cho {len(batch)} text")
+            # Toàn bộ khối dưới đây đọc payload upstream KHÔNG kiểm soát được hình dạng — mọi lỗi
+            # parse (JSON hỏng, thiếu field, giá trị không phải số, `index` không phải hoán vị hợp
+            # lệ) PHẢI thành `EmbeddingGatewayError`, không phải lọt ra ngoài dưới dạng
+            # `JSONDecodeError`/`KeyError`/`TypeError`/`ValueError` thô (review PR#32, Critical #1):
+            # `ValueError` trần bị `routes/publish.py::_evaluate`'s `except ValueError` bắt NHẦM
+            # thành lỗi input 400 ("golden_set_ref sai"), che mất một sự cố gateway thật đằng sau
+            # một mã lỗi hoàn toàn sai hướng chẩn đoán.
+            try:
+                payload = response.json()
+                data = payload.get("data")
+                if data is None or len(data) != len(batch):
+                    got = 0 if data is None else len(data)
+                    raise EmbeddingGatewayError(f"OpenRouter embeddings trả {got} vector cho {len(batch)} text")
 
-            # Sắp lại theo `index` — KHÔNG tin thứ tự API trả (spec OpenAI-compatible cho phép trả
-            # không theo thứ tự); lệch một nấc ở đây gán sai vector cho MỌI text sau đó, hỏng câm.
-            ordered = sorted(data, key=lambda item: item["index"])
-            vectors: list[list[float]] = []
-            for item in ordered:
-                vector = _l2_normalize([float(x) for x in item["embedding"]])
-                if len(vector) != self._dim:
+                # Sắp lại theo `index` — KHÔNG tin thứ tự API trả (spec OpenAI-compatible cho phép
+                # trả không theo thứ tự); lệch một nấc ở đây gán sai vector cho MỌI text sau đó,
+                # hỏng câm. Review PR#32, Critical #2: kiểm ĐỘ DÀI thôi chưa đủ — `index` trùng
+                # lặp, ngoài phạm vi, hoặc kiểu chuỗi (sort từ điển "0","1","10"...) làm `sorted()`
+                # xếp sai mà không exception nào nổ. Ép `int()` + xác nhận tập kết quả ĐÚNG BẰNG
+                # `{0, ..., len(batch)-1}` mới thật sự chặn được lớp lỗi "hoán vị giả".
+                indices = [int(item["index"]) for item in data]
+                if sorted(indices) != list(range(len(batch))):
                     raise EmbeddingGatewayError(
-                        f"OpenRouter embeddings trả vector {len(vector)} chiều, kỳ vọng {self._dim}"
+                        f"OpenRouter embeddings trả index không phải hoán vị hợp lệ 0..{len(batch) - 1}: {indices}"
                     )
-                vectors.append(vector)
+                ordered = sorted(data, key=lambda item: int(item["index"]))
+
+                vectors: list[list[float]] = []
+                for item in ordered:
+                    vector = _l2_normalize([float(x) for x in item["embedding"]])
+                    if len(vector) != self._dim:
+                        raise EmbeddingGatewayError(
+                            f"OpenRouter embeddings trả vector {len(vector)} chiều, kỳ vọng {self._dim}"
+                        )
+                    vectors.append(vector)
+            except EmbeddingGatewayError:
+                raise
+            except (AttributeError, KeyError, TypeError, ValueError) as exc:
+                # `AttributeError` phủ ca `response.json()` trả về một giá trị JSON hợp lệ nhưng
+                # KHÔNG phải object (`payload.get(...)` nổ trên list/str/số/null) — cùng lớp "hình
+                # dạng lạ" với 3 exception còn lại, không phải nhánh riêng.
+                raise EmbeddingGatewayError(f"OpenRouter embeddings trả payload không đọc được: {exc}") from exc
             return vectors
         finally:
             if owns_client:

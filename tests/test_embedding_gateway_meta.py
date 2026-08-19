@@ -35,11 +35,11 @@ def test_no_derive_vector_in_gateway_source() -> None:
     — không nhánh fallback nào rơi về bag-of-words khi gateway lỗi (QĐ-6, fail-closed tuyệt đối).
     AST-based (không phải khớp chuỗi thô) vì docstring của chính module này nhắc tên
     `derive_vector` khi GIẢI THÍCH lý do không dùng nó."""
+    # `alias.name` (tên NGUỒN, không phải `asname`) — review PR#32: `from studio_kb.embeddings
+    # import derive_vector as _x` né được nếu check chỉ soi tên cục bộ sau `as`; tên nguồn thì
+    # không né được kiểu đó.
     imported_names = {
-        alias.asname or alias.name
-        for node in ast.walk(_GATEWAY_AST)
-        if isinstance(node, ast.ImportFrom)
-        for alias in node.names
+        alias.name for node in ast.walk(_GATEWAY_AST) if isinstance(node, ast.ImportFrom) for alias in node.names
     }
     assert "derive_vector" not in imported_names
 

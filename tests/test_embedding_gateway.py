@@ -1,8 +1,9 @@
-"""`GatewayEmbedding` — app#30 Phase 3.
+"""`GatewayEmbedding` — app#30 Phase 3 (+ review PR#32 fixes: malformed-payload/index-permutation
+coverage, partial-batch-failure cache persistence).
 
-9/10 test dùng transport double (`httpx.MockTransport`) + cache double (`_FakePool`, dưới) —
-KHÔNG gọi mạng, KHÔNG cần DSN (INV-4). Chỉ `test_cache_hit_skips_http` cần DB thật (`admin_pool`),
-skip khi không có DSN (root `conftest.py::_require_dsn`).
+Mọi test TRỪ `test_cache_hit_skips_http` dùng transport double (`httpx.MockTransport`) + cache
+double (`_FakePool`, dưới) — KHÔNG gọi mạng, KHÔNG cần DSN (INV-4). `test_cache_hit_skips_http`
+cần DB thật (`admin_pool`), skip khi không có DSN (root `conftest.py::_require_dsn`).
 """
 
 from __future__ import annotations
@@ -127,6 +128,33 @@ async def test_reorders_by_response_index() -> None:
     assert vectors[2][0] == pytest.approx(vectors[2][1])  # "c" ~ [1,1]
 
 
+async def test_partial_batch_failure_keeps_earlier_batch_cached() -> None:
+    """Review PR#32, Important #1: 100 text (2 lô 90/10) — lô 1 (90 text) THÀNH CÔNG, lô 2 (10
+    text) THẤT BẠI. `embed()` phải raise (fail-closed, không trả kết quả một phần), nhưng 90 hàng
+    cache của lô 1 đã trả tiền gọi API PHẢI còn nguyên trong bảng — không bị mất theo lô 2 lỗi."""
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        payload = json.loads(request.content)
+        batch = payload["input"]
+        if call_count == 2:
+            return httpx.Response(500, json={"error": "boom lô 2"})
+        data = [{"index": i, "embedding": [1.0] + [0.0] * (DIM - 1)} for i in range(len(batch))]
+        return httpx.Response(200, json={"data": data})
+
+    pool = _FakePool()
+    client = _client(handler)
+    gw = GatewayEmbedding(api_key="k", client=client, pool=pool)  # type: ignore[arg-type]
+    texts = [f"text-{i}" for i in range(100)]
+    with pytest.raises(EmbeddingGatewayError):
+        await gw.embed(texts)
+
+    assert call_count == 2
+    assert len(pool.store) == 90  # lô 1 (90 text) đã ghi cache; lô 2 (10 text) không, vì lỗi trước khi tới INSERT
+
+
 async def test_batches_at_90() -> None:
     """200 text → transport ghi nhận đúng 3 lần gọi (90/90/20)."""
     calls: list[list[str]] = []
@@ -206,6 +234,139 @@ async def test_wrong_width_from_api_raises() -> None:
         await gw.embed(["hello"])
 
 
+async def test_malformed_json_body_raises_gateway_error() -> None:
+    """Review PR#32, Critical #1: HTTP 200 nhưng body KHÔNG phải JSON hợp lệ — `response.json()`
+    raise `json.JSONDecodeError` (subclass `ValueError`). Phải thành `EmbeddingGatewayError`, không
+    phải `ValueError` trần (bị `routes/publish.py`'s `except ValueError` bắt nhầm thành 400)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, content=b"khong phai json hop le {{{")
+
+    pool = _FakePool()
+    client = _client(handler)
+    gw = GatewayEmbedding(api_key="k", client=client, pool=pool)  # type: ignore[arg-type]
+    with pytest.raises(EmbeddingGatewayError):
+        await gw.embed(["hello"])
+
+
+async def test_json_body_not_an_object_raises_gateway_error() -> None:
+    """Review PR#32, Critical #1: JSON hợp lệ nhưng KHÔNG phải object (`payload.get(...)` nổ
+    `AttributeError` trên list) — cùng lớp lỗi hình dạng lạ, phải thành `EmbeddingGatewayError`."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json=[1, 2, 3])
+
+    pool = _FakePool()
+    client = _client(handler)
+    gw = GatewayEmbedding(api_key="k", client=client, pool=pool)  # type: ignore[arg-type]
+    with pytest.raises(EmbeddingGatewayError):
+        await gw.embed(["hello"])
+
+
+async def test_missing_embedding_field_raises_gateway_error() -> None:
+    """Review PR#32, Critical #1: item thiếu field `embedding` — `KeyError` trần phải thành
+    `EmbeddingGatewayError`."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        batch = payload["input"]
+        data = [{"index": i} for i in range(len(batch))]  # thiếu "embedding"
+        return httpx.Response(200, json={"data": data})
+
+    pool = _FakePool()
+    client = _client(handler)
+    gw = GatewayEmbedding(api_key="k", client=client, pool=pool)  # type: ignore[arg-type]
+    with pytest.raises(EmbeddingGatewayError):
+        await gw.embed(["hello"])
+
+
+async def test_non_numeric_embedding_value_raises_gateway_error() -> None:
+    """Review PR#32, Critical #1: giá trị trong `embedding` không phải số — `float("khong-phai-so")`
+    raise `ValueError` trần phải thành `EmbeddingGatewayError`."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        batch = payload["input"]
+        data = [{"index": i, "embedding": ["khong-phai-so"] * DIM} for i in range(len(batch))]
+        return httpx.Response(200, json={"data": data})
+
+    pool = _FakePool()
+    client = _client(handler)
+    gw = GatewayEmbedding(api_key="k", client=client, pool=pool)  # type: ignore[arg-type]
+    with pytest.raises(EmbeddingGatewayError):
+        await gw.embed(["hello"])
+
+
+async def test_duplicate_index_raises_gateway_error() -> None:
+    """Review PR#32, Critical #2: `index` trùng lặp (cả 2 item cùng index=0) — độ dài `data` vẫn
+    khớp `len(batch)` nên check cũ (chỉ so độ dài) lọt qua, nhưng đây KHÔNG phải hoán vị hợp lệ
+    `{0..n-1}` — phải raise, không được âm thầm gán sai vector."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        batch = payload["input"]
+        assert len(batch) == 2
+        data = [
+            {"index": 0, "embedding": [1.0] + [0.0] * (DIM - 1)},
+            {"index": 0, "embedding": [0.0, 1.0] + [0.0] * (DIM - 2)},
+        ]
+        return httpx.Response(200, json={"data": data})
+
+    pool = _FakePool()
+    client = _client(handler)
+    gw = GatewayEmbedding(api_key="k", client=client, pool=pool)  # type: ignore[arg-type]
+    with pytest.raises(EmbeddingGatewayError):
+        await gw.embed(["a", "b"])
+
+
+async def test_out_of_range_index_raises_gateway_error() -> None:
+    """Review PR#32, Critical #2: `index` ngoài phạm vi `[0, len(batch))` (vd index=5 cho batch 2
+    text) — cùng lớp "không phải hoán vị hợp lệ", phải raise."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        batch = payload["input"]
+        assert len(batch) == 2
+        data = [
+            {"index": 0, "embedding": [1.0] + [0.0] * (DIM - 1)},
+            {"index": 5, "embedding": [0.0, 1.0] + [0.0] * (DIM - 2)},
+        ]
+        return httpx.Response(200, json={"data": data})
+
+    pool = _FakePool()
+    client = _client(handler)
+    gw = GatewayEmbedding(api_key="k", client=client, pool=pool)  # type: ignore[arg-type]
+    with pytest.raises(EmbeddingGatewayError):
+        await gw.embed(["a", "b"])
+
+
+async def test_string_index_reorders_numerically_not_lexicographically() -> None:
+    """Review PR#32, Critical #2: `index` kiểu CHUỖI ("0","1",..,"10") sort TỪ ĐIỂN sẽ xếp sai thứ
+    tự với ≥11 phần tử ("10" < "2" theo chuỗi) — bài này dùng 11 text để bài KHÔNG xanh giả nếu ai
+    quay lại `sorted(data, key=lambda item: item["index"])` (so chuỗi) thay vì ép `int()` trước."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        batch = payload["input"]
+        assert len(batch) == 11
+        # trả ĐÚNG index nhưng dưới dạng CHUỖI — vector thứ i là [1.0 tại vị trí i, còn lại 0]
+        data = [
+            {"index": str(i), "embedding": ([0.0] * i + [1.0] + [0.0] * (10 - i))[:11] + [0.0] * (DIM - 11)}
+            for i in range(11)
+        ]
+        return httpx.Response(200, json={"data": data})
+
+    pool = _FakePool()
+    client = _client(handler)
+    gw = GatewayEmbedding(api_key="k", client=client, pool=pool)  # type: ignore[arg-type]
+    texts = [f"text-{i}" for i in range(11)]
+    vectors = await gw.embed(texts)
+    for i in range(11):
+        assert vectors[i][i] == pytest.approx(1.0)
+
+
 async def test_zero_vector_survives_normalize() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
@@ -259,15 +420,22 @@ async def test_recorded_response_roundtrips_through_gateway() -> None:
 
 
 async def test_cache_hit_skips_http(admin_pool: Pool) -> None:
-    """Gọi 2 lần cùng text — lần 2 transport 0 lần gọi, kết quả bằng nhau bit-for-bit. Cần DB thật
-    (bảng `core.embedding_cache` — Phase 2, cột `vector(2048)` cố định); skip khi không có DSN."""
+    """Gọi 2 lần cùng text — lần 2 transport 0 lần gọi, kết quả khớp trong dung sai float4. Cần DB
+    thật (bảng `core.embedding_cache` — Phase 2, cột `vector(2048)` = pgvector, lưu float4); skip
+    khi không có DSN.
+
+    Review PR#32: bản trước dùng vector toàn 0.0/1.0 rồi assert `==` (bit-for-bit) — nhưng đó là
+    trùng hợp, KHÔNG phải bằng chứng tổng quát: 0.0/1.0 tình cờ biểu diễn CHÍNH XÁC được ở float4,
+    nên phép so `==` xanh dù không thật sự kiểm tra được mất mát độ chính xác lúc round-trip qua
+    cột `vector`. Vector dưới đây có phần thập phân không tròn (sau L2-normalize) — `pytest.approx`
+    kiểm round-trip THẬT qua float4, thay vì khớp `==` chỉ vì chọn nhầm giá trị dễ."""
     calls: list[list[str]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
         batch = payload["input"]
         calls.append(batch)
-        data = [{"index": i, "embedding": [1.0] + [0.0] * (DIM - 1)} for i in range(len(batch))]
+        data = [{"index": i, "embedding": [1.0, 2.0, 3.0, 4.0] + [0.0] * (DIM - 4)} for i in range(len(batch))]
         return httpx.Response(200, json={"data": data})
 
     gw1 = GatewayEmbedding(api_key="k", client=_client(handler), pool=admin_pool)
@@ -277,7 +445,7 @@ async def test_cache_hit_skips_http(admin_pool: Pool) -> None:
     gw2 = GatewayEmbedding(api_key="k", client=_client(handler), pool=admin_pool)
     second = await gw2.embed(["cache-me"])
     assert len(calls) == 1  # KHÔNG gọi transport lần 2 — cache hit
-    assert first == second
+    assert second[0] == pytest.approx(first[0], rel=1e-6)
 
     # sanity: đúng row nằm trong bảng, đúng cache_key
     key = _cache_key(MODEL, DIM, "cache-me")
