@@ -77,6 +77,53 @@ async def list_agent_versions(agent_id: str) -> list[VersionSummary]:
     return [VersionSummary(version=row[0], status=row[1], created_at=row[2].isoformat()) for row in rows]
 
 
+class AgentRecipeResponse(BaseModel):
+    recipe: dict[str, object]
+    version: int
+    status: str
+
+
+@router.get("/{agent_id}/recipe", response_model=AgentRecipeResponse)
+async def get_agent_recipe(agent_id: str, version: int | None = None) -> AgentRecipeResponse:
+    """Nạp recipe THẬT cho Canvas — trước bản vá này Canvas không hề đọc `wb.recipes`, luôn khởi
+    tạo từ 1 sample cứng (`apps/web/src/recipe/sample.ts`), nên sau publish/rollback Canvas không
+    có cách nào hiện đúng nội dung/version đang sống.
+
+    Không truyền `version` → bản `status='published'` mới nhất, cùng nguồn `_load_published_recipe`
+    (`routes/chat.py`). Có `version` → đọc `wb.recipe_versions` (lịch sử append-only, KHÔNG phải
+    `wb.recipes`) — `rollback()` (`studio_workbench.publish`) tự thừa nhận `wb.recipes` có thể
+    KHÔNG còn giữ row của version cũ (rollback tái tạo lại từ `wb.recipe_versions` khi cần, xem
+    docstring hàm đó), nên đây là nguồn duy nhất luôn có đủ MỌI version từng tồn tại, kể cả đã
+    `rolled_back` — cho phép Canvas soi đúng "đang xem bản nào" bất kể trạng thái hiện tại.
+
+    Admin-only (giống `list_agent_versions`) — Canvas là công cụ dựng agent, cùng nhóm quyền với
+    Rollback, không phải màn nhân viên như Chat."""
+    session = get_request_session()
+    conn = get_request_connection()
+    identity = await fetch_fresh_identity(conn, session.user)
+    require_admin(identity.roles)
+
+    if version is None:
+        cur = await conn.execute(
+            "SELECT recipe, version, status FROM wb.recipes WHERE agent_id = %s AND status = 'published' "
+            "ORDER BY version DESC LIMIT 1",
+            (agent_id,),
+        )
+    else:
+        cur = await conn.execute(
+            "SELECT recipe, version, status FROM wb.recipe_versions WHERE agent_id = %s AND version = %s "
+            "ORDER BY created_at DESC LIMIT 1",
+            (agent_id, version),
+        )
+    row = await cur.fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"agent_id {agent_id!r} không có recipe version {version!r} cho tenant hiện tại",
+        )
+    return AgentRecipeResponse(recipe=row[0], version=row[1], status=row[2])
+
+
 class RollbackRequest(BaseModel):
     to_version: int
 

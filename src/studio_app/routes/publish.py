@@ -29,6 +29,7 @@ from pathlib import Path
 from uuid import UUID
 
 import studio_kb
+import yaml  # type: ignore[import-untyped, unused-ignore]
 from fastapi import APIRouter, HTTPException
 from pydantic import ValidationError
 from studio_contracts import Edge, Node, Recipe, Scorecard
@@ -65,6 +66,27 @@ router = APIRouter(prefix="/api/agents", tags=["publish"])
 # `site-packages/studio_kb/golden`) vì `golden/` là con trực tiếp của thư mục chứa
 # `__init__.py` ở cả hai. Không còn phụ thuộc layout nào khác — không cần config/env riêng.
 _GOLDEN_SET_DIR = Path(studio_kb.__file__).resolve().parent / "golden"
+
+
+def _resolve_golden_set_path(ref: str) -> Path | None:
+    """Tìm file `.yaml` trong `_GOLDEN_SET_DIR` mà `golden_set_ref` KHAI BÊN TRONG khớp `ref`.
+
+    KHÔNG suy đường dẫn bằng cách ghép `f"{ref}.yaml"` — đúng anti-pattern `golden_loader.py`
+    (`load_golden_set`, DEC-D16-01) cảnh báo: tên file không ổn định qua thời gian (evidence
+    trong docstring đó — cùng bộ 30 case DE đổi tên file 2 lần, `golden_set_ref` bên trong không
+    đổi), và corpus thật đã có ca lệch tên/ref (`smoke-5.yaml` khai `golden_set_ref:
+    "callisto-smoke-5-v0"`). Route này build path để TRUYỀN vào `load_golden_set(path,
+    expect_ref=...)` — chính hàm đó đã enforce cross-check ref-trong-file == expect_ref, nên
+    resolver ở đây chỉ cần tìm đúng file, không cần lặp lại việc validate.
+    """
+    for path in sorted(_GOLDEN_SET_DIR.glob("*.yaml")):
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except yaml.YAMLError:
+            continue
+        if isinstance(raw, dict) and raw.get("golden_set_ref") == ref:
+            return path
+    return None
 
 
 async def _evaluate(agent_id: str, body: RunRequest, session: ResolvedContext) -> tuple[Recipe, Scorecard]:
@@ -108,11 +130,14 @@ async def _evaluate(agent_id: str, body: RunRequest, session: ResolvedContext) -
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"recipe không qua graph_lint(): {exc}") from exc
 
-    golden_set_path = _GOLDEN_SET_DIR / f"{recipe.golden_set_ref}.yaml"
-    if not golden_set_path.is_file():
+    golden_set_path = _resolve_golden_set_path(recipe.golden_set_ref)
+    if golden_set_path is None:
         raise HTTPException(
             status_code=400,
-            detail=f"golden_set_ref {recipe.golden_set_ref!r} không có file tương ứng ở {golden_set_path}",
+            detail=(
+                f"golden_set_ref {recipe.golden_set_ref!r} không khớp golden_set_ref khai trong "
+                f"bất kỳ file .yaml nào ở {_GOLDEN_SET_DIR}"
+            ),
         )
 
     # `Pool` (không phải `get_request_connection()`) — rủi ro pool self-deadlock CHƯA được giải

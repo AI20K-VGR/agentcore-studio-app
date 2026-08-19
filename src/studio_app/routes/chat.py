@@ -50,14 +50,19 @@ class ChatResponse(BaseModel):
     citations: list[str]
     refused: bool
     run_id: str
+    version: int
 
 
-async def _load_published_recipe(agent_id: str) -> Recipe:
+async def _load_published_recipe(agent_id: str) -> tuple[Recipe, int]:
     """RLS (`wb.recipes`) tự lọc theo `app.tenant_id` của connection hiện tại — không thêm
-    `WHERE tenant_id` tay ở đây, tránh 2 nguồn sự thật lệch nhau về tenant."""
+    `WHERE tenant_id` tay ở đây, tránh 2 nguồn sự thật lệch nhau về tenant.
+
+    Trả kèm `version` — client cần biết ĐANG chat với bản nào (đổi sau publish/rollback), không
+    chỉ nội dung recipe."""
     conn = get_request_connection()
     cursor = await conn.execute(
-        "SELECT recipe FROM wb.recipes WHERE agent_id = %s AND status = 'published' ORDER BY version DESC LIMIT 1",
+        "SELECT recipe, version FROM wb.recipes WHERE agent_id = %s AND status = 'published' "
+        "ORDER BY version DESC LIMIT 1",
         (agent_id,),
     )
     row = await cursor.fetchone()
@@ -66,14 +71,14 @@ async def _load_published_recipe(agent_id: str) -> Recipe:
             status_code=404,
             detail=f"agent_id {agent_id!r} chưa có bản published nào cho tenant hiện tại",
         )
-    return Recipe.model_validate(row[0])
+    return Recipe.model_validate(row[0]), row[1]
 
 
 @router.post("/{agent_id}/chat", response_model=ChatResponse)
 async def chat(agent_id: str, body: ChatRequest) -> ChatResponse:
     session = get_request_session()
 
-    recipe = await _load_published_recipe(agent_id)
+    recipe, version = await _load_published_recipe(agent_id)
     if recipe.tenant_id != session.tenant_id:
         # Không nên trúng được (RLS đã lọc ở `_load_published_recipe`) — giữ lại như hàng rào thứ
         # hai đúng tinh thần defense-in-depth toàn codebase này theo, không tin RLS là đủ một mình.
@@ -134,4 +139,5 @@ async def chat(agent_id: str, body: ChatRequest) -> ChatResponse:
         citations=[str(c) for c in raw_citations] if isinstance(raw_citations, list) else [],
         refused=bool(llm_out.get("refused", False)),
         run_id=result.run_id,
+        version=version,
     )
