@@ -53,7 +53,18 @@ from studio_app.settings import get_settings
 router = APIRouter(prefix="/api/agents", tags=["publish"])
 
 # DEC-D16-01: composition root là nơi DUY NHẤT được phép biết golden-set nằm ở đâu trên đĩa.
-_GOLDEN_SET_DIR = Path(studio_kb.__file__).resolve().parent.parent.parent / "golden"
+#
+# `kit#181` — công thức cũ đi ngược 3 cấp (`parent.parent.parent`), giả định `golden/` nằm
+# CẠNH `src/` (đúng ở workspace editable-install CŨ: `.../packages/kb/src/studio_kb/__init__.py`
+# → 3 cấp → `.../packages/kb`). Wheel install (`--no-editable`, đúng cách image build) phẳng
+# hơn 1 cấp — không có `src/` — nên 3 cấp đi LỐ ra khỏi `site-packages`, luôn 400.
+#
+# `kb#37`/`kit#181` sửa CẢ HAI phía đồng thời: `golden/` dời vào NGAY TRONG cây package
+# (`packages/kb/src/studio_kb/golden/`), nên giờ chỉ cần đi ngược ĐÚNG 1 cấp — và công thức đó
+# cho cùng một kết quả cấu trúc ở cả 2 layout (editable: `src/studio_kb/golden`; wheel:
+# `site-packages/studio_kb/golden`) vì `golden/` là con trực tiếp của thư mục chứa
+# `__init__.py` ở cả hai. Không còn phụ thuộc layout nào khác — không cần config/env riêng.
+_GOLDEN_SET_DIR = Path(studio_kb.__file__).resolve().parent / "golden"
 
 
 async def _evaluate(agent_id: str, body: RunRequest, session: ResolvedContext) -> tuple[Recipe, Scorecard]:
