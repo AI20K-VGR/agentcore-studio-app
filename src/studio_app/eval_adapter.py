@@ -49,13 +49,13 @@ recipe để băm. Băm trên chuỗi byte nào (`by_alias`? `exclude_none`?) v�
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from uuid import UUID
 
-from studio_contracts import LLM, EmbeddingService, KbSearch, NodeType, Recipe, TraceWriter
+from studio_contracts import LLM, EmbeddingService, KbSearch, Recipe, TraceWriter
 from studio_engine import interpreter
 from studio_evalhub.agent_runner import AgentAnswer, CaseRun
 from studio_workbench import create_recipe_d4
+from studio_workbench.recipe_ops import with_query, without_query
 from studio_workbench.tenant_wall import resolve_session
 
 
@@ -66,53 +66,6 @@ def _llm_answer(final_state: dict[str, object]) -> dict[str, object]:
         if isinstance(output, dict) and "answer" in output:
             return output
     raise LookupError("EngineAgentRunner: final_state không có output node llm-step (thiếu 'answer')")
-
-
-_QUERY_KEY = "query"
-
-
-def _map_kb_params(recipe: Recipe, fn: Callable[[dict[str, object]], dict[str, object]]) -> Recipe:
-    """Áp `fn` lên `params` của node `kb-retrieve` **đầu tiên**, trả bản sao. Không có node đó ⇒ trả
-    nguyên trạng.
-
-    Chọn theo **loại** chứ không theo vị trí `nodes[0]`: DAG 6-node của AIE-1 (D20) không bảo đảm node
-    đầu là `kb-retrieve`, còn `create_recipe_d4` thì có — khoá theo loại đúng ở cả hai, khoá theo vị
-    trí chỉ đúng ở một.
-
-    Không raise khi vắng `kb-retrieve`: một DAG không truy xuất KB là hợp lệ (`end`-only,
-    `tool-call`-only). Ném lỗi ở đây sẽ biến một recipe hợp lệ thành lỗi của bộ chấm."""
-    for i, node in enumerate(recipe.dag.nodes):
-        if node.type is not NodeType.KB_RETRIEVE:
-            continue
-        patched = node.model_copy(update={"params": fn(dict(node.params))})
-        nodes = [*recipe.dag.nodes[:i], patched, *recipe.dag.nodes[i + 1 :]]
-        return recipe.model_copy(update={"dag": recipe.dag.model_copy(update={"nodes": nodes})})
-    return recipe
-
-
-def _without_query(recipe: Recipe) -> Recipe:
-    """Gỡ `query` khỏi recipe ⇒ **recipe gốc của run**, thứ `recipe_hash` băm.
-
-    Gỡ hẳn khoá chứ không đặt `""`: hai cái cho **hai chuỗi byte khác nhau** khi serialize, mà chuỗi
-    byte đó chính là đầu vào của hash. Đây là một trong năm trục canonical-form đang chờ SWE chốt
-    (`kit#127` 🅑) — chọn "vắng mặt" ở đây là chọn dạng **không mang dữ liệu đề bài**, nhất quán với
-    lý do tách `query` ra ngay từ đầu."""
-    return _map_kb_params(recipe, lambda params: {k: v for k, v in params.items() if k != _QUERY_KEY})
-
-
-def _with_query(recipe: Recipe, query: str) -> Recipe:
-    """Trả bản sao của `recipe` với `query` bơm vào node `kb-retrieve` **đầu tiên**.
-
-    Không sửa `recipe` gốc — `Recipe` là `frozen=True`, và cái gốc chính là thứ `recipe_hash` sẽ băm,
-    nên nó phải giữ nguyên qua cả 30 case. Một biến thể per-case là **dữ liệu chạy**, không phải một
-    recipe khác.
-
-    Chọn node `kb-retrieve` **đầu tiên** chứ không phải `nodes[0]`: DAG 6-node của AIE-1 (D20) không
-    bảo đảm node đầu là `kb-retrieve`, và `create_recipe_d4` thì có — khoá theo **loại** thì đúng ở cả
-    hai, khoá theo vị trí thì chỉ đúng ở một.
-
-    Không có node `kb-retrieve` nào ⇒ trả recipe **nguyên trạng** (xem `_map_kb_params`)."""
-    return _map_kb_params(recipe, lambda params: {**params, _QUERY_KEY: query})
 
 
 class EngineAgentRunner:
@@ -141,14 +94,18 @@ class EngineAgentRunner:
     def certified_recipe(self, *, agent_id: str, tenant_id: UUID, section_roles: list[str]) -> Recipe:
         """Recipe **gốc** của run — thứ mà `recipe_hash` phải băm, và thứ `publish()` phải chứng nhận.
 
-        **Không mang `query`.** Đó là điểm khác duy nhất so với bản trước D20, và là điều làm câu
-        *"scorecard này chứng nhận recipe nào"* có đáp án đơn nhất: `query` là **dữ liệu đề bài của
-        golden-set**, không phải cấu hình agent — một agent đã publish không có query cố định.
+        **Không mang `query` — CHỈ ĐÚNG cho nhánh không tiêm `recipe=` (dựng `create_recipe_d4` rồi
+        gỡ query bên dưới).** Đó là điều làm câu *"scorecard này chứng nhận recipe nào"* có đáp án
+        đơn nhất cho nhánh đó: `query` là **dữ liệu đề bài của golden-set**, không phải cấu hình
+        agent — một agent đã publish không có query cố định. Nhánh tiêm (dòng dưới) KHÔNG áp lại
+        bất biến này: nếu canvas admin vẽ có `params["query"]` gõ sẵn trong 1 node `kb-retrieve`,
+        giá trị đó đi thẳng vào hash — vô hại cho tính nhất quán (cùng object được băm lẫn publish),
+        nhưng là 1 trục canonical-form còn bỏ ngỏ nếu sau này cần so sánh giữa 2 lần chấm.
 
-        Caller truyền `recipe=` ở constructor (đường `routes/publish.py` sẽ dùng: recipe từ canvas)
-        ⇒ trả **đúng recipe đó**, không dựng lại. Đây là chỗ đóng finding của SWE trên `kit#127`:
-        *"recipe được CHẤM và recipe được PUBLISH là hai đối tượng khác nhau về cấu trúc"* — hai cái
-        chỉ bằng nhau khi caller đưa recipe thật vào thay vì để adapter tự dựng.
+        Caller truyền `recipe=` ở constructor (đường `routes/publish.py` ĐANG dùng: recipe từ canvas,
+        từ review `app#26` ⛔) ⇒ trả **đúng recipe đó**, không dựng lại. Đây là chỗ đóng finding của
+        SWE trên `kit#127`: *"recipe được CHẤM và recipe được PUBLISH là hai đối tượng khác nhau về
+        cấu trúc"* — hai cái chỉ bằng nhau khi caller đưa recipe thật vào thay vì để adapter tự dựng.
 
         Không truyền ⇒ dựng `create_recipe_d4` như trước, nhưng **một lần cho cả run** và đã gỡ `query`.
 
@@ -159,7 +116,7 @@ class EngineAgentRunner:
             return self._recipe
         scope = f"t/{','.join(section_roles)}" if section_roles else "t/"
         built = create_recipe_d4(agent_id=agent_id or self._agent_id, tenant_id=tenant_id, scope=scope)
-        return _without_query(built)
+        return without_query(built)
 
     async def run_case(
         self,
@@ -197,17 +154,21 @@ class EngineAgentRunner:
         không phải một người dùng thật; nói dối chỗ này sẽ làm trace khó truy nguồn.
 
         GRAPH-LINT-CONTRACT (kit#129 item 3, thẩm định VinSOC finding C / DEC-A): hàm này KHÔNG tự
-        gọi `graph_lint()`. An toàn hôm nay vì `certified_recipe()` ở trên chỉ có hai nhánh: (a) trả
-        `self._recipe` — recipe được tiêm ở constructor — NGUYÊN VẸN, nhưng caller sản xuất DUY NHẤT
-        trong production (`routes/publish.py::_evaluate`) hiện KHÔNG truyền `recipe=` (đó chính là
-        `kit#127`, còn mở, khác việc đang đóng ở đây) nên nhánh này chưa từng chạy thật; hoặc (b) tự
+        gọi `graph_lint()`. `certified_recipe()` ở trên có hai nhánh: (a) trả `self._recipe` —
+        recipe được tiêm ở constructor — NGUYÊN VẸN; caller sản xuất DUY NHẤT trong production
+        (`routes/publish.py::_evaluate`) giờ ĐÃ truyền `recipe=` (`kit#127` đóng ở review `app#26`
+        ⛔ — trước đó nhánh này chưa từng chạy thật, KHÔNG truyền, khiến recipe được CHẤM khác hẳn
+        recipe được PUBLISH), và an toàn vì `_evaluate` gọi `graph_lint(recipe)` NGAY TRƯỚC khi dựng
+        `EngineAgentRunner(recipe=recipe, ...)`, đúng tiền điều kiện dòng dưới đòi hỏi; hoặc (b) tự
         dựng `create_recipe_d4(...)` — một recipe cố định, KHÔNG bắt nguồn từ `nodes`/`edges` người
-        dùng gửi lên, nên không có DAG chưa-kiểm nào của người dùng chạm tới `interpreter.run()` qua
-        đường này. Ai đóng `kit#127` bằng cách truyền `recipe=` canvas thật vào constructor PHẢI giữ
-        `graph_lint(recipe)` ở `_evaluate` chạy TRƯỚC dòng đó — `tests/test_graph_lint_before_interpreter_run.py`
-        đang allowlist hàm này theo tên; đọc lại docstring bài test đó trước khi đổi hợp đồng này."""
+        dùng gửi lên (đường còn lại, dùng khi caller không tiêm `recipe=`, ví dụ eval-harness chạy
+        rời khỏi route thật), nên không có DAG chưa-kiểm nào của người dùng chạm tới
+        `interpreter.run()` qua đường này. Đổi thứ tự 2 lệnh gọi đó ở `_evaluate` (graph_lint sau
+        khi dựng runner, thay vì trước) làm mất tiền điều kiện này —
+        `tests/test_graph_lint_before_interpreter_run.py` đang allowlist hàm này theo tên; đọc lại
+        docstring bài test đó trước khi đổi hợp đồng này."""
         base = self.certified_recipe(agent_id=agent_id, tenant_id=tenant_id, section_roles=section_roles)
-        recipe = _with_query(base, query)
+        recipe = with_query(base, query)
         session_context = resolve_session({"tenant_id": tenant_id, "user": "eval-harness", "roles": section_roles})
         result = await interpreter.run(
             recipe,

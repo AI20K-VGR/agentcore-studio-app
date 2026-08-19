@@ -4,9 +4,10 @@ Rủi ro thiết kế lớn nhất trong Kế hoạch 2, nói thẳng trong chí
 node `kb-retrieve` mang `query` CỐ ĐỊNH tại thời điểm build recipe (`builder.py`'s tham số
 `query: str`) — contract hiện tại KHÔNG có khái niệm "hỏi câu khác mỗi lượt chat" trên cùng 1
 recipe đã publish. Route này vì vậy KHÔNG thể chỉ đọc `wb.recipes.recipe` rồi chạy thẳng — nó phải
-`model_copy` recipe đã lưu, thay `params["query"]` của MỌI node `kb-retrieve` bằng tin nhắn user
-gửi, TRƯỚC KHI chạy `interpreter.run()`. Đây là biến đổi CỤC BỘ trong route này — không đổi
-`wb.recipes` đã lưu, không đổi contract `Recipe`/`Node`.
+thay `params["query"]` của MỌI node `kb-retrieve` bằng tin nhắn user gửi, TRƯỚC KHI chạy
+`interpreter.run()` (`studio_workbench.recipe_ops.with_query()` — dùng CHUNG với
+`eval_adapter.py`, không tự viết lại phép biến đổi này lần 2 ở đây, xem docstring module đó). Đây
+là biến đổi CỤC BỘ ở tầng gọi — không đổi `wb.recipes` đã lưu, không đổi contract `Recipe`/`Node`.
 
 Tenant fence: KHÔNG tự thêm `WHERE tenant_id = %s` — dựa hẳn vào RLS của `wb.recipes`
 (`schema.py`, `USING (tenant_id = current_setting('app.tenant_id'))`) trên connection đã
@@ -18,9 +19,10 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from studio_contracts import NodeType, Recipe
+from studio_contracts import Recipe
 from studio_engine import interpreter
 from studio_kb.postgres import PgKbSearch
+from studio_workbench.recipe_ops import with_query
 from studio_workbench.tenant_wall import ResolvedContext
 from studio_workbench.validator import graph_lint
 
@@ -67,18 +69,6 @@ async def _load_published_recipe(agent_id: str) -> Recipe:
     return Recipe.model_validate(row[0])
 
 
-def _with_query(recipe: Recipe, message: str) -> Recipe:
-    """`model_copy` toàn bộ `dag.nodes`, thay `params['query']` của MỌI node `kb-retrieve` bằng
-    `message` — KHÔNG đụng `wb.recipes` đã lưu (không ghi gì lại DB ở route này)."""
-    new_nodes = [
-        node.model_copy(update={"params": {**node.params, "query": message}})
-        if node.type is NodeType.KB_RETRIEVE
-        else node
-        for node in recipe.dag.nodes
-    ]
-    return recipe.model_copy(update={"dag": recipe.dag.model_copy(update={"nodes": new_nodes})})
-
-
 @router.post("/{agent_id}/chat", response_model=ChatResponse)
 async def chat(agent_id: str, body: ChatRequest) -> ChatResponse:
     session = get_request_session()
@@ -89,7 +79,7 @@ async def chat(agent_id: str, body: ChatRequest) -> ChatResponse:
         # hai đúng tinh thần defense-in-depth toàn codebase này theo, không tin RLS là đủ một mình.
         raise HTTPException(status_code=403, detail="recipe published thuộc tenant khác phiên hiện tại")
 
-    recipe = _with_query(recipe, body.message)
+    recipe = with_query(recipe, body.message)
 
     try:
         graph_lint(recipe)

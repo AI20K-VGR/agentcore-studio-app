@@ -7,10 +7,12 @@ Trước D20, `EngineAgentRunner.run_case` gọi `create_recipe_d4(query=…)` *
 nhất** — bất kể ai băm và băm bằng gì. Đó là thứ chặn `recipe_hash` (`DEC-03`, quá hạn từ D12), không
 phải bản thân phép băm.
 
-SWE đo thêm một vế nặng hơn (`kit#127`): `routes/publish.py` gọi `EvalHarness().run(recipe.agent_id,
-recipe.golden_set_ref, …)` — **không truyền `recipe` canvas vào đâu cả** ⇒ recipe được **chấm** và
-recipe được **publish** là hai đối tượng khác nhau **về cấu trúc**. Dù `recipe_hash` có producer ngay
-hôm nay, `publish()` vẫn chứng nhận **nhầm đối tượng**.
+SWE đo thêm một vế nặng hơn (`kit#127`, ĐÃ ĐÓNG ở review `app#26` ⛔): trước bản vá đó,
+`routes/publish.py` gọi `EvalHarness().run(recipe.agent_id, recipe.golden_set_ref, …)` mà **không
+truyền `recipe` canvas vào đâu cả** ⇒ recipe được **chấm** và recipe được **publish** là hai đối
+tượng khác nhau **về cấu trúc** — dù `recipe_hash` có producer, `publish()` vẫn chứng nhận **nhầm
+đối tượng**. `_evaluate()` giờ truyền `recipe=recipe` vào `EngineAgentRunner` (xem
+`routes/publish.py`), đóng đúng khe mà đoạn dưới đây gọi tên.
 
 ## Bài nào bắt được gì — đo bằng mutant, không tự khai
 
@@ -34,9 +36,11 @@ recipe sắp publish** vào. Khe đó mới là thứ đóng finding của SWE, 
 Nói ra vì bản nháp đầu gọi bài 30-case là *"bài trả lời 🅐"* — **sai**: nó xanh ở cả hai phía mutant.
 Nó được giữ lại với đúng vai thật của nó (xem docstring của chính bài đó), không phải vai đã dán.
 
-**Bài này KHÔNG chứng minh `recipe_hash` đã có.** Nó chứng minh *đã có đúng một thứ để băm* — điều
-kiện **cần**. Băm trên chuỗi byte nào vẫn là câu hỏi mở của SWE (`kit#127` 🅑), và `DEC-D20-02` giữ
-nguyên: evalhub **nhận** giá trị, không tự dẫn xuất.
+**Bài này KHÔNG tự chứng minh `recipe_hash` đã có** — nó chứng minh *đã có đúng một thứ để băm*,
+điều kiện **cần**. Băm trên chuỗi byte nào đã được SWE chốt (`studio_workbench.publish.
+recipe_hash()`: `sha256` trên `model_dump(mode="json", by_alias=True)` + `sort_keys=True`, xem
+docstring hàm đó để biết lý do từng cờ), và `DEC-D20-02` giữ nguyên: evalhub **nhận** giá trị,
+không tự dẫn xuất.
 """
 
 from __future__ import annotations
@@ -51,6 +55,7 @@ from studio_app.providers.fakes import FakeEmbedding
 from studio_contracts import NodeType, Recipe, TraceEvent
 from studio_engine.interpreter import RunResult
 from studio_workbench import create_recipe_d4
+from studio_workbench.recipe_ops import without_query
 
 TENANT_ID = UUID("a0000000-0000-0000-0000-000000000001")
 OTHER_TENANT = UUID("b0000000-0000-0000-0000-000000000001")
@@ -140,7 +145,7 @@ async def test_query_duoc_bom_dung_vao_kb_retrieve(monkeypatch: pytest.MonkeyPat
     Đo trên recipe **interpreter thật sự nhận**, không trên recipe adapter định dựng — hai cái chỉ
     bằng nhau khi không ai `model_copy` ở giữa mà quên.
 
-    Vế thứ hai (`_without_query(nhận) == gốc`) là vế thật sự khoá: nó nói *"khác ĐÚNG một khoá"*, chứ
+    Vế thứ hai (`without_query(nhận) == gốc`) là vế thật sự khoá: nó nói *"khác ĐÚNG một khoá"*, chứ
     không chỉ *"có khoá query"*. Một cài đặt tiện tay đổi thêm `top_k` hay `tenant_id` vẫn xanh nếu
     chỉ assert vế đầu."""
     runner, stub = _patched(monkeypatch)
@@ -151,7 +156,7 @@ async def test_query_duoc_bom_dung_vao_kb_retrieve(monkeypatch: pytest.MonkeyPat
     assert _kb_params(nhan)["query"] == "câu hỏi A"
 
     goc = runner.certified_recipe(agent_id="a1", tenant_id=TENANT_ID, section_roles=["public"])
-    assert eval_adapter._without_query(nhan) == goc
+    assert without_query(nhan) == goc
 
 
 async def test_ba_muoi_case_chi_sinh_MOT_recipe_goc(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -180,7 +185,7 @@ async def test_ba_muoi_case_chi_sinh_MOT_recipe_goc(monkeypatch: pytest.MonkeyPa
     queries = {_kb_params(r)["query"] for r in stub.recipes}
     assert len(queries) == 30, f"30 case phải mang 30 query khác nhau, đo được {len(queries)} — tập đã bị làm phẳng"
 
-    goc_khac_nhau = {eval_adapter._without_query(r).model_dump_json() for r in stub.recipes}
+    goc_khac_nhau = {without_query(r).model_dump_json() for r in stub.recipes}
     assert len(goc_khac_nhau) == 1, f"gỡ query ra thì 30 biến thể phải trùng nhau, đo được {len(goc_khac_nhau)}"
 
 
