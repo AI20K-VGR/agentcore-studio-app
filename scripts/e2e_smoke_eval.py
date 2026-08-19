@@ -110,6 +110,7 @@ from studio_evalhub.harness import citations_from_trace, score_case
 from studio_kb.doc_factory import TENANT_IDS, load_callisto
 from studio_kb.embeddings import derive_vector
 from studio_kb.postgres import KbIngest, PgKbSearch
+from studio_kb.schema import EMBEDDING_DIM
 
 
 class _CallistoEmbedding:
@@ -117,10 +118,15 @@ class _CallistoEmbedding:
     (SSOT `studio_kb.embeddings`). Bản trùng thứ ba của cùng adapter (đã có ở
     `test_kb_search_live_readiness.py` và `test_spine_scored_from_postgres.py`) — trùng có chủ đích
     (DRY note, plan D13): cả ba đều gọi cùng SSOT, chỗ trùng chỉ là lớp vỏ 2 dòng, không phải công
-    thức. Khác `_StubEmbedding` dưới đây, vốn phục vụ khe `EngineAgentRunner(embedding=...)` (trơ)."""
+    thức. Khác `_StubEmbedding` dưới đây, vốn phục vụ khe `EngineAgentRunner(embedding=...)` (trơ).
+
+    `dim=EMBEDDING_DIM` TƯỜNG MINH (app#30, Đính chính B) — adapter ingest SỐNG, seed qua
+    `KbIngest` VÀ query qua `PgKbSearch` trên cùng cột `vector(2048)` sống, không phải nơi
+    sinh/đọc fixture golden-1.0 dim-8. Không khai tường minh thì coupling với
+    `studio_kb.schema.EMBEDDING_DIM` là NGẦM; hành vi runtime KHÔNG đổi (giá trị y hệt mặc định)."""
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        return [derive_vector(text) for text in texts]
+        return [derive_vector(text, dim=EMBEDDING_DIM) for text in texts]
 
 
 class _CountingKb:

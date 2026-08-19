@@ -50,6 +50,7 @@ from studio_evalhub.harness import citations_from_trace, score_case
 from studio_kb.doc_factory import TENANT_IDS, load_callisto
 from studio_kb.embeddings import derive_vector
 from studio_kb.postgres import KbIngest, PgKbSearch
+from studio_kb.schema import EMBEDDING_DIM
 from studio_kb.trace_reader import PgTraceReader
 
 
@@ -65,10 +66,14 @@ class _CallistoEmbedding:
     """`EmbeddingService` cho `PgKbSearch`/seed — CÙNG không gian với `derive_vector` (SSOT
     `studio_kb.embeddings`). Không dùng `_StubEmbedding` ở đây: đó là khe của
     `EngineAgentRunner(embedding=...)` (trơ, feed `LlmStepExecutor`), khác khe seed/query của
-    `PgKbSearch` — hai adapter phục vụ hai collaborator khác nhau."""
+    `PgKbSearch` — hai adapter phục vụ hai collaborator khác nhau.
+
+    `dim=EMBEDDING_DIM` TƯỜNG MINH (app#30, Đính chính B) — adapter ingest SỐNG, seed qua
+    `KbIngest` VÀ query qua `PgKbSearch` trên cùng cột `vector(2048)` sống. Hành vi runtime KHÔNG
+    đổi (giá trị y hệt mặc định)."""
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        return [derive_vector(text) for text in texts]
+        return [derive_vector(text, dim=EMBEDDING_DIM) for text in texts]
 
 
 async def _run_case_through_postgres(pool: Pool) -> tuple[CaseRun, UUID, str]:

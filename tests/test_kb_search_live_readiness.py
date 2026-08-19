@@ -42,6 +42,7 @@ from studio_evalhub.harness import citations_from_trace
 from studio_kb.doc_factory import TENANT_IDS, load_callisto
 from studio_kb.embeddings import derive_vector
 from studio_kb.postgres import KbIngest, PgKbSearch
+from studio_kb.schema import EMBEDDING_DIM
 from studio_kb.search import KbSearchService
 
 # (số dòng ghi, {slug: {chunk_id đã seed}}) — trả về bởi fixture `seeded_corpus`.
@@ -67,10 +68,16 @@ class _CallistoEmbedding:
     Nguồn vector đúng là `studio_kb.embeddings.derive_vector` — `load_callisto_embeddings()` tự
     khai là đường đọc DUY NHẤT cho vector Callisto, và cả `PgKbSearch`/`KbSearchService` (khi DE
     land) đều xếp hạng trên đúng không gian đó.
+
+    `dim=EMBEDDING_DIM` TƯỜNG MINH (app#30, Đính chính B) — adapter ingest SỐNG, seed qua
+    `KbIngest` VÀ query qua `PgKbSearch`/`KbSearchService` trên cùng cột `vector(2048)` sống. Hành
+    vi runtime KHÔNG đổi (giá trị y hệt mặc định). KHÔNG đụng `studio_engine.demo_stubs.StubEmbedding`
+    (dòng import ở trên) — khe `EngineAgentRunner(embedding=...)` nó phục vụ vẫn trơ
+    (`executors.py:238`), thuộc `packages/engine`, ngoài scope app#30.
     """
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        return [derive_vector(text) for text in texts]
+        return [derive_vector(text, dim=EMBEDDING_DIM) for text in texts]
 
 
 @pytest_asyncio.fixture

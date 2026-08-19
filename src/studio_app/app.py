@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse
 from studio_app.core._db import close_pools, get_admin_pool
 from studio_app.core.schema import ensure_all_schemas, grant_app_privileges
 from studio_app.middleware import tenant_context_middleware
+from studio_app.providers.embeddings import EmbeddingGatewayError
 from studio_app.routes import admin as admin_routes
 from studio_app.routes import agents as agents_routes
 from studio_app.routes import auth as auth_routes
@@ -146,6 +147,16 @@ async def _redact_sensitive_validation_errors(request: Request, exc: RequestVali
     return JSONResponse(status_code=422, content=jsonable_encoder({"detail": redacted}))
 
 
+async def _embedding_gateway_error_to_503(request: Request, exc: EmbeddingGatewayError) -> JSONResponse:
+    """app#30, QĐ-6/Q2: `providers/embeddings.py::EmbeddingGatewayError` là domain error (module đó
+    KHÔNG import FastAPI) — ánh xạ HTTP ở ĐÂY, composition root, cùng khuôn
+    `_redact_sensitive_validation_errors` ở trên. CỐ Ý khác precedent `build_llm()` (raise
+    `HTTPException(500)` từ TRONG module provider) — issue §4.1 đòi fail-closed **503** cho
+    embedding, không phải 500; gọi tên chỗ vênh ra trong PR body, không bắt chước im lặng."""
+    del request
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     del app  # unused — required by the ASGI lifespan callable signature
@@ -167,6 +178,9 @@ def create_app() -> FastAPI:
     # FastAPI (`@app.exception_handler(RequestValidationError)` cũng cùng 1 signature) — cùng lớp
     # false-positive đã gặp ở `test_admin_routes.py`'s `# type: ignore[arg-type]` cho ContextVar.
     app.add_exception_handler(RequestValidationError, _redact_sensitive_validation_errors)  # type: ignore[arg-type]
+    # app#30 QĐ-6/Q2 — cùng lý do type:ignore ở trên (Starlette stub không suy được kiểu exception
+    # hẹp hơn `Exception` chung dù đây là cách dùng chính thống của FastAPI).
+    app.add_exception_handler(EmbeddingGatewayError, _embedding_gateway_error_to_503)  # type: ignore[arg-type]
     # DEV-TIME — cho phép `apps/web` (Vite, cổng KHÁC — 5173 — nên trình duyệt coi là origin
     # khác) gọi được API này. `dev_playground_server.py` (server tạm cũ) cũng tự set
     # `Access-Control-Allow-Origin: *` cho đúng lý do này — không phải phát minh mới, chỉ là

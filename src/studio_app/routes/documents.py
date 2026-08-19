@@ -32,7 +32,7 @@ from studio_kb.pipeline import KbPipeline
 from studio_app.authz import fetch_fresh_identity, fetch_tenant_section_names, require_admin
 from studio_app.core._db import get_pool
 from studio_app.middleware import get_request_connection, get_request_session
-from studio_app.providers.factory import CallistoEmbedding
+from studio_app.providers.factory import build_embedding
 
 router = APIRouter(prefix="/api/admin/documents", tags=["documents"])
 
@@ -136,7 +136,7 @@ async def upload_document(
     name_hash = hashlib.sha256(file.filename.encode("utf-8")).hexdigest()[:8]
     doc_id = f"{tenant_uuid.hex}-{_slugify(section_role)}-{_slugify(stem)}-{name_hash}"
 
-    pipeline = KbPipeline(await get_pool(), CallistoEmbedding())
+    pipeline = KbPipeline(await get_pool(), build_embedding())
     try:
         chunks = await pipeline.chunker(text, doc_id=doc_id, tenant_id=tenant_uuid, section_role=section_role)
     except ValueError as exc:

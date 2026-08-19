@@ -7,22 +7,31 @@ from __future__ import annotations
 from typing import assert_never
 
 from fastapi import HTTPException
-from studio_contracts.protocols import LLM
+from studio_contracts.protocols import LLM, EmbeddingService
 from studio_kb.embeddings import derive_vector
+from studio_kb.schema import EMBEDDING_DIM
 
+from studio_app.providers.embeddings import GatewayEmbedding
 from studio_app.providers.fakes import ExtractiveFakeLLM
 from studio_app.settings import LlmProvider, get_settings
 
 
-class CallistoEmbedding:
-    """`EmbeddingService` khớp không gian vector của dữ liệu ĐÃ INGEST vào `kb.chunks`
-    (`scripts/ingest_callisto.py`, DE) — SSOT `studio_kb.embeddings.derive_vector`. Trùng có chủ
-    đích với `_CallistoEmbedding` của `scripts/e2e_smoke_eval.py` (DRY note gốc, plan D13): cả hai
-    chỉ là lớp vỏ 2 dòng quanh CÙNG một hàm, không phải công thức riêng — `FakeEmbedding`
-    (`providers/fakes.py`) KHÔNG dùng được ở đây vì nó không khớp không gian vector đã ingest."""
+class CallistoStubEmbedding:
+    """`EmbeddingService` STUB-LOCAL (app#30, QĐ-7) — nửa "stub local fixtures (CI, 100%)" của cặp
+    2-impl mà `protocols.py:18-20` đòi (nửa kia là `GatewayEmbedding`, production thật). KHÔNG BAO
+    GIỜ là đường production — đường production là `GatewayEmbedding` (`build_embedding()` dưới).
+
+    Vỏ 2 dòng quanh `studio_kb.embeddings.derive_vector`, trùng có chủ đích với
+    `_CallistoEmbedding` của `scripts/e2e_smoke_eval.py` (DRY note gốc, plan D13). Truyền
+    `dim=EMBEDDING_DIM` TƯỜNG MINH (Đính chính B, app#30): `derive_vector` mặc định bám hằng số
+    cột — không khai tường minh thì coupling với `studio_kb.schema.EMBEDDING_DIM` là NGẦM, và một
+    lần lật hằng số đó (`kb#43`, 8 → 2048) mà chỗ gọi không đổi theo sẽ sinh vector SAI SỐ CHIỀU
+    của KHÔNG-GIAN-CŨ dưới nhãn số-chiều-mới — đúng con bug app#30 đang đóng. `FakeEmbedding`
+    (`providers/fakes.py`) KHÔNG dùng được ở đây: `dim=8` cứng, chưa từng L2-normalize, và tự
+    docstring của nó cấm đếm vào cặp 2-impl này."""
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        return [derive_vector(text) for text in texts]
+        return [derive_vector(text, dim=EMBEDDING_DIM) for text in texts]
 
 
 def build_llm() -> LLM:
@@ -60,3 +69,27 @@ def build_llm() -> LLM:
             return GeminiProvider(api_key=settings.gemini_api_key)
         case _ as unreachable:
             assert_never(unreachable)
+
+
+def build_embedding() -> EmbeddingService:
+    """Gương đúng hình `build_llm()` ở trên (app#30). `STUDIO_USE_FAKE_PROVIDERS=true` (mặc định)
+    -> `CallistoStubEmbedding` (đúng bề rộng `EMBEDDING_DIM`, KHÔNG phải `FakeEmbedding` — xem
+    docstring `CallistoStubEmbedding`). `false` -> `GatewayEmbedding` thật (đòi
+    `STUDIO_OPENROUTER_API_KEY`). `GatewayEmbedding` import top-level (không lazy như
+    `OpenAIProvider`/`GeminiProvider` ở trên): `httpx` đã là base dep (`pyproject.toml:19`), không
+    phải extra, nên không có ImportError nào để tránh trên đường CI fake.
+
+    Ánh xạ lỗi CỐ Ý khác `build_llm()` (503 ở đây, không phải 500): `providers/embeddings.py`
+    raise `EmbeddingGatewayError` (domain error, không FastAPI) khi gọi API thất bại lúc runtime;
+    ở ĐÂY chỉ bắt ca THIẾU KEY lúc dựng provider — giữ coupling `HTTPException` đúng chỗ
+    `build_llm()` đã đặt (`factory.py` đã import `HTTPException` sẵn), không mở chỗ mới."""
+    settings = get_settings()
+    if settings.use_fake_providers:
+        return CallistoStubEmbedding()
+
+    if not settings.openrouter_api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="STUDIO_USE_FAKE_PROVIDERS=false nhưng thiếu STUDIO_OPENROUTER_API_KEY",
+        )
+    return GatewayEmbedding(api_key=settings.openrouter_api_key)

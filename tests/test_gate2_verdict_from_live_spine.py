@@ -72,6 +72,7 @@ from studio_evalhub.harness import EvalHarness
 from studio_kb.doc_factory import TENANT_IDS, load_callisto
 from studio_kb.embeddings import derive_vector
 from studio_kb.postgres import KbIngest, PgKbSearch
+from studio_kb.schema import EMBEDDING_DIM
 
 _GOLDEN_30 = (
     Path(__file__).resolve().parents[3]
@@ -106,10 +107,14 @@ class _StubEmbedding:
 
 class _CallistoEmbedding:
     """`EmbeddingService` cho `PgKbSearch`/seed — CÙNG không gian với `derive_vector` (SSOT
-    `studio_kb.embeddings`), khác khe trơ của `EngineAgentRunner(embedding=...)`."""
+    `studio_kb.embeddings`), khác khe trơ của `EngineAgentRunner(embedding=...)`.
+
+    `dim=EMBEDDING_DIM` TƯỜNG MINH (app#30, Đính chính B) — adapter ingest SỐNG, seed qua
+    `KbIngest` VÀ query qua `PgKbSearch` trên cùng cột `vector(2048)` sống. Hành vi runtime KHÔNG
+    đổi (giá trị y hệt mặc định)."""
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        return [derive_vector(text) for text in texts]
+        return [derive_vector(text, dim=EMBEDDING_DIM) for text in texts]
 
 
 def _golden() -> GoldenSet:
