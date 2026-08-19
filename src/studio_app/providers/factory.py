@@ -8,7 +8,6 @@ from typing import assert_never
 
 from fastapi import HTTPException
 from studio_contracts.protocols import LLM
-
 from studio_kb.embeddings import derive_vector
 
 from studio_app.providers.fakes import ExtractiveFakeLLM
