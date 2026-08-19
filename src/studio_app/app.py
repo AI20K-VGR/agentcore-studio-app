@@ -33,6 +33,7 @@ from studio_app.routes import admin as admin_routes
 from studio_app.routes import agents as agents_routes
 from studio_app.routes import auth as auth_routes
 from studio_app.routes import chat as chat_routes
+from studio_app.routes import documents as documents_routes
 from studio_app.routes import publish as publish_routes
 from studio_app.routes import runs as runs_routes
 from studio_app.routes import sections as sections_routes
@@ -193,6 +194,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_routes.router)
     app.include_router(admin_routes.router)
     app.include_router(sections_routes.router)
+    app.include_router(documents_routes.router)
     app.include_router(agents_routes.router)
     app.include_router(runs_routes.router)
     app.include_router(publish_routes.router)

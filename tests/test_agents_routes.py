@@ -12,7 +12,7 @@ import pytest_asyncio
 from fastapi import HTTPException
 from studio_app import middleware
 from studio_app.core._db import Pool, close_pools, get_pool
-from studio_app.routes.agents import RollbackRequest, list_agents, rollback_agent
+from studio_app.routes.agents import RollbackRequest, list_agent_versions, list_agents, rollback_agent
 from studio_workbench.tenant_wall import ResolvedContext
 
 
@@ -205,3 +205,57 @@ async def test_rollback_restores_prior_version(admin_pool: Pool) -> None:
     assert dict(rows) == {1: "published", 2: "rolled_back"}, (
         f"v1 phải thành published, v2 phải thành rolled_back, cả 2 row vẫn tồn tại — thấy {rows}"
     )
+
+
+async def test_list_agent_versions_requires_admin(admin_pool: Pool) -> None:
+    """`list_agent_versions` (`routes/agents.py`, review app#27 finding #4 — TranBaDat2607: route
+    ship KHÔNG test) — cùng gate `require_admin` với `rollback_agent`."""
+    tenant_id = await _seed_tenant(admin_pool, "agents-probe-h")
+    await _seed_user(admin_pool, tenant_id, "user@acme.com", ["public"])
+    await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-h1", version=1)
+
+    token = _set_session(tenant_id=tenant_id, user="user@acme.com", roles=["public"])
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            async with _simulate_request_connection(tenant_id):
+                await list_agent_versions("agent-h1")
+        assert exc_info.value.status_code == 403
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+
+async def test_list_agent_versions_returns_real_rows_desc(admin_pool: Pool) -> None:
+    """Đọc THẬT `wb.recipe_versions` (không phải danh sách giả) — dropdown Rollback ở UI dựng
+    trực tiếp từ đây, đúng lý do route này tồn tại (thay input số tự do gõ tay)."""
+    tenant_id = await _seed_tenant(admin_pool, "agents-probe-i")
+    await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+    await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-i1", version=1, status="draft")
+    await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-i1", version=2, status="published")
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        async with _simulate_request_connection(tenant_id):
+            result = await list_agent_versions("agent-i1")
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert [(r.version, r.status) for r in result] == [(2, "published"), (1, "draft")]
+
+
+async def test_list_agent_versions_scoped_to_own_tenant_via_rls(admin_pool: Pool) -> None:
+    """`wb.recipe_versions` bật RLS — 2 tenant cùng khai `agent_id` không được thấy version của
+    nhau, cùng nguyên tắc `test_list_agents_scoped_to_own_tenant_via_rls` ở trên."""
+    tenant_a = await _seed_tenant(admin_pool, "agents-probe-j-a")
+    tenant_b = await _seed_tenant(admin_pool, "agents-probe-j-b")
+    await _seed_user(admin_pool, tenant_a, "admin-a@acme.com", ["admin"])
+    await _seed_published_recipe(admin_pool, tenant_id=tenant_a, agent_id="agent-shared", version=1)
+    await _seed_published_recipe(admin_pool, tenant_id=tenant_b, agent_id="agent-shared", version=1)
+
+    token = _set_session(tenant_id=tenant_a, user="admin-a@acme.com", roles=["admin"])
+    try:
+        async with _simulate_request_connection(tenant_a):
+            result = await list_agent_versions("agent-shared")
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert len(result) == 1, "RLS phải tự lọc — không thấy version của tenant_b dù cùng agent_id"

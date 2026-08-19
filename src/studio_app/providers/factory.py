@@ -44,7 +44,11 @@ def build_llm() -> LLM:
                     status_code=500,
                     detail="STUDIO_LLM_PROVIDER=openai nhưng thiếu STUDIO_OPENAI_API_KEY",
                 )
-            return OpenAIProvider(api_key=settings.openai_api_key)
+            return OpenAIProvider(
+                api_key=settings.openai_api_key,
+                base_url=settings.openai_base_url,
+                model=settings.openai_model or "o4-mini",
+            )
         case LlmProvider.GEMINI:
             from studio_app.providers.gemini import GeminiProvider
 

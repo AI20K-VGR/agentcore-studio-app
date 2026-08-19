@@ -104,6 +104,11 @@ class Settings(BaseSettings):
     # lạ phải ồn" (cùng lý lẽ `_VOCABULARY` của `agreement.py:64`, `DEC-D18-01`).
     llm_provider: LlmProvider
     openai_api_key: str | None = None
+    # OpenRouter (hoặc endpoint tương thích OpenAI khác) — `None` giữ hành vi cũ (API OpenAI gốc,
+    # model mặc định "o4-mini"). Set cả hai để trỏ sang OpenRouter, vd
+    # `STUDIO_OPENAI_BASE_URL=https://openrouter.ai/api/v1`, `STUDIO_OPENAI_MODEL=openai/gpt-4o-mini`.
+    openai_base_url: str | None = None
+    openai_model: str | None = None
     gemini_api_key: str | None = None
 
     langfuse_public_key: str | None = None

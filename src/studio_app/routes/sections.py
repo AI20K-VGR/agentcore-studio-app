@@ -11,6 +11,8 @@ core.sections`) — ranh giới tenant enforce TƯỜNG MINH ở đây, không n
 
 from __future__ import annotations
 
+from uuid import UUID
+
 import psycopg.errors
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, field_validator
@@ -55,6 +57,14 @@ async def create_section(body: CreateSectionRequest) -> SectionResponse:
     identity = await fetch_fresh_identity(conn, session.user)
     require_superadmin(identity.roles)
 
+    # Parse UUID TRƯỚC khi query — cùng bug đã sửa ở routes/documents.py (review app#27,
+    # dholmes0207/TranBaDat2607, finding #2): tenant_id sai định dạng đi thẳng vào WHERE id = %s
+    # (cột UUID) sẽ làm psycopg raise lỗi cú pháp CHƯA BẮT ⇒ 500 thay vì 400 rõ ràng.
+    try:
+        UUID(body.tenant_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"tenant_id không phải UUID hợp lệ: {body.tenant_id!r}") from exc
+
     cur = await conn.execute(
         "SELECT 1 FROM core.tenants WHERE id = %s AND name != '__system__'",
         (body.tenant_id,),
@@ -90,6 +100,11 @@ async def list_sections(tenant_id: str | None = None) -> list[SectionResponse]:
             raise HTTPException(
                 status_code=400, detail="superadmin phải khai ?tenant_id= để xem sections của công ty nào"
             )
+        # Parse UUID TRƯỚC khi query — cùng finding #2 (review app#27).
+        try:
+            UUID(tenant_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"tenant_id không phải UUID hợp lệ: {tenant_id!r}") from exc
         target_tenant_id = tenant_id
     elif "admin" in identity.roles:
         if tenant_id is not None and tenant_id != str(identity.tenant_id):

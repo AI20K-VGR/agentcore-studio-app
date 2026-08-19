@@ -47,6 +47,36 @@ async def list_agents() -> list[AgentSummary]:
     return [AgentSummary(agent_id=row[0], latest_published_version=row[1]) for row in rows]
 
 
+class VersionSummary(BaseModel):
+    version: int
+    status: str
+    created_at: str
+
+
+@router.get("/{agent_id}/versions", response_model=list[VersionSummary])
+async def list_agent_versions(agent_id: str) -> list[VersionSummary]:
+    """Liệt kê THẬT các version đã từng publish cho `agent_id` (đọc `wb.recipe_versions`, RLS tự
+    lọc theo tenant) — cho UI Rollback dựng dropdown chọn đúng version tồn tại, thay vì để admin
+    tự gõ số tuỳ ý rồi chờ 404 (`rollback()` vẫn fail-closed như cũ, đây chỉ thêm gợi ý UX thật
+    dựa trên dữ liệu có sẵn, không thay đổi hàng rào)."""
+    session = get_request_session()
+    conn = get_request_connection()
+    identity = await fetch_fresh_identity(conn, session.user)
+    require_admin(identity.roles)
+
+    cur = await conn.execute(
+        """
+        SELECT version, status, created_at
+        FROM wb.recipe_versions
+        WHERE agent_id = %s
+        ORDER BY version DESC
+        """,
+        (agent_id,),
+    )
+    rows = await cur.fetchall()
+    return [VersionSummary(version=row[0], status=row[1], created_at=row[2].isoformat()) for row in rows]
+
+
 class RollbackRequest(BaseModel):
     to_version: int
 
