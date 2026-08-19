@@ -46,7 +46,7 @@ from studio_app.core._db import get_pool
 from studio_app.eval_adapter import EngineAgentRunner
 from studio_app.middleware import get_request_connection, get_request_session
 from studio_app.obs.trace_writer import PgTraceWriter
-from studio_app.providers.factory import CallistoEmbedding, build_llm
+from studio_app.providers.factory import build_embedding, build_llm
 from studio_app.routes.runs import RunRequest
 from studio_app.settings import get_settings
 
@@ -124,7 +124,7 @@ async def _evaluate(agent_id: str, body: RunRequest, session: ResolvedContext) -
     # connection middleware đã giữ), khác hẳn `get_pool()` ở đây.
     pool = await get_pool()
     settings = get_settings()
-    embedding = CallistoEmbedding()
+    embedding = build_embedding()
     runner = EngineAgentRunner(
         kb_search=PgKbSearch(pool, embedding),
         llm=build_llm(),

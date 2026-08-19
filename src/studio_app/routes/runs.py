@@ -30,7 +30,7 @@ from studio_app.authz import fetch_fresh_identity, require_admin
 from studio_app.core._db import get_pool
 from studio_app.middleware import get_request_connection, get_request_session
 from studio_app.obs.trace_writer import PgTraceWriter
-from studio_app.providers.factory import CallistoEmbedding, build_llm
+from studio_app.providers.factory import build_embedding, build_llm
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 
@@ -129,7 +129,7 @@ async def create_run(body: RunRequest) -> RunResponse:
     # giữ connection xuyên suốt `call_next()` cho các route không cần nó suốt cả lượt chạy. Không
     # làm ở đây — ghi lại tường minh làm follow-up, không phải để im như đợt 3 đã cảnh báo.
     pool = await get_pool()
-    embedding: EmbeddingService = CallistoEmbedding()
+    embedding: EmbeddingService = build_embedding()
     kb_search = PgKbSearch(pool, embedding)
     llm = build_llm()
     trace_writer = PgTraceWriter(pool)
