@@ -1,4 +1,5 @@
-"""Seed `core.tenants` với 2 tenant demo (ankor/borea) — chạy tay 1 lần.
+"""Seed `core.tenants` với 2 tenant demo (ankor/borea) + 1 tài khoản admin mỗi tenant — chạy tay
+1 lần.
 
 `core.tenants` (`core/schema.py`) không có seed data nào sau khi tạo — bảng trống hoàn toàn.
 Không seed ở `packages/kb` (kb chỉ ingest NỘI DUNG tài liệu vào `kb.chunks`, không sở hữu
@@ -14,6 +15,18 @@ Nếu seed bằng UUID ngẫu nhiên, `core.tenants` sẽ có 2 hàng nhưng KH�
 nào các quadrant khác đang dùng — toàn bộ demo login → publish → chat sẽ vỡ ở khâu "tenant_id
 tồn tại trong core.tenants" dù mọi thứ khác đúng.
 
+**Tài khoản admin đi kèm mỗi tenant** (`admin@ankor.vn`/`admin@borea.vn`) thay cho việc phải tự
+insert tay `core.users` theo README "Cách B" — gán thẳng `tenant_id` fix cứng ở trên (không qua
+route `POST /api/admin/companies`, vốn luôn sinh `tenant_id` ngẫu nhiên) nên khớp `kb.chunks` mà
+`ingest_callisto.py` đã gắn sẵn. Roles gán đủ cả 4 role nội dung (`SECTION_VOCAB`) + `admin` để
+canvas/chat ra dữ liệu thật ngay, không cần superadmin tạo `core.sections` trước (insert thẳng
+SQL, không qua route `POST /api/admin/users` nên không bị validate theo `core.sections`).
+
+Mật khẩu đọc từ biến môi trường `STUDIO_DEMO_ADMIN_PASSWORD` — có default cho tiện chạy dev cục bộ
+NGAY (khác `seed_superadmin.py`: rủi ro thấp hơn nhiều, tài khoản này chỉ có quyền trong 1 tenant
+demo chứa dữ liệu fixture, không phải quyền toàn hệ thống như superadmin) — nhưng vẫn nên override
+bằng biến môi trường nếu DB này lộ ra ngoài máy cá nhân.
+
 Chạy:
     uv run python apps/studio/scripts/seed_demo_tenants.py
 """
@@ -21,11 +34,13 @@ Chạy:
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from uuid import UUID
 
 from studio_app.core._db import close_pools, get_admin_pool
 from studio_app.core.schema import ensure_all_schemas
+from studio_app.jwt_auth import hash_password
 
 # Khớp 1:1 với `studio_workbench.builder.ANKOR_ID`/`BOREA_ID` và
 # `studio_kb.doc_factory.TENANT_IDS` — 3 nơi đều phải ra cùng giá trị, đây là SSOT thứ 3 (không
@@ -36,6 +51,16 @@ _DEMO_TENANTS: dict[str, UUID] = {
     "ankor": UUID("a0000000-0000-0000-0000-000000000001"),
     "borea": UUID("b0000000-0000-0000-0000-000000000001"),
 }
+
+# email theo đúng quy ước README "Cách B" đã dùng cho `ankor` (`admin@ankor.vn`) — mở rộng thêm
+# `borea` theo cùng quy luật. `SECTION_VOCAB` (studio_kb.doc_factory_core) gán đủ để canvas/chat
+# ra dữ liệu KB thật ngay sau khi ingest, không cần superadmin tạo `core.sections` trước.
+_DEMO_ADMIN_ROLES: list[str] = ["admin", "public", "hr", "finance", "engineering"]
+_DEMO_ADMIN_EMAILS: dict[str, str] = {
+    "ankor": "admin@ankor.vn",
+    "borea": "admin@borea.vn",
+}
+_DEFAULT_DEMO_ADMIN_PASSWORD = "doi-mat-khau-nay-truoc-khi-dung-that"
 
 
 def _assert_matches_known_constants() -> None:
@@ -58,15 +83,36 @@ def _assert_matches_known_constants() -> None:
 
 async def seed_demo_tenants() -> None:
     _assert_matches_known_constants()
+    password = os.environ.get("STUDIO_DEMO_ADMIN_PASSWORD", _DEFAULT_DEMO_ADMIN_PASSWORD)
+    # bcrypt giới hạn 72 byte — fail loud thay vì để `hash_password` raise traceback khó hiểu nếu
+    # ai đó override bằng 1 password quá dài (cùng guard `seed_superadmin.py` đã dùng).
+    if len(password.encode("utf-8")) > 72:
+        raise SystemExit("STUDIO_DEMO_ADMIN_PASSWORD tối đa 72 byte (giới hạn bcrypt).")
+    password_hash = hash_password(password)
+
     admin = await get_admin_pool()
-    await ensure_all_schemas(admin)  # đảm bảo core.tenants tồn tại trước khi INSERT
+    await ensure_all_schemas(admin)  # đảm bảo core.tenants/core.users tồn tại trước khi INSERT
+    created_admins: list[str] = []
     async with admin.connection() as conn:
         for name, tenant_id in _DEMO_TENANTS.items():
             await conn.execute(
                 "INSERT INTO core.tenants (id, name) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING",
                 (tenant_id, name),
             )
+            email = _DEMO_ADMIN_EMAILS[name]
+            cur = await conn.execute(
+                "INSERT INTO core.users (tenant_id, email, password_hash, roles) "
+                "VALUES (%s, %s, %s, %s) ON CONFLICT (email) DO NOTHING RETURNING id",
+                (tenant_id, email, password_hash, _DEMO_ADMIN_ROLES),
+            )
+            if await cur.fetchone() is not None:
+                created_admins.append(email)
+
     print(f"Seeded {len(_DEMO_TENANTS)} tenant demo vào core.tenants: {list(_DEMO_TENANTS)}")
+    if created_admins:
+        print(f"Seeded admin cho {len(created_admins)} tenant: {created_admins} (mật khẩu: {password!r})")
+    else:
+        print("Admin của 2 tenant demo đã tồn tại từ trước — không đổi gì (mật khẩu giữ nguyên).")
 
 
 async def main() -> None:

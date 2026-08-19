@@ -17,6 +17,7 @@ P5-P8 for the quadrant classes themselves).
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -38,6 +39,30 @@ from studio_app.routes import documents as documents_routes
 from studio_app.routes import publish as publish_routes
 from studio_app.routes import runs as runs_routes
 from studio_app.routes import sections as sections_routes
+
+
+# Windows mặc định `ProactorEventLoop`; psycopg async từ chối thẳng ("Psycopg cannot use the
+# 'ProactorEventLoop' to run in async mode"). `apps/studio/scripts/seed_*.py` + kit-root
+# `conftest.py` tự vá bằng `asyncio.set_event_loop_policy(...)` NGAY TRƯỚC `asyncio.run(main())`
+# CỦA RIÊNG CHÚNG — cách đó KHÔNG áp dụng được cho `uvicorn`: `uvicorn.loops.asyncio.
+# asyncio_loop_factory()` (Python 3.14, uvicorn 0.51 — kiểm chứng trực tiếp bằng repro cô lập, không
+# suy đoán) trả THẲNG `asyncio.ProactorEventLoop` trên Windows, bỏ qua hoàn toàn policy toàn cục
+# đang set — set-policy ở module-level (bản vá trước ở đây) chạy đúng lúc nhưng vô nghĩa, vì
+# uvicorn không đọc policy đó khi tự chọn loop.
+#
+# Cách ĐÚNG (uvicorn hỗ trợ chính thức, 2 hình dạng khác nhau — dễ nhầm): `Config.loop` nhận 1
+# chuỗi "module:function". `get_loop_factory()` (`uvicorn/config.py`) rẽ 2 nhánh: (a) tên có sẵn
+# ("auto"/"asyncio"/"uvloop") -> gọi hàm đó VỚI `use_subprocess=` rồi mới trả kết quả (dạng
+# "factory-của-factory", đúng hình `uvicorn.loops.asyncio.asyncio_loop_factory`); (b) chuỗi TUỲ Ý
+# (như của chúng ta) -> `return import_from_string(self.loop)` NGAY, KHÔNG gọi thêm — nghĩa là hàm ở
+# nhánh (b) phải là `Callable[[], AbstractEventLoop]` THẬT (0 tham số, trả THẲNG 1 instance loop),
+# KHÔNG phải factory-của-factory như nhánh (a). Bản đầu của hàm này viết nhầm theo hình (a) (nhận
+# `use_subprocess`, trả CLASS `SelectorEventLoop` chưa gọi) — `Runner` gọi nó như nhánh (b), tưởng
+# giá trị trả về (chính là CLASS) là loop INSTANCE, gọi `create_task`/`close` như method KHÔNG bound
+# -> "missing 1 required positional argument: self" (đã thấy khi chạy thật, không phải suy đoán).
+def _win_loop_factory() -> asyncio.AbstractEventLoop:
+    return asyncio.SelectorEventLoop()
+
 
 # `CreateUserRequest.password`/`CreateCompanyRequest.admin_password` — tên field CÓ mật khẩu, ở
 # BẤT KỲ route nào tương lai thêm field mật khẩu mới cũng nên đặt tên khớp 1 trong 2 chuỗi này
