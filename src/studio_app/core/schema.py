@@ -81,6 +81,30 @@ ALTER TABLE core.users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAU
 -- nhưng trước bản vá này JWT cũ vẫn sống nguyên tới hết `jwt_expire_minutes`, mặc định 480 phút).
 ALTER TABLE core.users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMPTZ NULL;
 
+-- Cache vector production cho `GatewayEmbedding` (app#30, QĐ-2 — Postgres, KHÔNG file-based:
+-- settings.py:37-51 ghi lại ba hiện thân của cùng lớp bug đường-dẫn-file). Đường ĐỌC
+-- (packages/kb/src/studio_kb/postgres.py:213 `embed([query])`) là 1 text/call, không batch được
+-- từ trong apps/studio (đứng sau ranh giới package DE) — cache thay cho batching ở đó.
+--
+-- cache_key = sha256(f"{model}|{dim}|{text}") — khớp nguyên văn `kb#40`
+-- (packages/kb/tests/embedding-tests/_vector_cache.py:56-63). Gộp model+dim vào khoá chứ không chỉ
+-- băm text: cùng câu qua gemini-embedding-001 ở 2048 vs 1536 là HAI vector khác nhau.
+--
+-- KHÔNG RLS (cố ý, khác wb.recipes/kb.chunks): bảng này là một HÀM THUẦN của (model, dim, text) —
+-- cùng input luôn cho cùng vector, bất kể tenant nào hỏi. Dùng chung hàng giữa các tenant là ĐÚNG
+-- ngữ nghĩa, không phải rò rỉ — bảng không mang cột `tenant_id` nào để mà rò.
+--
+-- `embedding vector(2048)` cố ý viết hằng số, KHÔNG nội suy `EMBEDDING_DIM` từ Python vào chuỗi
+-- DDL này: đây là schema `core` (apps/studio sở hữu), không phải `kb`. Không index HNSW
+-- (packages/kb/src/studio_kb/schema.py:40-41 khoá cứng "2048 chỉ hợp lệ VÌ không còn index HNSW").
+CREATE TABLE IF NOT EXISTS core.embedding_cache (
+    cache_key TEXT PRIMARY KEY,
+    model TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    embedding vector(2048) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- "Phòng ban"/section per tenant (thay SECTION_VOCAB toàn cục cứng của studio_kb.doc_factory) —
 -- routes/sections.py: chỉ superadmin tạo/sửa/xoá, routes/admin.py::create_user tra động bảng này
 -- để validate roles thay vì frozenset tĩnh.
