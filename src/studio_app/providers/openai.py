@@ -19,17 +19,22 @@ from __future__ import annotations
 
 
 class OpenAIProvider:
-    """`LLM` Protocol impl only — no `embed()` method exists on this class (F3)."""
+    """`LLM` Protocol impl only — no `embed()` method exists on this class (F3).
 
-    def __init__(self, *, api_key: str, model: str = "o4-mini") -> None:
+    `base_url` (optional): trỏ sang endpoint tương thích OpenAI khác (vd OpenRouter
+    `https://openrouter.ai/api/v1`, model id kiểu `openai/gpt-4o-mini`) thay vì API OpenAI gốc —
+    `None` (mặc định) giữ nguyên hành vi cũ, SDK tự dùng endpoint OpenAI chính thức."""
+
+    def __init__(self, *, api_key: str, model: str = "o4-mini", base_url: str | None = None) -> None:
         self._api_key = api_key
         self._model = model
+        self._base_url = base_url
 
     async def complete(self, prompt: str, **kwargs: object) -> str:
         del kwargs  # extensibility hook — forwarding to the SDK is a later concern, same as gemini.py
         from openai import AsyncOpenAI  # type: ignore[import-not-found]
 
-        client = AsyncOpenAI(api_key=self._api_key)
+        client = AsyncOpenAI(api_key=self._api_key, base_url=self._base_url)
         response = await client.chat.completions.create(
             model=self._model,
             messages=[{"role": "user", "content": prompt}],

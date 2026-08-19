@@ -30,7 +30,7 @@ from studio_app.authz import fetch_fresh_identity, require_admin
 from studio_app.core._db import get_pool
 from studio_app.middleware import get_request_connection, get_request_session
 from studio_app.obs.trace_writer import PgTraceWriter
-from studio_app.providers.factory import CallistoEmbedding, build_llm
+from studio_app.providers.factory import CallistoEmbedding, build_llm, build_tool_dispatch
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 
@@ -141,6 +141,7 @@ async def create_run(body: RunRequest) -> RunResponse:
         llm=llm,
         embedding=embedding,
         trace_writer=trace_writer,
+        tool_dispatch=build_tool_dispatch(recipe, kb_search, session),
     )
 
     timeline_text = render_timeline(result.events, expected=walk_from_dag(recipe.dag))

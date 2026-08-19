@@ -31,7 +31,7 @@ from studio_app.core._db import get_pool
 from studio_app.eval_adapter import _llm_answer
 from studio_app.middleware import get_request_connection, get_request_session
 from studio_app.obs.trace_writer import PgTraceWriter
-from studio_app.providers.factory import CallistoEmbedding, build_llm
+from studio_app.providers.factory import CallistoEmbedding, build_llm, build_tool_dispatch
 
 router = APIRouter(prefix="/api/agents", tags=["chat"])
 
@@ -114,13 +114,15 @@ async def chat(agent_id: str, body: ChatRequest) -> ChatResponse:
     # middleware đã giữ suốt request, không phải "tiết kiệm" hơn).
     pool = await get_pool()
     embedding = CallistoEmbedding()
+    kb_search = PgKbSearch(pool, embedding)
     result = await interpreter.run(
         recipe,
         session_context=session_context,
-        kb_search=PgKbSearch(pool, embedding),
+        kb_search=kb_search,
         llm=build_llm(),
         embedding=embedding,
         trace_writer=PgTraceWriter(pool),
+        tool_dispatch=build_tool_dispatch(recipe, kb_search, session_context),
     )
 
     try:
