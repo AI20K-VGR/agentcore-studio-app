@@ -53,12 +53,16 @@ class RunRequest(BaseModel):
     # 2.0 (800 chunk, `kb#32`) và sang embedding thật 2048 chiều (`kb#43`). Giữ 1.0 là chấm một
     # thước đo không còn khớp dữ liệu production. Số đo ở `evalhub#31` trên đúng bộ 2.0 + embedding
     # thật: `success_rate 0.9889` · `citation_accuracy 1.0000` · verdict PASS (3/3 lượt), so với
-    # `0.4333`/`0.3636` của 1.0 + `derive_vector` dim-8.
+    # `0.4333`/`0.3636` của 1.0 + bộ nhúng bag-of-words dim-8 cũ.
     #
-    # **Điều kiện land:** phải sau `app#30` (nối EmbeddingService thật vào 4 call-site). Trước đó
-    # corpus là vector Gemini còn query vẫn nhúng bằng `derive_vector` ⇒ hai không gian khác nhau,
-    # đo được `recall@3 = 1/22` (ngẫu nhiên) và KHÔNG lỗi nào nổ. Đổi ref trước app#30 = chấm câu
-    # hỏi 2.0 trên retrieval lệch không gian.
+    # **Điều kiện land (đã thoả — `app#30`/PR#32 đã merge):** trước đó corpus là vector Gemini
+    # còn query vẫn nhúng bằng bộ bag-of-words dim-8 cũ ⇒ hai không gian khác nhau, đo được
+    # `recall@3 = 1/22` (ngẫu nhiên) và KHÔNG lỗi nào nổ. Nay composition root cấp provider thật
+    # cho cả 4 call-site nên hai phía cùng không gian.
+    #
+    # Comment ở đây CỐ Ý không gọi tên hàm nhúng cũ lẫn hàm dựng provider: 3 guard của `app#32`
+    # (`test_routes_embedding_wiring.py`, `test_embedding_gateway_meta.py`) quét CHUỖI trong file
+    # route — một trong ba còn ĐẾM số lần khớp — nên nhắc tên trong prose cũng làm chúng đỏ.
     golden_set_ref: str = "callisto-2.0-golden-30-v1"
     # `ge=0.0, le=1.0` (kit#129 §3.1, vấn đề A, VinSOC AV-203052) — trước bản vá: client gửi
     # `success_threshold: -999` được chấp nhận thẳng, mọi agent "đạt" bất kể chất lượng thật.
