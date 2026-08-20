@@ -20,6 +20,12 @@ dependencies = [
     "pyjwt>=2.7",
     "bcrypt>=4.1",
     "python-multipart>=0.0.9",
+    # `openai` KHÔNG còn là extra: nhóm chốt OpenAI làm provider chính (app#19) và
+    # `build_embedding()` cũng đi qua OpenRouter bằng cùng SDK-shape, nên nó là đường DUY NHẤT
+    # chạy được của production. Để ở `[optional-dependencies]` làm `uv sync --frozen` (đúng lệnh
+    # README) KHÔNG cài nó ⇒ `/evaluate` chết `ModuleNotFoundError` thành 500 trần ở bước llm-step
+    # (dựng lại được: tổng duyệt demo 20/08). `gemini` giữ nguyên extra vì nó là đường rollback.
+    "openai>=1.40",
 ]
 
 # Declared now (F7) so P9's observability wiring and Gemini LLM-provider wiring never need
@@ -30,9 +36,6 @@ obs = [
 ]
 gemini = [
     "google-genai",
-]
-openai = [
-    "openai",
 ]
 
 [build-system]

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 from typing import assert_never
 
 from fastapi import HTTPException
@@ -53,10 +54,30 @@ def build_llm() -> LLM:
                     status_code=500,
                     detail="STUDIO_LLM_PROVIDER=openai nhưng thiếu STUDIO_OPENAI_API_KEY",
                 )
+            # `importlib.util.find_spec` chứ không `import openai`: dựng provider phải rẻ, và chỗ
+            # này chỉ cần biết package CÓ hay KHÔNG. `openai.py::complete()` import lazy nên thiếu
+            # package sẽ nổ `ModuleNotFoundError` tận trong `interpreter.run()` ⇒ 500 trần, không
+            # nói được phải làm gì (đo được ở tổng duyệt demo 20/08: `/evaluate` 500 sau 4.4s).
+            # Kiểm ở composition root biến nó thành 503 có lời khuyên, cùng khuôn ca thiếu key.
+            if importlib.util.find_spec("openai") is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "thiếu package `openai` trong môi trường — chạy `uv sync --frozen` lại sau khi "
+                        "bump con trỏ `apps/studio` (openai giờ là dependency thường, không còn extra)"
+                    ),
+                )
             return OpenAIProvider(
                 api_key=settings.openai_api_key,
                 base_url=settings.openai_base_url,
-                model=settings.openai_model or "o4-mini",
+                # `gpt-4o-mini` chứ không `o4-mini` (đổi 20/08). Đo trên golden 2.0 + embedding thật,
+                # 3 lượt mỗi model, cùng harness/judge/retrieval — chỉ đổi model trả lời:
+                #   o4-mini      success 0.6667–0.8333 (tb 0.7556) · citation 0.6818–0.8636 · FAIL 3/3
+                #   gpt-4o-mini  success 0.9667–1.0000 (tb 0.9889) · citation 1.0000          · PASS 3/3
+                # `o4-mini` là dòng reasoning: nó hay BỎ marker `[chunk_id]` dù chunk đúng nằm trong
+                # ngữ cảnh (recall@3 = 22/22), nên trục citation tụt mà retrieval không hề sai — xem
+                # `evalhub#31`. Override bằng `STUDIO_OPENAI_MODEL` khi cần đo model khác.
+                model=settings.openai_model or "gpt-4o-mini",
             )
         case LlmProvider.GEMINI:
             from studio_app.providers.gemini import GeminiProvider
