@@ -12,7 +12,7 @@ không viết lại logic rollback."""
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from studio_contracts import Recipe
 from studio_workbench.publish import rollback
 
@@ -132,7 +132,23 @@ async def get_agent_recipe(agent_id: str, version: int | None = None) -> AgentRe
     # `undefined`, mọi cạnh trỏ về 1 node "…__undefined" không tồn tại — canvas nạp xong TRÔNG như
     # có cạnh (handle nối vẫn vẽ chấm) nhưng `graph_lint`/`buildRecipe` thấy 0 cạnh thật, báo "4
     # start node" (đã tái hiện + xác nhận đúng nguyên nhân qua DB thật, không phải suy đoán).
-    recipe = Recipe.model_validate(row[0])
+    #
+    # Đánh đổi đi kèm: `model_validate()` + `model_dump()` KHÔNG passthrough — field nào contract
+    # hiện tại không khai (vd. ghi bởi 1 rev contract mới hơn, additive-only) bị Pydantic
+    # `extra='ignore'` (mặc định) âm thầm cắt khỏi response, dù vẫn còn nguyên trong DB.
+    #
+    # Row cũ không còn hợp lệ theo contract HIỆN TẠI (vd. `scorecard_threshold.success` publish
+    # trước khi kit#129 §3.1 siết `ge=0.0, le=1.0`) làm `model_validate()` ném `ValidationError` —
+    # không có handler nào cho lỗi này (`app.py` chỉ bắt `RequestValidationError`), nên trần ra sẽ
+    # thành 500 không detail. Bắt riêng để admin soi version cũ (đường phục hồi/rollback) thấy lý do
+    # thay vì 500 câm.
+    try:
+        recipe = Recipe.model_validate(row[0])
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"recipe version {row[1]!r} không đọc được theo contract hiện tại: {exc}",
+        ) from exc
     return AgentRecipeResponse(recipe=recipe.model_dump(mode="json", by_alias=True), version=row[1], status=row[2])
 
 
