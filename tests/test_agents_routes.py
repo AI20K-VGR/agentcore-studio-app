@@ -313,7 +313,14 @@ async def test_get_agent_recipe_rejects_row_invalid_under_current_contract(admin
     Ca thật: `scorecard_threshold.success = -999` được server CHẤP NHẬN trước khi kit#129 §3.1 siết
     `ge=0.0, le=1.0` (docstring `ScorecardThreshold`). Row publish trước lần siết đó giờ nằm vĩnh
     viễn trong `wb.recipe_versions` (append-only) — endpoint phải trả 500 CÓ detail nêu rõ version
-    nào hỏng, không phải 500 câm, vì đây đúng đường phục hồi của admin (soi version cũ → rollback)."""
+    nào hỏng, không phải 500 câm, vì đây đúng đường phục hồi của admin (soi version cũ → rollback).
+
+    Review app#37 round 2 (dholmes0207, M4): assertion gốc (`"version" in detail and "1" in
+    detail`) SỐNG SÓT qua mutation đổi `row[1]` (đúng version của row) thành tham số query
+    `version` (`None` ở đây vì không truyền) — `"version"` là chữ cứng trong template nên luôn có,
+    `"1"` tình cờ khớp `"1 validation error for Recipe"` bên trong thông điệp `pydantic`, không
+    chứng minh được version có in đúng hay không. Khoá chặt bằng chuỗi liền `"version 1"` — mutation
+    trên sẽ đổi thành `"version None"`, giết được assertion."""
     tenant_id = await _seed_tenant(admin_pool, "agents-probe-l")
     await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
 
@@ -337,4 +344,10 @@ async def test_get_agent_recipe_rejects_row_invalid_under_current_contract(admin
         middleware._request_session.reset(token)  # type: ignore[arg-type]
 
     assert exc_info.value.status_code == 500
-    assert "version" in str(exc_info.value.detail) and "1" in str(exc_info.value.detail)
+    detail = str(exc_info.value.detail)
+    assert "version 1" in detail, f"detail phải nêu đúng version của row hỏng — thấy {detail!r}"
+    assert "success" in detail, "detail phải nêu field trượt validate để admin biết chỗ hỏng"
+    assert "-999" not in detail, (
+        "N1 (review app#37 round 2): detail KHÔNG được echo input_value trần — dùng "
+        "exc.errors(include_input=False, ...), không phải str(exc)"
+    )

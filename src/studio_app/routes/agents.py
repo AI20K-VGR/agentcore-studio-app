@@ -142,12 +142,26 @@ async def get_agent_recipe(agent_id: str, version: int | None = None) -> AgentRe
     # không có handler nào cho lỗi này (`app.py` chỉ bắt `RequestValidationError`), nên trần ra sẽ
     # thành 500 không detail. Bắt riêng để admin soi version cũ (đường phục hồi/rollback) thấy lý do
     # thay vì 500 câm.
+    #
+    # Review app#37 round 2 (dholmes0207, N1): `str(exc)` echo `input_value` của field TRƯỢT
+    # validate — hôm nay an toàn (field trượt luôn là `scorecard_threshold.success`, không nhạy
+    # cảm), nhưng `agent_config.instructions`/`kb_binding.scope` (`schema.py` xếp loại tenant PII,
+    # đúng lý do bật RLS `FORCE`) nằm CÙNG model. Ngày nào một ràng buộc mới rơi lên 1 trong 2 field
+    # đó (đúng khuôn kit#129 §3.1 vừa làm với `scorecard_threshold`), `str(exc)` sẽ mang tenant PII
+    # vào body 500 → access log của reverse-proxy/APM — đúng hạng lỗ mà
+    # `_redact_sensitive_validation_errors` (`app.py:153`) đóng ở chiều REQUEST, chỉ khác chiều
+    # RESPONSE. `include_input=False` cắt `input_value` khỏi mọi error entry (giữ lại `loc`/`type`/
+    # `msg` — đủ để admin biết field nào hỏng), `include_url=False` bỏ link docs pydantic.io không
+    # cần thiết trong response lỗi.
     try:
         recipe = Recipe.model_validate(row[0])
     except ValidationError as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"recipe version {row[1]!r} không đọc được theo contract hiện tại: {exc}",
+            detail=(
+                f"recipe version {row[1]!r} không đọc được theo contract hiện tại: "
+                f"{exc.errors(include_input=False, include_url=False)}"
+            ),
         ) from exc
     return AgentRecipeResponse(recipe=recipe.model_dump(mode="json", by_alias=True), version=row[1], status=row[2])
 
