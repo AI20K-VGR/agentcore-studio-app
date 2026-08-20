@@ -32,7 +32,10 @@ class OpenAIProvider:
 
     async def complete(self, prompt: str, **kwargs: object) -> str:
         del kwargs  # extensibility hook — forwarding to the SDK is a later concern, same as gemini.py
-        from openai import AsyncOpenAI  # type: ignore[import-not-found]
+        # Hai error-code (tiền lệ `engine#22`): `openai` giờ là dependency THƯỜNG nên môi trường
+        # đủ sẽ không có `import-not-found`, nhưng giữ dạng hai code để dòng này hợp lệ ở cả
+        # trạng thái chưa cài (mypy không thấy package) lẫn đã cài (ignore thành thừa).
+        from openai import AsyncOpenAI  # type: ignore[import-not-found, unused-ignore]
 
         client = AsyncOpenAI(api_key=self._api_key, base_url=self._base_url)
         response = await client.chat.completions.create(
