@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from uuid import UUID
@@ -12,7 +13,14 @@ import pytest_asyncio
 from fastapi import HTTPException
 from studio_app import middleware
 from studio_app.core._db import Pool, close_pools, get_pool
-from studio_app.routes.agents import RollbackRequest, list_agent_versions, list_agents, rollback_agent
+from studio_app.routes.agents import (
+    RollbackRequest,
+    get_agent_recipe,
+    list_agent_versions,
+    list_agents,
+    rollback_agent,
+)
+from studio_workbench import create_recipe_d4
 from studio_workbench.tenant_wall import ResolvedContext
 
 
@@ -259,3 +267,74 @@ async def test_list_agent_versions_scoped_to_own_tenant_via_rls(admin_pool: Pool
         middleware._request_session.reset(token)  # type: ignore[arg-type]
 
     assert len(result) == 1, "RLS phải tự lọc — không thấy version của tenant_b dù cùng agent_id"
+
+
+async def test_get_agent_recipe_normalizes_from_alias_regardless_of_write_path(admin_pool: Pool) -> None:
+    """Review app#37 F1 (dholmes0207, ⛔): trước test này, cả app#37 lẫn workbench#30 là mutation
+    sống — xoá `by_alias=True` ở route (`Recipe.model_validate(...).model_dump(by_alias=True)`) hay
+    ở `publish()` thì suite vẫn xanh 100%, vì `get_agent_recipe` chưa từng có test nào chạm tới.
+
+    Seed THẲNG bằng đúng đường ghi hỏng đã gây bug (`recipe.model_dump_json()` KHÔNG `by_alias`,
+    cùng công thức `test_routes_chat_as_roles.py::_seed_published_recipe`) — tái dựng đúng row
+    `publish()` cũ để lại: DB lưu `"from_"` thay vì `"from"`. Route phải tự chuẩn hoá lại khi đọc,
+    bất kể đường ghi nào tạo ra hàng đó."""
+    tenant_id = await _seed_tenant(admin_pool, "agents-probe-k")
+    await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+
+    agent_id = "agent-k1"
+    recipe = create_recipe_d4(agent_id=agent_id, tenant_id=tenant_id)
+    async with admin_pool.connection() as conn, conn.transaction():
+        await _bind_tenant(conn, tenant_id)
+        await conn.execute(
+            "INSERT INTO wb.recipes (agent_id, tenant_id, recipe, version, status) "
+            "VALUES (%s, %s, %s::jsonb, 1, 'published')",
+            (agent_id, str(tenant_id), recipe.model_dump_json()),
+        )
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        async with _simulate_request_connection(tenant_id):
+            result = await get_agent_recipe(agent_id)
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    edges = result.recipe["dag"]["edges"]  # type: ignore[index]
+    assert edges, "seed (create_recipe_d4) phải sinh cạnh thật — nếu rỗng, assert dưới vô nghĩa"
+    assert all("from" in e and "from_" not in e for e in edges), (
+        f"route phải chuẩn hoá lại alias dây bất kể đường ghi cũ để lại 'from_' — thấy {edges}"
+    )
+
+
+async def test_get_agent_recipe_rejects_row_invalid_under_current_contract(admin_pool: Pool) -> None:
+    """Review app#37 F2 (dholmes0207, ⚠️): `model_validate()` biến row cũ hợp lệ-lúc-ghi nhưng
+    không còn hợp lệ theo contract HIỆN TẠI thành `ValidationError` trần — `app.py` không có
+    handler cho lỗi này (chỉ bắt `RequestValidationError`), nên bay thẳng thành 500 không detail.
+
+    Ca thật: `scorecard_threshold.success = -999` được server CHẤP NHẬN trước khi kit#129 §3.1 siết
+    `ge=0.0, le=1.0` (docstring `ScorecardThreshold`). Row publish trước lần siết đó giờ nằm vĩnh
+    viễn trong `wb.recipe_versions` (append-only) — endpoint phải trả 500 CÓ detail nêu rõ version
+    nào hỏng, không phải 500 câm, vì đây đúng đường phục hồi của admin (soi version cũ → rollback)."""
+    tenant_id = await _seed_tenant(admin_pool, "agents-probe-l")
+    await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+
+    agent_id = "agent-l1"
+    recipe_dict = create_recipe_d4(agent_id=agent_id, tenant_id=tenant_id).model_dump(mode="json", by_alias=True)
+    recipe_dict["scorecard_threshold"]["success"] = -999
+    async with admin_pool.connection() as conn, conn.transaction():
+        await _bind_tenant(conn, tenant_id)
+        await conn.execute(
+            "INSERT INTO wb.recipes (agent_id, tenant_id, recipe, version, status) "
+            "VALUES (%s, %s, %s::jsonb, 1, 'published')",
+            (agent_id, str(tenant_id), json.dumps(recipe_dict)),
+        )
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            async with _simulate_request_connection(tenant_id):
+                await get_agent_recipe(agent_id)
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert exc_info.value.status_code == 500
+    assert "version" in str(exc_info.value.detail) and "1" in str(exc_info.value.detail)
