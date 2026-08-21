@@ -56,11 +56,17 @@ def _sample_event(event_id: str, tenant_id: UUID) -> TraceEvent:
 
 @pytest_asyncio.fixture
 async def obs_trace_events_rls(admin_pool: Pool) -> AsyncIterator[None]:
-    """Bật `ENABLE`+`FORCE ROW LEVEL SECURITY` cho `obs.trace_events` CỤC BỘ, chỉ trong phạm vi
-    test dùng fixture này — gỡ lại (DROP POLICY + DISABLE RLS) ở teardown để KHÔNG rò rỉ sang test
-    khác trong cùng DB dùng chung container (vd `test_trace_writer.py` đọc `obs.trace_events` qua
-    `pool` không set `app.tenant_id` — nếu RLS còn bật sau test này, SELECT đó sẽ tự nhiên về 0
-    dòng và test đó sẽ đỏ vì lý do KHÔNG liên quan)."""
+    """Bật `ENABLE`+`FORCE ROW LEVEL SECURITY` cho `obs.trace_events` — kể từ GAP-1 (mini-RFC B,
+    4/4 chữ ký), production `obs/schema.py::ddl()` **đã tự bật** RLS này ngay từ
+    `ensure_all_schemas()`, nên 2 dòng `ENABLE`/`FORCE` dưới đây giờ CHỈ còn là idempotent no-op
+    (an toàn giữ lại, phòng ca fixture này chạy trên 1 DB chưa từng migrate qua `ddl()` mới).
+
+    Trước đây fixture này còn tự `DISABLE ROW LEVEL SECURITY` ở teardown để "trả DB về trạng thái
+    cũ" (khi đó RLS production CHƯA tồn tại, nên trạng thái cũ = tắt). Giờ RLS là thuộc tính THẬT của
+    production, không phải thứ do fixture này sở hữu — teardown chỉ còn `DROP POLICY` (dọn đúng
+    policy phụ `_POLICY_NAME` fixture này tự tạo), KHÔNG được đụng `DISABLE ROW LEVEL SECURITY` nữa:
+    làm vậy sẽ tắt luôn policy production `obs_trace_events_tenant_isolation` cho mọi test chạy sau
+    trong cùng session (test polution xuyên bài, sai không liên quan tới bài đang chạy)."""
     async with admin_pool.connection() as conn:
         await conn.execute("ALTER TABLE obs.trace_events ENABLE ROW LEVEL SECURITY")
         await conn.execute("ALTER TABLE obs.trace_events FORCE ROW LEVEL SECURITY")
@@ -79,7 +85,6 @@ async def obs_trace_events_rls(admin_pool: Pool) -> AsyncIterator[None]:
             await conn.execute(
                 sql.SQL("DROP POLICY IF EXISTS {} ON obs.trace_events").format(sql.Identifier(_POLICY_NAME))
             )
-            await conn.execute("ALTER TABLE obs.trace_events DISABLE ROW LEVEL SECURITY")
 
 
 async def _count_visible(pool: Pool, event_id: str, tenant_id: UUID | None) -> int:
