@@ -60,6 +60,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from uuid import UUID
 
+from psycopg import sql
 from studio_app.core._db import Pool
 from studio_app.eval_adapter import EngineAgentRunner
 from studio_app.obs.trace_writer import PgTraceWriter
@@ -183,10 +184,22 @@ def _runner_tot(golden: GoldenSet, tenant_map: Mapping[str, UUID]) -> StubAgentR
 
 
 async def _dem_trace_rows(pool: Pool) -> int:
+    """Tổng số dòng `obs.trace_events` **trên MỌI tenant của golden-30** (`TENANT_IDS`).
+
+    GAP-1: bảng này giờ có RLS thật — 1 `SET LOCAL app.tenant_id` chỉ soi được đúng 1 tenant, mà
+    golden-30 rải case qua cả `ankor` lẫn `borea` (`TENANT_IDS`). Đếm qua đúng 1 tenant sẽ RA
+    SỐ THẬT NHỎ HƠN tổng — không phải 0 (assert `> 0` vẫn xanh oan), nhưng là số sai, và một ngày
+    tenant đó tình cờ không có case nào thì bài này đỏ vì lý do không liên quan. Lặp qua từng tenant
+    đã biết trong CÙNG một transaction (mỗi `SET LOCAL` ghi đè giá trị trước, còn hiệu lực tới hết
+    connection block) rồi cộng dồn — đúng tổng thật, không đoán."""
+    total = 0
     async with pool.connection() as conn:
-        cur = await conn.execute("SELECT count(*) FROM obs.trace_events")
-        row = await cur.fetchone()
-    return int(row[0]) if row is not None else 0
+        for tenant_id in TENANT_IDS.values():
+            await conn.execute(sql.SQL("SET LOCAL app.tenant_id = {}").format(sql.Literal(str(tenant_id))))
+            cur = await conn.execute("SELECT count(*) FROM obs.trace_events")
+            row = await cur.fetchone()
+            total += int(row[0]) if row is not None else 0
+    return total
 
 
 async def test_verdict_fail_tu_run_that(admin_pool: Pool, pool: Pool) -> None:

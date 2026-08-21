@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from psycopg import sql
 from studio_app.core._db import Pool
 from studio_app.obs.trace_writer import PgTraceWriter
 from studio_contracts.nodes import NodeType
@@ -42,6 +43,10 @@ async def test_pg_trace_writer_single_insert_roundtrip(admin_pool: Pool, pool: P
     await writer.write(event)
 
     async with pool.connection() as conn:
+        # GAP-1: `obs.trace_events` giờ có RLS thật (ENABLE+FORCE) — đọc qua `pool` (studio_app,
+        # không phải owner) phải tự SET LOCAL đúng tenant của event vừa ghi, cùng idiom
+        # `PgTraceWriter.write()` đã dùng, nếu không SELECT này luôn về 0 dòng.
+        await conn.execute(sql.SQL("SET LOCAL app.tenant_id = {}").format(sql.Literal(str(TENANT_ID))))
         cur = await conn.execute(
             "SELECT event_id, run_id, agent_id, tenant_id, node_id, node_type, ts, inputs_hash, "
             "outputs, tokens, cost, citations FROM obs.trace_events WHERE event_id = %s",
@@ -65,6 +70,8 @@ async def test_pg_trace_writer_single_insert_roundtrip(admin_pool: Pool, pool: P
     # No aggregation/dedup (F15): writing a SECOND distinct event yields a SECOND row.
     await writer.write(_sample_event("evt-2"))
     async with pool.connection() as conn:
+        # Cả 2 event cùng `TENANT_ID` (`_sample_event` khoá cứng) — set 1 lần là đủ thấy cả 2.
+        await conn.execute(sql.SQL("SET LOCAL app.tenant_id = {}").format(sql.Literal(str(TENANT_ID))))
         cur = await conn.execute("SELECT count(*) FROM obs.trace_events")
         count_row = await cur.fetchone()
     assert count_row is not None

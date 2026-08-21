@@ -39,6 +39,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from psycopg import sql
 from psycopg.types.json import Jsonb
 from studio_app.core._db import Pool
 from studio_app.eval_adapter import EngineAgentRunner
@@ -151,6 +152,10 @@ async def test_the_score_really_comes_from_postgres_not_from_memory(admin_pool: 
     assert from_memory.citation_accuracy == 1.0, "SC-01 phải grounded đúng chunk kỳ vọng trước khi phá"
 
     async with pool.connection() as conn:
+        # GAP-1: RLS thật trên `obs.trace_events` — UPDATE cần `USING` (chọn dòng) VÀ `WITH CHECK`
+        # (giá trị mới) cùng khớp `app.tenant_id`; không set thì UPDATE này lặng lẽ sửa 0 dòng, và
+        # bài `assert tampered != from_memory` sẽ đỏ vì lý do hoàn toàn không liên quan.
+        await conn.execute(sql.SQL("SET LOCAL app.tenant_id = {}").format(sql.Literal(str(tenant_id))))
         await conn.execute(
             "UPDATE obs.trace_events SET citations = %s WHERE run_id = %s AND citations IS NOT NULL",
             (Jsonb(["chunk-khong-ton-tai#c999"]), run_id),
