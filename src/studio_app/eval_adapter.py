@@ -58,6 +58,8 @@ from studio_workbench import create_recipe_d4
 from studio_workbench.recipe_ops import with_query, without_query
 from studio_workbench.tenant_wall import resolve_session
 
+from studio_app.providers.factory import build_tool_dispatch
+
 
 def _llm_answer(final_state: dict[str, object]) -> dict[str, object]:
     """Nhặt output node llm-step từ final_state (không hardcode node id — tìm dict có key 'answer',
@@ -170,6 +172,24 @@ class EngineAgentRunner:
         base = self.certified_recipe(agent_id=agent_id, tenant_id=tenant_id, section_roles=section_roles)
         recipe = with_query(base, query)
         session_context = resolve_session({"tenant_id": tenant_id, "user": "eval-harness", "roles": section_roles})
+        # `tool_dispatch=` (engine#32 review finding): trước fix này thiếu tham số, nên MỌI recipe
+        # eval-gate qua đây âm thầm fallback về `WhitelistToolDispatch` (stub `interpreter.py`).
+        # Chỉ tiêm `RealToolDispatch` khi `self._recipe` được caller đưa vào (branch (a) —
+        # `routes/publish.py::_evaluate`, recipe THẬT, đã qua `graph_lint`, và chính comment ở đó
+        # xác nhận nó có thể mang 1 node `tool-call` thật, không phải giả định: "recipe được chấm
+        # còn có 1 node tool-call admin chưa từng vẽ"). Đây LÀ đường sản xuất cao rủi ro nhất
+        # (eval-gate/publish) mà `routes/runs.py`/`routes/chat.py` (`app#41`) đã nối đúng còn adapter
+        # thì chưa — lỗ hổng issue #32 muốn đóng.
+        #
+        # CỐ Ý không tiêm ở branch (b) (`self._recipe is None` — tự dựng `create_recipe_d4`, dùng khi
+        # eval-harness chạy rời khỏi route thật, ví dụ `test_eval_adapter.py`): fixture đó khai
+        # `tool_whitelist=["kb_search"]` mặc định và đặt "kb_search" vào node `tool-call` — tổ hợp
+        # `RealToolDispatch` không hỗ trợ (kb_search có kind `kb_retrieve` riêng, không đi qua
+        # `ToolDispatch`; xem `providers/tool_dispatch.py`). Tiêm ở đây sẽ đổi `RealToolDispatch`'s
+        # `unsupported tool: kb_search` thành lỗi cứng cho MỌI test hiện có, và đổi cả recipe được
+        # hash (`certified_recipe()` docstring, D16 golden-batch determinism) — hai side-effect nằm
+        # ngoài phạm vi finding này. Fixture `create_recipe_d4` là của `packages/workbench` (SWE) —
+        # sửa mặc định đó là quyết định riêng, không phải phần của fix này.
         result = await interpreter.run(
             recipe,
             kb_search=self._kb_search,
@@ -177,6 +197,9 @@ class EngineAgentRunner:
             embedding=self._embedding,
             trace_writer=self._trace_writer,
             session_context=session_context,
+            tool_dispatch=(
+                build_tool_dispatch(recipe.agent_config.tool_whitelist) if self._recipe is not None else None
+            ),
         )
         llm_out = _llm_answer(result.final_state)
         raw_citations = llm_out.get("citations")

@@ -28,11 +28,11 @@ import pytest
 import studio_app.eval_adapter as eval_adapter
 from studio_app.eval_adapter import EngineAgentRunner, _llm_answer
 from studio_app.providers.fakes import ExtractiveFakeLLM, FakeEmbedding, FakeLLM
-from studio_contracts import LLM, Recipe, TraceEvent
+from studio_contracts import LLM, Edge, Node, NodeType, Recipe, TraceEvent
 from studio_contracts.kb import KbSearchResultItem
 from studio_engine import interpreter as engine_interpreter
 from studio_engine.interpreter import RunResult
-from studio_workbench import create_recipe_d4
+from studio_workbench import create_dynamic_recipe, create_recipe_d4
 from studio_workbench.tenant_wall import resolve_session
 
 # CỐ Ý khác `ANKOR_ID` default của workbench (a0…01) — nếu adapter "quên" thread tenant_id xuống
@@ -487,3 +487,73 @@ async def test_extractive_fake_reads_only_the_top_chunk() -> None:
     assert case_run.answer.citations == ["doc-a#c1"]
     assert "Đáp án hạng 1." in case_run.answer.answer
     assert "Đáp án hạng 2." not in case_run.answer.answer
+
+
+# ---------------------------------------------------------------------------
+# Lớp D — `tool_dispatch` wiring (engine#32 review finding, Critical)
+#
+# `run_case()` trước fix này KHÔNG truyền `tool_dispatch` cho `interpreter.run()` — mọi recipe
+# eval-gate có node `tool-call` âm thầm chấm trên kết quả STUB thay vì `RealToolDispatch` thật.
+# Fix chỉ tiêm ở branch (a) — `self._recipe` được caller đưa vào (đường `routes/publish.py::
+# _evaluate` dùng thật) — CỐ Ý không đụng branch (b) (`create_recipe_d4` tự dựng, whitelist mặc
+# định `["kb_search"]` không phải tool `RealToolDispatch` hỗ trợ; xem comment tại
+# `eval_adapter.py::run_case`). Bài dưới khoá đúng branch (a).
+# ---------------------------------------------------------------------------
+
+
+def _tool_call_recipe(tenant_id: UUID, expression: str) -> Recipe:
+    return create_dynamic_recipe(
+        agent_id="agent-tool-dispatch-check",
+        tenant_id=tenant_id,
+        instructions="x",
+        model="m",
+        tool_whitelist=["calculator"],
+        nodes=[
+            Node(id="n1", type=NodeType.KB_RETRIEVE, params={"top_k": 3}),
+            Node(id="n2", type=NodeType.LLM_STEP, params={"temperature": 0.0}),
+            Node(id="n3", type=NodeType.TOOL_CALL, params={"tool": "calculator", "expression": expression}),
+            Node(id="n4", type=NodeType.END, params={}),
+        ],
+        edges=[Edge(from_="n1", to="n2"), Edge(from_="n2", to="n3"), Edge(from_="n3", to="n4")],
+        kb_id="kb-smoke",
+        scope="public",
+    )
+
+
+async def test_run_case_dispatches_real_tool_when_recipe_is_injected() -> None:
+    """KHÓA D1: recipe TIÊM (branch (a), như `routes/publish.py::_evaluate` dùng thật) có node
+    `tool-call(calculator)` → `TraceEvent.outputs` của node đó PHẢI là `{"expression", "result"}`
+    thật (`RealToolDispatch`), KHÔNG PHẢI marker stub `{"tool", "status": "stub-dispatched"}`
+    (`WhitelistToolDispatch`, hành vi trước fix)."""
+    recipe = _tool_call_recipe(TENANT_ID, "6 * 7")
+    runner = EngineAgentRunner(
+        kb_search=_RecordingKbSearch([_item("ankor-leave-001#c1")]),
+        llm=_ScriptedLLM("ok"),
+        embedding=FakeEmbedding(),
+        trace_writer=_CollectingTraceWriter(),
+        recipe=recipe,
+    )
+
+    case_run = await runner.run_case(agent_id="a", query="q?", tenant_id=TENANT_ID, section_roles=["public"])
+
+    tool_event = next(e for e in case_run.events if e.node_type == NodeType.TOOL_CALL)
+    assert tool_event.outputs == {"expression": "6 * 7", "result": 42}
+    assert tool_event.outputs.get("status") != "stub-dispatched"
+
+
+async def test_run_case_without_injected_recipe_still_uses_stub_dispatch() -> None:
+    """KHÓA D2 (phạm vi CỐ Ý hẹp): branch (b) — `self._recipe is None`, `create_recipe_d4` tự dựng
+    (whitelist mặc định `["kb_search"]`) — vẫn giữ hành vi CŨ (`WhitelistToolDispatch` stub), không
+    đổi. Nếu ai đó sau này mở rộng fix sang branch (b) mà không sửa fixture `create_recipe_d4`
+    trước, bài `test_run_case_maps_llm_output_to_agent_answer` (Lớp A) sẽ đỏ với
+    `ValueError: unsupported tool: kb_search` — bài này giải thích tại sao và khoá ranh giới."""
+    kb = _RecordingKbSearch([_item("ankor-leave-001#c1")])
+    writer = _CollectingTraceWriter()
+    runner = _runner(kb, _ScriptedLLM("ok [ankor-leave-001#c1]"), writer)
+
+    case_run = await runner.run_case(
+        agent_id="agent-callisto-d4", query="q?", tenant_id=TENANT_ID, section_roles=["public"]
+    )
+
+    tool_event = next(e for e in case_run.events if e.node_type == NodeType.TOOL_CALL)
+    assert tool_event.outputs == {"tool": "kb_search", "status": "stub-dispatched"}

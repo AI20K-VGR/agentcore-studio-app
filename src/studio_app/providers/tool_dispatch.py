@@ -61,11 +61,17 @@ def _eval_node(node: ast.AST) -> int | float:
 def _calculate(params: dict[str, object]) -> dict[str, object]:
     raw_expression = params.get("expression", "")
     expression = raw_expression if isinstance(raw_expression, str) else str(raw_expression)
+    # `RecursionError` (review finding, engine#32): một `expression` dài/lồng sâu (vd. chuỗi
+    # `"1+"*3000 + "1"`, verify thực nghiệm) làm CHÍNH `ast.parse()` raise `RecursionError` — không
+    # phải `SyntaxError` — nên phải bắt riêng, không tự lọt lên crash request. Cùng nguyên tắc
+    # `_parse_literal` (`studio_engine.executors`, `when` grammar) đã dùng cho hazard này.
     try:
         tree = ast.parse(expression, mode="eval")
+        result = _eval_node(tree.body)
     except SyntaxError as exc:
         raise ValueError(f"calculator: biểu thức không hợp lệ: {expression!r}") from exc
-    result = _eval_node(tree.body)
+    except RecursionError as exc:
+        raise ValueError("calculator: biểu thức quá phức tạp (quá nhiều lớp lồng nhau)") from exc
     return {"expression": expression, "result": result}
 
 

@@ -78,6 +78,17 @@ async def test_calculator_rejects_anything_beyond_arithmetic(expression: str) ->
         await dispatcher.dispatch("calculator", {"expression": expression})
 
 
+async def test_calculator_deeply_nested_expression_raises_value_error_not_recursion_error() -> None:
+    """Review finding (engine#32): verify thực nghiệm — một `expression` dài kiểu chuỗi cộng liên
+    tiếp làm CHÍNH `ast.parse()` raise `RecursionError` (không phải `SyntaxError`). Trước fix, đó
+    xuyên thẳng lên thành crash request. Phải là `ValueError` sạch, cùng nguyên tắc `_parse_literal`
+    (`studio_engine.executors`, `except (ValueError, RecursionError):`)."""
+    dispatcher = _dispatch(["calculator"])
+    hostile_expression = "1+" * 3000 + "1"
+    with pytest.raises(ValueError, match="quá phức tạp"):
+        await dispatcher.dispatch("calculator", {"expression": hostile_expression})
+
+
 # --- current_datetime ------------------------------------------------------------------------
 
 
