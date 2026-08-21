@@ -124,6 +124,29 @@ CREATE TABLE IF NOT EXISTS core.sections (
     UNIQUE (tenant_id, name)
 );
 
+-- `core.user_sections` (GAP-2, `G:\\My Drive\\ERD.drawio` — "1 user thuộc nhiều section, 1 section
+-- nhiều user"). Shell — 0 reference nào tới `user_sections`/`UserSection` trong toàn bộ
+-- `apps/studio/src` (đã verify bằng grep thật), nên đây là bảng SẠCH: chưa writer, chưa reader nào
+-- có thể vỡ vì DDL này.
+--
+-- Khoá chính GHÉP `(user_id, section_id)`, không có cột `id` riêng — đúng ERD (cả 2 cột đều
+-- 🔑, không cột nào khác). Không `tenant_id`: tenant của 1 hàng suy được qua JOIN `core.users`/
+-- `core.sections` (cả hai đều đã có `tenant_id NOT NULL`), thêm cột trùng lặp ở đây chỉ tạo nguy cơ
+-- lệch dữ liệu (2 nguồn cho cùng 1 sự thật) mà ERD cũng không vẽ.
+--
+-- KHÔNG RLS — cùng lý do `core.users`/`core.sections` (comment ngay phía trên 2 bảng đó): superadmin
+-- cần gán/xem section CHÉO tenant (JWT của họ trỏ `__system__`), RLS theo `app.tenant_id` sẽ tự khoá
+-- nhầm chính superadmin. Ranh giới tenant enforce ở tầng application, đúng tiền lệ.
+--
+-- `ON DELETE CASCADE` cả 2 chiều: xoá user hoặc xoá section thì gỡ luôn phần gán liên quan — không
+-- để lại hàng mồ côi trỏ vào 1 user/section không còn tồn tại (cùng khuôn
+-- `wb.recipe_versions.recipe_id` đã dùng).
+CREATE TABLE IF NOT EXISTS core.user_sections (
+    user_id UUID NOT NULL REFERENCES core.users (id) ON DELETE CASCADE,
+    section_id UUID NOT NULL REFERENCES core.sections (id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, section_id)
+);
+
 CREATE TABLE IF NOT EXISTS core.jobs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id UUID NOT NULL,
