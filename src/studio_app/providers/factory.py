@@ -5,15 +5,18 @@
 from __future__ import annotations
 
 import importlib.util
+from datetime import UTC, datetime
 from typing import assert_never
 
 from fastapi import HTTPException
 from studio_contracts.protocols import LLM, EmbeddingService
+from studio_engine.executors import ToolDispatch
 from studio_kb.embeddings import derive_vector
 from studio_kb.schema import EMBEDDING_DIM
 
 from studio_app.providers.embeddings import GatewayEmbedding
 from studio_app.providers.fakes import ExtractiveFakeLLM
+from studio_app.providers.tool_dispatch import RealToolDispatch
 from studio_app.settings import LlmProvider, get_settings
 
 
@@ -114,3 +117,18 @@ def build_embedding() -> EmbeddingService:
             detail="STUDIO_USE_FAKE_PROVIDERS=false nhưng thiếu STUDIO_OPENROUTER_API_KEY",
         )
     return GatewayEmbedding(api_key=settings.openrouter_api_key)
+
+
+def build_tool_dispatch(whitelist: list[str]) -> ToolDispatch:
+    """Composition root thật cho `ToolDispatch` (engine#32) — thay
+    `studio_engine.demo_stubs.WhitelistToolDispatch` (stub) tại 2 call site `interpreter.run()`
+    (`routes/runs.py`, `routes/chat.py`), đúng docstring gốc của chính stub đó. Không có nhánh
+    fake/real qua `settings.use_fake_providers` như `build_llm()`/`build_embedding()` — xem
+    docstring `RealToolDispatch` (`providers/tool_dispatch.py`) vì sao: 2 tool này tự thân đã là
+    "bản thật", không gọi API ngoài để cần fake khi test/CI.
+
+    `clock=lambda: datetime.now(UTC)`: đường DUY NHẤT trong `apps/studio` được phép gọi
+    `datetime.now()` cho `current_datetime` — `RealToolDispatch`/`_current_datetime()` chỉ nhận nó
+    qua constructor-DI, không tự gọi bên trong (bắt buộc để CI/golden-set reproducible, `kit#67`
+    Z4/D03)."""
+    return RealToolDispatch(whitelist, clock=lambda: datetime.now(UTC))

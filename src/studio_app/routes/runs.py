@@ -30,7 +30,7 @@ from studio_app.authz import fetch_fresh_identity, require_admin
 from studio_app.core._db import get_pool
 from studio_app.middleware import get_request_connection, get_request_session
 from studio_app.obs.trace_writer import PgTraceWriter
-from studio_app.providers.factory import build_embedding, build_llm
+from studio_app.providers.factory import build_embedding, build_llm, build_tool_dispatch
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 
@@ -150,6 +150,7 @@ async def create_run(body: RunRequest) -> RunResponse:
     kb_search = PgKbSearch(pool, embedding)
     llm = build_llm()
     trace_writer = PgTraceWriter(pool)
+    tool_dispatch = build_tool_dispatch(recipe.agent_config.tool_whitelist)
 
     result = await interpreter.run(
         recipe,
@@ -158,6 +159,7 @@ async def create_run(body: RunRequest) -> RunResponse:
         llm=llm,
         embedding=embedding,
         trace_writer=trace_writer,
+        tool_dispatch=tool_dispatch,
     )
 
     timeline_text = render_timeline(result.events, expected=walk_from_dag(recipe.dag))

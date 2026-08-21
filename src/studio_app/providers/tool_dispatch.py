@@ -1,0 +1,110 @@
+"""`RealToolDispatch` — dispatcher THẬT cho 2 tool kind `tool_call` (engine#32), thay
+`WhitelistToolDispatch` (`studio_engine.demo_stubs`, stub) ở composition root này, đúng docstring
+gốc của chính stub đó ("Day 6 replaces with real composition in `apps/studio`"). `kb_search`
+(kind `kb_retrieve`) KHÔNG đi qua đây — nó có executor riêng (`KbRetrieveExecutor`, đã real, không
+đụng).
+
+Không có cặp fake/real như `build_llm()`/`build_embedding()`: 2 tool này (`calculator`,
+`current_datetime`) tự thân đã xong xuôi, tất định, không gọi API ngoài — KHÔNG có "bản thật" nào
+khác để chọn qua `settings.use_fake_providers`. Biến duy nhất cần tách để test được là ĐỒNG HỒ
+(`current_datetime` không được tự gọi `datetime.now()` bên trong — bắt buộc để CI/golden-set
+reproducible, đúng cảnh báo Z4/D03 `kit#67`, mutant-kill clock còn thiếu ở đó) — nên `Clock` đi qua
+constructor-DI, không phải qua settings flag.
+"""
+
+from __future__ import annotations
+
+import ast
+from collections.abc import Callable
+from datetime import date, datetime
+
+Clock = Callable[[], datetime]
+"""`() -> datetime` — production truyền `lambda: datetime.now(UTC)` (`providers/factory.py::
+build_tool_dispatch()`), test truyền 1 hàm trả `datetime` cố định. Không phải `Protocol` (chỉ 1
+method, `Callable` đủ, không cần class rỗng)."""
+
+_ALLOWED_BINOP = {
+    ast.Add: lambda a, b: a + b,
+    ast.Sub: lambda a, b: a - b,
+    ast.Mult: lambda a, b: a * b,
+    ast.Div: lambda a, b: a / b,
+}
+_ALLOWED_UNARYOP = {
+    ast.UAdd: lambda a: +a,
+    ast.USub: lambda a: -a,
+}
+"""Whitelist node-type cho `calculator` (engine#32): CHỈ `BinOp`/`UnaryOp`/`Constant` số học
+`+-*/` + ngoặc, đúng phạm vi `PROJECT-SCOPE-DEMO-DAY30.md` §1 khai — không mở rộng thêm `**`/`%`
+dù `ast` hỗ trợ, để không vượt phạm vi issue đã chốt. Cùng nguyên tắc `_parse_literal`
+(`studio_engine.executors`, `when` grammar cũ) đã dùng: KHÔNG `eval`/`exec`/`ast.literal_eval` —
+tự đi bộ cây AST và tính tay, 1 node lạ (tên biến, gọi hàm, chuỗi, ...) là `ValueError` ngay, không
+có nhánh nào rơi về thực thi code tuỳ ý."""
+
+
+def _eval_node(node: ast.AST) -> int | float:
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, bool) or not isinstance(node.value, int | float):
+            raise ValueError(f"calculator: hằng số không hợp lệ (chỉ int/float): {node.value!r}")
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BINOP:
+        left = _eval_node(node.left)
+        right = _eval_node(node.right)
+        try:
+            return _ALLOWED_BINOP[type(node.op)](left, right)
+        except ZeroDivisionError as exc:
+            raise ValueError("calculator: chia cho 0") from exc
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARYOP:
+        return _ALLOWED_UNARYOP[type(node.op)](_eval_node(node.operand))
+    raise ValueError(f"calculator: cú pháp không được phép: {ast.dump(node)}")
+
+
+def _calculate(params: dict[str, object]) -> dict[str, object]:
+    raw_expression = params.get("expression", "")
+    expression = raw_expression if isinstance(raw_expression, str) else str(raw_expression)
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(f"calculator: biểu thức không hợp lệ: {expression!r}") from exc
+    result = _eval_node(tree.body)
+    return {"expression": expression, "result": result}
+
+
+def _current_datetime(params: dict[str, object], clock: Clock) -> dict[str, object]:
+    mode = params.get("mode")
+    if mode == "now":
+        return {"mode": "now", "date": clock().date().isoformat()}
+    if mode == "days_between":
+        raw_from = params.get("from_date")
+        raw_to = params.get("to_date")
+        if not isinstance(raw_from, str) or not isinstance(raw_to, str):
+            raise ValueError("current_datetime: mode 'days_between' cần from_date/to_date dạng chuỗi ISO")
+        try:
+            from_d = date.fromisoformat(raw_from)
+            to_d = date.fromisoformat(raw_to)
+        except ValueError as exc:
+            raise ValueError(f"current_datetime: from_date/to_date không phải ISO date: {exc}") from exc
+        return {"mode": "days_between", "from": raw_from, "to": raw_to, "days": (to_d - from_d).days}
+    raise ValueError(f"current_datetime: mode không hỗ trợ: {mode!r}")
+
+
+class RealToolDispatch:
+    """`ToolDispatch` thật (engine#32) cho `calculator`/`current_datetime` — implement
+    `studio_engine.executors.ToolDispatch` bằng structural typing (duck-typed, protocol không đòi
+    kế thừa tường minh).
+
+    Whitelist-check GIỮ NGUYÊN hành vi của `WhitelistToolDispatch` cũ (raise `ValueError` cùng
+    format thông điệp, khi tool ngoài `agent_config.tool_whitelist`) — defense-in-depth alongside
+    recipe-validator layer, không bỏ (issue engine#32 nói rõ)."""
+
+    def __init__(self, whitelist: list[str], clock: Clock) -> None:
+        self._whitelist = whitelist
+        self._clock = clock
+
+    async def dispatch(self, tool: str, params: dict[str, object]) -> object:
+        if tool not in self._whitelist:
+            raise ValueError(f"tool not in whitelist: {tool}")
+        if tool == "calculator":
+            return _calculate(params)
+        if tool == "current_datetime":
+            return _current_datetime(params, self._clock)
+        raise ValueError(f"unsupported tool: {tool}")
