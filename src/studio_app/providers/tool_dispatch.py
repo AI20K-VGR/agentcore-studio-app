@@ -18,6 +18,8 @@ import ast
 from collections.abc import Callable
 from datetime import date, datetime
 
+from studio_contracts import NodeType, Recipe
+
 Clock = Callable[[], datetime]
 """`() -> datetime` — production truyền `lambda: datetime.now(UTC)` (`providers/factory.py::
 build_tool_dispatch()`), test truyền 1 hàm trả `datetime` cố định. Không phải `Protocol` (chỉ 1
@@ -93,6 +95,34 @@ def _current_datetime(params: dict[str, object], clock: Clock) -> dict[str, obje
     raise ValueError(f"current_datetime: mode không hỗ trợ: {mode!r}")
 
 
+SUPPORTED_TOOLS: frozenset[str] = frozenset({"calculator", "current_datetime"})
+"""Tool `RealToolDispatch` thực sự dispatch được — nguồn sự thật DUY NHẤT, dùng bởi cả
+`dispatch()` (raise nếu tool ngoài tập này) VÀ `find_unsupported_tool_call()` bên dưới (preflight
+ở `routes/runs.py`/`routes/chat.py`, bắt sớm TRƯỚC `interpreter.run()` thay vì để `dispatch()`
+raise giữa chừng DAG, review app#41). `kb_search` (kind `kb_retrieve`,
+`PROJECT-SCOPE-DEMO-DAY30.md` §1) cố ý KHÔNG có ở đây — nó có executor riêng (`KbRetrieveExecutor`,
+đã real), dùng node `kb-retrieve`, không phải node `tool-call`."""
+
+
+def find_unsupported_tool_call(recipe: Recipe) -> str | None:
+    """Tool đầu tiên (nếu có) mà một node `tool-call` trong `recipe.dag` tham chiếu nhưng KHÔNG
+    nằm trong `SUPPORTED_TOOLS` — vd `kb_search` (kind `kb_retrieve`, không bao giờ nên là
+    `tool-call`) hay bất kỳ tool tương lai nào chưa implement. `None` nếu mọi node `tool-call`
+    trong recipe đều hợp lệ.
+
+    Không tự raise/không tự chọn HTTP status — `graph_lint()` đã đảm bảo tool nằm trong
+    `agent_config.tool_whitelist` trước khi hàm này chạy (Rule 7), nên ở đây chỉ còn cần hỏi ĐÚNG
+    MỘT câu: dispatcher có dispatch được tool này không. Caller (route) chọn status phù hợp ngữ
+    cảnh — 400 cho recipe client-tạo (`routes/runs.py`), 500 cho recipe đã published
+    (`routes/chat.py`), cùng cách phân biệt `graph_lint()` đã dùng ở cả hai route đó."""
+    for node in recipe.dag.nodes:
+        if node.type == NodeType.TOOL_CALL:
+            tool = node.params.get("tool")
+            if tool not in SUPPORTED_TOOLS:
+                return str(tool)
+    return None
+
+
 class RealToolDispatch:
     """`ToolDispatch` thật (engine#32) cho `calculator`/`current_datetime` — implement
     `studio_engine.executors.ToolDispatch` bằng structural typing (duck-typed, protocol không đòi
@@ -109,8 +139,8 @@ class RealToolDispatch:
     async def dispatch(self, tool: str, params: dict[str, object]) -> object:
         if tool not in self._whitelist:
             raise ValueError(f"tool not in whitelist: {tool}")
+        if tool not in SUPPORTED_TOOLS:
+            raise ValueError(f"unsupported tool: {tool}")
         if tool == "calculator":
             return _calculate(params)
-        if tool == "current_datetime":
-            return _current_datetime(params, self._clock)
-        raise ValueError(f"unsupported tool: {tool}")
+        return _current_datetime(params, self._clock)

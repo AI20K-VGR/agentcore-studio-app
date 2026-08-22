@@ -32,6 +32,7 @@ from studio_app.eval_adapter import _llm_answer
 from studio_app.middleware import get_request_connection, get_request_session
 from studio_app.obs.trace_writer import PgTraceWriter
 from studio_app.providers.factory import build_embedding, build_llm, build_tool_dispatch
+from studio_app.providers.tool_dispatch import find_unsupported_tool_call
 
 router = APIRouter(prefix="/api/agents", tags=["chat"])
 
@@ -112,6 +113,22 @@ async def chat(agent_id: str, body: ChatRequest) -> ChatResponse:
                 detail=f"role {sorted(invalid)} không hợp lệ để giả lập — chỉ chấp nhận {sorted(valid_section_names)}",
             )
         session_context = ResolvedContext(tenant_id=session.tenant_id, user=session.user, roles=body.as_roles)
+
+    # PA-4 (app#41 review finding, dholmes0207) — cùng lý do `routes/runs.py` đã thêm, đặt SAU
+    # khối `as_roles` ở trên (authz phải quyết định TRƯỚC khi lộ recipe published có hỏng hay
+    # không — 1 caller không được phép giả lập role không nên nhận tín hiệu gì về nội dung
+    # recipe). Recipe ở ĐÂY đã publish (không phải client-tạo), nên tool không dispatch được là
+    # dữ liệu published bị hỏng — cùng mức nghiêm trọng `graph_lint()` đỏ ở trên, 500 không phải
+    # 400.
+    unsupported_tool = find_unsupported_tool_call(recipe)
+    if unsupported_tool is not None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"recipe đã published nhưng node tool-call dùng tool {unsupported_tool!r} không "
+                f"dispatch được — nếu là kb_search: kind của nó là kb_retrieve, không phải tool-call"
+            ),
+        )
 
     # `Pool` (không phải `get_request_connection()`) — rủi ro pool self-deadlock CHƯA được giải
     # quyết ở route này, xem giải thích đầy đủ + lý do ở `routes/runs.py` (review `app#17` đợt 4,

@@ -6,7 +6,8 @@ from __future__ import annotations
 from datetime import datetime
 
 import pytest
-from studio_app.providers.tool_dispatch import RealToolDispatch
+from studio_app.providers.tool_dispatch import SUPPORTED_TOOLS, RealToolDispatch, find_unsupported_tool_call
+from studio_workbench import create_recipe_d4
 
 _FIXED_NOW = datetime(2026, 8, 22, 12, 0, 0)
 
@@ -120,3 +121,40 @@ async def test_current_datetime_days_between_bad_date_raises() -> None:
             "current_datetime",
             {"mode": "days_between", "from_date": "not-a-date", "to_date": "2026-08-22"},
         )
+
+
+# --- find_unsupported_tool_call (PA-4, app#41 review finding dholmes0207) --------------------
+#
+# `graph_lint()` (packages/workbench/validator.py Rule 7) chỉ kiểm tool ∈ tool_whitelist, KHÔNG
+# kiểm dispatcher có hỗ trợ tool đó không — nên đây là lớp preflight riêng, dùng bởi
+# routes/runs.py + routes/chat.py TRƯỚC khi gọi interpreter.run().
+
+
+def test_supported_tools_is_exactly_calculator_and_current_datetime() -> None:
+    """Nguồn sự thật duy nhất `dispatch()` VÀ `find_unsupported_tool_call()` cùng đọc — đổi giá
+    trị này ở đây tức đổi cả 2 nơi cùng lúc, không có nguy cơ trôi lệch giữa chúng."""
+    assert frozenset({"calculator", "current_datetime"}) == SUPPORTED_TOOLS
+
+
+def test_find_unsupported_tool_call_flags_kb_search_in_default_recipe() -> None:
+    """`create_recipe_d4()` (packages/workbench, fixture dùng chung) hiện vẫn sinh node
+    `tool-call{tool:"kb_search"}` (nợ PA-3, theo dõi ở issue riêng packages/workbench + apps/web —
+    KHÔNG sửa ở đây). `kb_search` có kind `kb_retrieve` — không bao giờ nên là `tool-call` — đây
+    là instance thật của lớp lỗi mà hàm này phải bắt được."""
+    recipe = create_recipe_d4()
+    assert find_unsupported_tool_call(recipe) == "kb_search"
+
+
+def test_find_unsupported_tool_call_returns_none_when_tool_supported() -> None:
+    """`create_recipe_d4(tool_whitelist=...)` đặt `tool_whitelist[0]` vào node tool-call
+    (`builder.py:196`) — đổi whitelist mặc định đủ để tự chứng minh hàm này KHÔNG false-positive
+    trên tool hợp lệ."""
+    recipe = create_recipe_d4(tool_whitelist=["calculator"])
+    assert find_unsupported_tool_call(recipe) is None
+
+
+def test_find_unsupported_tool_call_generalizes_beyond_kb_search() -> None:
+    """Lớp lỗi đúng phải là 'mọi tool ∈ whitelist mà ∉ SUPPORTED_TOOLS', không riêng kb_search —
+    `http_fetch` (tool ma từng lộ ở apps/web AVAILABLE_TOOLS) là instance thứ hai."""
+    recipe = create_recipe_d4(tool_whitelist=["http_fetch"])
+    assert find_unsupported_tool_call(recipe) == "http_fetch"
