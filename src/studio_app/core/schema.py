@@ -242,3 +242,40 @@ async def grant_app_privileges(admin_pool: Pool) -> None:
                     "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO studio_app"
                 ).format(schema_id)
             )
+
+
+async def grant_scorer_privileges(admin_pool: Pool) -> None:
+    """Least-privilege GRANT cho `studio_scorer` — ĐÚNG `SELECT`, ĐÚNG `obs.trace_events`.
+
+    Vì sao role này tồn tại (`evalhub#37`, hệ quả GAP-1 của chính repo này). `obs/schema.py` bật
+    `ENABLE`+`FORCE ROW LEVEL SECURITY` trên `obs.trace_events` với policy
+    `tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid`. Hai hàm chấm điểm của
+    evalhub — `read_run_unscoped`/`list_runs_all_tenants` — **cố ý** không set `app.tenant_id`: chúng
+    phải nhìn thấy event của MỌI tenant thì `tenant_scope_ok` mới bắt được run có node đầu mang
+    tenant A còn node sau mang tenant B. Dưới policy đó, role không `BYPASSRLS` khớp 0 dòng và nhận
+    `[]` **im lặng**. Chính khối DDL bên `obs/schema.py` đã ghi trước hệ quả này và giao lại cho AIE-2.
+
+    **Vì sao KHÔNG gộp vào `grant_app_privileges`.** Hàm kia cấp `SELECT, INSERT, UPDATE, DELETE`
+    trên MỌI bảng của cả 5 schema, cộng `ALTER DEFAULT PRIVILEGES` để bảng tương lai tự có quyền.
+    Đúng cho `studio_app` — role đó bị RLS chặn nên quyền rộng vẫn nằm trong hàng rào. **Sai hoàn
+    toàn** cho `studio_scorer`: role này có `BYPASSRLS`, nên với nó KHÔNG có policy nào chặn, và
+    quyền bảng là lưới **duy nhất** còn lại. Một `ALTER DEFAULT PRIVILEGES` ở đây sẽ lặng lẽ cấp
+    quyền xuyên tenant trên mọi bảng ai đó tạo sau này. Vì thế hàm này liệt kê **tường minh** một
+    bảng, không lặp `ALL_SCHEMAS`, và cố ý **không** có `ALTER DEFAULT PRIVILEGES`.
+
+    Bảng chưa tồn tại ⇒ no-op im lặng, không raise: cùng khuôn `grant_app_privileges` (hàm này chạy
+    ở mọi lần boot và mọi fixture `admin_pool`, nên nó tự bắt đầu có tác dụng đúng lúc `obs.ddl()`
+    tạo bảng). Role chưa tồn tại ⇒ cũng no-op: `docker/postgres-init/00-roles.sql` chỉ chạy ở
+    initdb, nên một volume có sẵn từ trước `evalhub#37` sẽ chưa có `studio_scorer` — boot không được
+    phép chết vì chuyện đó, evalhub đã fail-closed sẵn ở phía nó (`UnscopedReadUnavailable`).
+    """
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'studio_scorer'")
+        if await cur.fetchone() is None:
+            return
+        cur = await conn.execute("SELECT to_regclass('obs.trace_events')")
+        row = await cur.fetchone()
+        if row is None or row[0] is None:
+            return
+        await conn.execute("GRANT USAGE ON SCHEMA obs TO studio_scorer")
+        await conn.execute("GRANT SELECT ON obs.trace_events TO studio_scorer")
