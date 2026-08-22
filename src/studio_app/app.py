@@ -28,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from studio_app.core._db import close_pools, get_admin_pool
-from studio_app.core.schema import ensure_all_schemas, grant_app_privileges
+from studio_app.core.schema import ensure_all_schemas, grant_app_privileges, grant_scorer_privileges
 from studio_app.middleware import tenant_context_middleware
 from studio_app.providers.embeddings import EmbeddingGatewayError
 from studio_app.routes import admin as admin_routes
@@ -188,6 +188,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     admin = await get_admin_pool()
     await ensure_all_schemas(admin)
     await grant_app_privileges(admin)
+    await grant_scorer_privileges(admin)
     try:
         yield
     finally:
