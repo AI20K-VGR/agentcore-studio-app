@@ -11,6 +11,7 @@ from uuid import UUID
 from studio_app.providers.factory import build_tool_dispatch
 from studio_app.providers.fakes import FakeEmbedding, FakeLLM
 from studio_contracts import Edge, Node, NodeType, TraceEvent
+from studio_contracts.kb import KbSearchResultItem
 from studio_engine import interpreter as engine_interpreter
 from studio_workbench import create_dynamic_recipe
 from studio_workbench.tenant_wall import resolve_session
@@ -19,7 +20,9 @@ _TENANT_ID = UUID("d0000000-0000-0000-0000-000000000004")
 
 
 class _NullKbSearch:
-    async def search(self, query: str, tenant_id: UUID, section_roles: list[str], top_k: int) -> list:
+    async def search(
+        self, query: str, tenant_id: UUID, section_roles: list[str], top_k: int
+    ) -> list[KbSearchResultItem]:
         del query, tenant_id, section_roles, top_k
         return []
 

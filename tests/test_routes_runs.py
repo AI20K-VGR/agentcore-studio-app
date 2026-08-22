@@ -27,7 +27,12 @@ from studio_workbench.tenant_wall import ResolvedContext
 _NODES = [
     {"id": "node_1", "type": "kb-retrieve", "params": {"query": "Callisto policy"}},
     {"id": "node_2", "type": "llm-step", "params": {"temperature": 0.0}},
-    {"id": "node_3", "type": "tool-call", "params": {"tool": "kb_search"}},
+    # "calculator", not "kb_search": this node exists only to exercise the tool-call SHAPE through
+    # graph_lint()/create_run() — since routes/runs.py now wires RealToolDispatch unconditionally
+    # (engine#32), the placeholder tool here must be one RealToolDispatch actually implements.
+    # "kb_search" is a kb-retrieve node KIND (node_1 above), never a real tool-call target; using
+    # it here was a leftover placeholder that RealToolDispatch correctly rejects as unsupported.
+    {"id": "node_3", "type": "tool-call", "params": {"tool": "calculator", "expression": "6 * 7"}},
     {"id": "node_4", "type": "end", "params": {}},
 ]
 _EDGES = [
@@ -104,7 +109,7 @@ async def test_create_run_ignores_client_declared_tenant_in_body(admin_pool: Poo
         "agent_id": "agent-t1-idor-probe",
         "instructions": "irrelevant cho bài này",
         "model": "gemini-2.5-flash",
-        "tool_whitelist": ["kb_search"],
+        "tool_whitelist": ["calculator"],
         "kb_id": "kb-callisto-v1",
         "scope": "ankor/public",
         "nodes": _NODES,
@@ -165,7 +170,7 @@ def _threshold_body(success_threshold: float, citation_accuracy_threshold: float
         "agent_id": "agent-threshold-probe",
         "instructions": "irrelevant",
         "model": "gemini-2.5-flash",
-        "tool_whitelist": ["kb_search"],
+        "tool_whitelist": ["calculator"],
         "kb_id": "kb-callisto-v1",
         "scope": "ankor/public",
         "nodes": _NODES,

@@ -23,13 +23,13 @@ Clock = Callable[[], datetime]
 build_tool_dispatch()`), test truyền 1 hàm trả `datetime` cố định. Không phải `Protocol` (chỉ 1
 method, `Callable` đủ, không cần class rỗng)."""
 
-_ALLOWED_BINOP = {
+_ALLOWED_BINOP: dict[type[ast.operator], Callable[[int | float, int | float], int | float]] = {
     ast.Add: lambda a, b: a + b,
     ast.Sub: lambda a, b: a - b,
     ast.Mult: lambda a, b: a * b,
     ast.Div: lambda a, b: a / b,
 }
-_ALLOWED_UNARYOP = {
+_ALLOWED_UNARYOP: dict[type[ast.unaryop], Callable[[int | float], int | float]] = {
     ast.UAdd: lambda a: +a,
     ast.USub: lambda a: -a,
 }
