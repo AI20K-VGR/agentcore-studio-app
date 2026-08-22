@@ -30,7 +30,8 @@ from studio_app.authz import fetch_fresh_identity, require_admin
 from studio_app.core._db import get_pool
 from studio_app.middleware import get_request_connection, get_request_session
 from studio_app.obs.trace_writer import PgTraceWriter
-from studio_app.providers.factory import build_embedding, build_llm
+from studio_app.providers.factory import build_embedding, build_llm, build_tool_dispatch
+from studio_app.providers.tool_dispatch import find_unsupported_tool_call
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 
@@ -125,6 +126,23 @@ async def create_run(body: RunRequest) -> RunResponse:
         # UI đã chặn export/test khi `graph_lint()` đỏ, nhưng client vẫn có thể gửi thẳng qua API.
         raise HTTPException(status_code=400, detail=f"recipe không qua graph_lint(): {exc}") from exc
 
+    # PA-4 (app#41 review finding, dholmes0207): `graph_lint()` Rule 7 chỉ kiểm tool nằm trong
+    # `agent_config.tool_whitelist`, KHÔNG kiểm `RealToolDispatch` có dispatch được tool đó không.
+    # `kb_search` (kind `kb_retrieve`) nằm trong whitelist mặc định NHƯNG không phải tool
+    # `RealToolDispatch` implement — trước bản vá này, node `tool-call{kb_search}` qua sạch
+    # graph_lint() rồi mới crash ở `RealToolDispatch.dispatch()` GIỮA `interpreter.run()`, leak
+    # `ValueError` thành 500 trần (không có try/except quanh interpreter.run() ở route này). Chặn
+    # NGAY ĐÂY, trước khi tốn 1 lượt DB/LLM nào — 400 sạch, chỉ đúng cách sửa.
+    unsupported_tool = find_unsupported_tool_call(recipe)
+    if unsupported_tool is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"tool {unsupported_tool!r} trong node tool-call không dispatch được — nếu là "
+                f"kb_search: kind của nó là kb_retrieve, dùng node kb-retrieve thay vì tool-call"
+            ),
+        )
+
     # `Pool` (`get_pool()`), KHÔNG dùng `get_request_connection()` — review `app#17` đợt 3, "mở
     # rộng connection-reuse pattern sang runs.py/publish.py/chat.py?". QUYẾT ĐỊNH: KHÔNG mở rộng
     # trong PR này, nhưng đây KHÔNG PHẢI vì get_pool() "tiết kiệm" connection hơn — bản comment đầu
@@ -150,6 +168,7 @@ async def create_run(body: RunRequest) -> RunResponse:
     kb_search = PgKbSearch(pool, embedding)
     llm = build_llm()
     trace_writer = PgTraceWriter(pool)
+    tool_dispatch = build_tool_dispatch(recipe.agent_config.tool_whitelist)
 
     result = await interpreter.run(
         recipe,
@@ -158,6 +177,7 @@ async def create_run(body: RunRequest) -> RunResponse:
         llm=llm,
         embedding=embedding,
         trace_writer=trace_writer,
+        tool_dispatch=tool_dispatch,
     )
 
     timeline_text = render_timeline(result.events, expected=walk_from_dag(recipe.dag))

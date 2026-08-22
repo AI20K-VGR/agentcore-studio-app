@@ -27,7 +27,12 @@ from studio_workbench.tenant_wall import ResolvedContext
 _NODES = [
     {"id": "node_1", "type": "kb-retrieve", "params": {"query": "Callisto policy"}},
     {"id": "node_2", "type": "llm-step", "params": {"temperature": 0.0}},
-    {"id": "node_3", "type": "tool-call", "params": {"tool": "kb_search"}},
+    # "calculator", not "kb_search": this node exists only to exercise the tool-call SHAPE through
+    # graph_lint()/create_run() — since routes/runs.py now wires RealToolDispatch unconditionally
+    # (engine#32), the placeholder tool here must be one RealToolDispatch actually implements.
+    # "kb_search" is a kb-retrieve node KIND (node_1 above), never a real tool-call target; using
+    # it here was a leftover placeholder that RealToolDispatch correctly rejects as unsupported.
+    {"id": "node_3", "type": "tool-call", "params": {"tool": "calculator", "expression": "6 * 7"}},
     {"id": "node_4", "type": "end", "params": {}},
 ]
 _EDGES = [
@@ -104,7 +109,7 @@ async def test_create_run_ignores_client_declared_tenant_in_body(admin_pool: Poo
         "agent_id": "agent-t1-idor-probe",
         "instructions": "irrelevant cho bài này",
         "model": "gemini-2.5-flash",
-        "tool_whitelist": ["kb_search"],
+        "tool_whitelist": ["calculator"],
         "kb_id": "kb-callisto-v1",
         "scope": "ankor/public",
         "nodes": _NODES,
@@ -165,7 +170,7 @@ def _threshold_body(success_threshold: float, citation_accuracy_threshold: float
         "agent_id": "agent-threshold-probe",
         "instructions": "irrelevant",
         "model": "gemini-2.5-flash",
-        "tool_whitelist": ["kb_search"],
+        "tool_whitelist": ["calculator"],
         "kb_id": "kb-callisto-v1",
         "scope": "ankor/public",
         "nodes": _NODES,
@@ -195,3 +200,56 @@ def test_run_request_accepts_threshold_boundaries() -> None:
         body = RunRequest.model_validate(_threshold_body(success, citation))
         assert body.success_threshold == success
         assert body.citation_accuracy_threshold == citation
+
+
+# --- PA-4 (app#41 review finding, dholmes0207): kb_search dưới dạng tool-call phải 400, không 500 -
+
+
+_NODES_UNSUPPORTED_TOOL_CALL = [
+    {"id": "node_1", "type": "kb-retrieve", "params": {"query": "Callisto policy"}},
+    {"id": "node_2", "type": "llm-step", "params": {"temperature": 0.0}},
+    # kb_search có kind kb_retrieve (node_1 ở trên) — không bao giờ nên là tool-call. Whitelist
+    # PHẢI chứa "kb_search" để graph_lint() (Rule 7) cho qua, đúng để bài test này chạm đúng lớp
+    # preflight mới (find_unsupported_tool_call), không phải lớp whitelist cũ.
+    {"id": "node_3", "type": "tool-call", "params": {"tool": "kb_search"}},
+    {"id": "node_4", "type": "end", "params": {}},
+]
+
+
+async def test_create_run_rejects_unsupported_tool_call_with_400_not_500(admin_pool: Pool) -> None:
+    """Trước bản vá này: node `tool-call{kb_search}` qua sạch `graph_lint()` (tool nằm trong
+    whitelist) rồi mới crash `RealToolDispatch.dispatch()` giữa `interpreter.run()` — không có
+    try/except quanh `interpreter.run()` ở route này, `ValueError` leak thành 500 trần. Giờ phải
+    bị chặn NGAY SAU `graph_lint()`, 400 rõ ràng, KHÔNG chạm `interpreter.run()` (nên không cần
+    KB/LLM thật, cùng lý do `test_run_request_rejects_out_of_range_thresholds` không cần)."""
+    from fastapi import HTTPException
+
+    tenant = await _seed_tenant(admin_pool, "ankor-pa4-unsupported-tool-call")
+    # "victim@ankor.vn" — hardcode trong `_set_session()` bên dưới, không phải tuỳ ý.
+    await _seed_admin_user(admin_pool, tenant, "victim@ankor.vn")
+
+    raw_body: dict[str, object] = {
+        "agent_id": "agent-pa4-probe",
+        "instructions": "irrelevant",
+        "model": "gemini-2.5-flash",
+        "tool_whitelist": ["kb_search"],
+        "kb_id": "kb-callisto-v1",
+        "scope": "ankor/public",
+        "nodes": _NODES_UNSUPPORTED_TOOL_CALL,
+        "edges": _EDGES,
+    }
+    body = RunRequest.model_validate(raw_body)
+
+    token = _set_session(tenant)
+    try:
+        async with _simulate_request_connection():
+            with pytest.raises(HTTPException) as exc_info:
+                await create_run(body)
+    finally:
+        middleware._request_session.reset(token)
+
+    assert exc_info.value.status_code == 400, (
+        f"đáng lẽ 400 (preflight PA-4 chặn sớm), thực tế status={exc_info.value.status_code} — "
+        "nếu đây là 500, preflight đã không chạm hoặc ValueError lại leak trần từ interpreter.run()"
+    )
+    assert "kb_retrieve" in exc_info.value.detail
