@@ -24,18 +24,17 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+
 from dotenv import load_dotenv
+from studio_app.core._db import Pool, close_pools, get_admin_pool
+from studio_app.core.schema import ensure_all_schemas
+from studio_app.jwt_auth import hash_password, normalize_email
 
 # Tự động tìm nạp file .env ở thư mục gốc (lùi 3 cấp thư mục từ apps/studio/scripts)
 _ROOT_DIR = Path(__file__).resolve().parents[3]
 load_dotenv(_ROOT_DIR / ".env")
 
-from studio_app.core._db import Pool, close_pools, get_admin_pool
-from studio_app.core.schema import ensure_all_schemas
-from studio_app.jwt_auth import hash_password, normalize_email
-
 _SYSTEM_TENANT_NAME = "__system__"
-
 
 async def _ensure_system_tenant(admin: Pool) -> str:
     """Trả `id` (text) của tenant hệ thống, tự tạo nếu chưa có. Không dùng UUID hardcode như
