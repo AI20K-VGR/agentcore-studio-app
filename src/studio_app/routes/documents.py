@@ -1,10 +1,18 @@
-"""`POST /api/admin/documents` — upload 1 file `.md` thật, chunk/embed/index vào `kb.chunks` qua
-`KbPipeline` (`packages/kb`). Trước route này, `KbPipeline` đã implement đủ 5 method (chunker/
-embed_invoke/index/consent_purge/re_index) nhưng chưa route nào trong `apps/studio` gọi tới — tab
-"Tài liệu" chỉ là placeholder tĩnh (`apps/web/src/admin/DocumentsPlaceholderTab.tsx`).
+"""`POST /api/admin/documents` — upload 1 file `.md`/`.txt`/`.docx` thật, chunk/embed/index vào
+`kb.chunks`. Trước route này, `KbPipeline` đã implement đủ 5 method (chunker/embed_invoke/index/
+consent_purge/re_index) nhưng chưa route nào trong `apps/studio` gọi tới — tab "Tài liệu" chỉ là
+placeholder tĩnh (`apps/web/src/admin/DocumentsPlaceholderTab.tsx`).
 
 Phạm vi route này CỐ Ý chỉ có upload — không xoá/reindex/list. Nút "Xoá toàn bộ"/"Re-index toàn
 bộ" ở UI hiện là khung hiển thị (không gọi API), giữ chỗ cho lúc nào tính năng đó thật sự cần.
+
+**Cắt bằng `chunk_window.cut_window` (cửa sổ trượt 850 từ/overlap 170), KHÔNG dùng
+`KbPipeline.chunker`/`_cut_document` (bộ cắt theo heading `##`).** Lý do: nội dung upload tự do
+không có gì đảm bảo có cấu trúc `## title` như corpus Callisto 2.0 curate tay — `_cut_document`
+raise ngay khi thiếu heading, đúng thứ chặn `.txt`/`.docx` (gần như không bao giờ có `##`) và cả
+nhiều `.md` thật (ghi chú rời rạc, không heading). `cut_window` không quan tâm cấu trúc, chỉ cần có
+chữ. Xem `packages/kb/plans/multiformat_chunker_plan.md` cho số liệu đo (2000 token trần
+`gemini-embedding-001` → 850 từ/chunk là biên an toàn đo trên corpus thật).
 
 `section_role` KHÔNG dùng `SECTION_VOCAB` (`studio_kb.doc_factory_core` — 4 giá trị cố định chỉ
 dùng cho bộ tài liệu mẫu tĩnh `docs/callisto-2.0/`, xem `doc_factory_v2.py::load_corpus_v2`).
@@ -15,7 +23,7 @@ dùng cho `as_roles` — thay vì 1 vocab cố định.
 
 **Giới hạn đã biết:** chưa kiểm tra được `doc_id` đã tồn tại trước khi ghi. Re-upload cùng tên
 file + phòng ban sẽ `ON CONFLICT DO UPDATE` (`postgres.py::_UPSERT`) các `chunk_id` trùng, nhưng
-nếu bản mới có ÍT section hơn bản cũ, các `chunk_id` dư sẽ mồ côi lại trong DB (không bị xoá).
+nếu bản mới có ÍT chunk hơn bản cũ, các `chunk_id` dư sẽ mồ côi lại trong DB (không bị xoá).
 """
 
 from __future__ import annotations
@@ -27,6 +35,8 @@ from uuid import UUID
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
+from studio_kb.chunk_window import cut_window
+from studio_kb.extract import SUPPORTED_SUFFIXES, UnsupportedFormatError, extract_text
 from studio_kb.pipeline import KbPipeline
 
 from studio_app.authz import fetch_fresh_identity, fetch_tenant_section_names, require_admin
@@ -37,7 +47,9 @@ from studio_app.providers.factory import build_embedding
 router = APIRouter(prefix="/api/admin/documents", tags=["documents"])
 
 # Chưa có tiền lệ giới hạn kích thước upload nào trong repo — 1 MiB là giá trị mặc định hợp lý cho
-# tài liệu markdown thuần văn bản, chỉnh sau nếu cần qua config thay vì hardcode nếu nhu cầu thật.
+# tài liệu văn bản thuần (`.md`/`.txt`/`.docx`), chỉnh sau nếu cần qua config thay vì hardcode nếu
+# nhu cầu thật. `.docx` có overhead XML/zip nên cùng 1 MiB chứa ÍT chữ hơn `.md`/`.txt` — chấp nhận
+# được, không phải bug: hạn mức này chặn KÍCH THƯỚC UPLOAD, không hứa một lượng chữ tối thiểu.
 _MAX_UPLOAD_BYTES = 1 * 1024 * 1024
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -100,8 +112,11 @@ async def upload_document(
             detail=f"section_role {section_role!r} không hợp lệ — chỉ chấp nhận {sorted(valid_section_names)}",
         )
 
-    if not file.filename or not file.filename.lower().endswith(".md"):
-        raise HTTPException(status_code=422, detail="chỉ chấp nhận file .md")
+    if not file.filename or not any(file.filename.lower().endswith(suf) for suf in SUPPORTED_SUFFIXES):
+        raise HTTPException(
+            status_code=422,
+            detail=f"đuôi file không hỗ trợ — chỉ chấp nhận {sorted(SUPPORTED_SUFFIXES)}",
+        )
 
     # Đọc theo chunk có chặn, huỷ NGAY khi vượt hạn mức — review app#27 (dholmes0207): đọc hết
     # `file.read()` vào bộ đệm rồi mới so `len(raw)` khiến `_MAX_UPLOAD_BYTES` chỉ là một phép
@@ -120,9 +135,9 @@ async def upload_document(
         pieces.append(piece)
     raw = b"".join(pieces)
     try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise HTTPException(status_code=422, detail=f"file không phải UTF-8 hợp lệ: {exc}") from exc
+        text = extract_text(file.filename, raw)
+    except UnsupportedFormatError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # Tiền tố `tenant_uuid.hex` bắt buộc: `chunk_id` (`{doc_id}#c{n}`) là PRIMARY KEY toàn bảng
     # `kb.chunks`, KHÔNG tenant-scoped — 2 tenant cùng `doc_id` sẽ `ON CONFLICT DO UPDATE` đè lẫn
@@ -136,12 +151,11 @@ async def upload_document(
     name_hash = hashlib.sha256(file.filename.encode("utf-8")).hexdigest()[:8]
     doc_id = f"{tenant_uuid.hex}-{_slugify(section_role)}-{_slugify(stem)}-{name_hash}"
 
-    pipeline = KbPipeline(await get_pool(), build_embedding())
-    try:
-        chunks = await pipeline.chunker(text, doc_id=doc_id, tenant_id=tenant_uuid, section_role=section_role)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    chunks = cut_window(text, doc_id, tenant_uuid, section_role)
+    if not chunks:
+        raise HTTPException(status_code=422, detail="tài liệu rỗng — không có chữ nào để cắt chunk")
 
+    pipeline = KbPipeline(await get_pool(), build_embedding())
     embeddings = await pipeline.embed_invoke(chunks)
     await pipeline.index(chunks, embeddings)
 

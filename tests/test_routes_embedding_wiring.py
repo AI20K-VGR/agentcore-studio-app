@@ -108,9 +108,12 @@ def _md_upload_file(filename: str, content: bytes) -> UploadFile:
     return UploadFile(filename=filename, file=BytesIO(content))
 
 
-_TWO_CHUNK_MD = (
-    b"## Nghi phep\nBao truoc 3 ngay lam viec.\n\n## Lam them gio\nToi da 4 gio moi ngay, can duyet truoc.\n"
-)
+# Route dùng `chunk_window.cut_window` (cửa sổ 850 từ/overlap 170), KHÔNG còn `_cut_document`
+# (cắt theo heading `##`) — 1000 từ PHÂN BIỆT nằm trong khoảng (850, 1530] cho ĐÚNG 2 chunk
+# (chunk1 = từ 1..850, chunk2 = từ 681..1000) theo cùng công thức đã test ở
+# `packages/kb/tests/test_chunk_window.py`. Nội dung vô nghĩa CỐ Ý — test này chỉ cần "nhiều hơn
+# 1 chunk", không quan tâm heading hay ngữ nghĩa.
+_TWO_CHUNK_MD = " ".join(f"tu{i}" for i in range(1, 1001)).encode()
 
 
 class _SpyEmbedding:
@@ -137,8 +140,8 @@ class _RaisingEmbedding:
 
 
 async def test_documents_upload_batches_in_one_call(admin_pool: Pool, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Upload file sinh 2 chunk (2 heading `##`) — spy trên `embed()` thấy ĐÚNG 1 lời gọi với
-    `len(texts) == 2`. Ghim Đính chính A vế 1 bằng số thật."""
+    """Upload file sinh 2 chunk (`cut_window` cửa sổ 850/170) — spy trên `embed()` thấy ĐÚNG 1 lời
+    gọi với `len(texts) == 2`. Ghim Đính chính A vế 1 bằng số thật."""
     from studio_app.providers.factory import CallistoStubEmbedding
 
     spy = _SpyEmbedding(CallistoStubEmbedding())

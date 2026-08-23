@@ -121,7 +121,9 @@ async def test_upload_rejects_unknown_section_role(admin_pool: Pool) -> None:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
 
 
-async def test_upload_rejects_non_md_file(admin_pool: Pool) -> None:
+async def test_upload_rejects_unsupported_extension(admin_pool: Pool) -> None:
+    """`.pdf` (ngoài `extract.SUPPORTED_SUFFIXES`) vẫn bị chặn — khác `.txt` (đã CHO PHÉP từ khi
+    route chuyển sang `chunk_window.cut_window`, xem `test_upload_accepts_txt_file` bên dưới)."""
     tenant_id = await _seed_tenant(admin_pool, "documents-probe-c")
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
@@ -131,7 +133,7 @@ async def test_upload_rejects_non_md_file(admin_pool: Pool) -> None:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
                 await upload_document(
-                    file=_md_upload_file("leave.txt", _VALID_MD),
+                    file=_md_upload_file("leave.pdf", _VALID_MD),
                     section_role="hr",
                     tenant_id=None,
                 )
@@ -140,23 +142,85 @@ async def test_upload_rejects_non_md_file(admin_pool: Pool) -> None:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
 
 
-async def test_upload_rejects_document_with_no_heading(admin_pool: Pool) -> None:
+async def test_upload_accepts_txt_file(admin_pool: Pool) -> None:
+    """`.txt` — trước đây bị 422 ngay ở kiểm đuôi file (khi route chỉ nhận `.md`); giờ đi qua
+    `extract.extract_text` + `chunk_window.cut_window`, không đòi hỏi cấu trúc heading `##`."""
+    tenant_id = await _seed_tenant(admin_pool, "documents-probe-h")
+    admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+    await _seed_section(admin_pool, tenant_id, "hr", admin_id)
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        async with _simulate_request_connection():
+            result = await upload_document(
+                file=_md_upload_file("ghi-chu.txt", b"Ghi chu roi rac, khong co heading nao ca."),
+                section_role="hr",
+                tenant_id=None,
+            )
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert result.chunk_count == 1
+
+
+async def test_upload_accepts_md_without_heading(admin_pool: Pool) -> None:
+    """Trước đây (`_cut_document`, cắt theo heading `##`) file `.md` không heading bị 422. Giờ route
+    dùng `chunk_window.cut_window` (không đòi cấu trúc), nên phải THÀNH CÔNG — đúng động lực chính
+    của thay đổi này: ghi chú `.md` thật thường không có heading chuẩn."""
     tenant_id = await _seed_tenant(admin_pool, "documents-probe-d")
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
 
     token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
     try:
-        with pytest.raises(HTTPException) as exc_info:
-            async with _simulate_request_connection():
-                await upload_document(
-                    file=_md_upload_file("leave.md", b"khong co heading nao ca"),
-                    section_role="hr",
-                    tenant_id=None,
-                )
-        assert exc_info.value.status_code == 422
+        async with _simulate_request_connection():
+            result = await upload_document(
+                file=_md_upload_file("leave.md", b"khong co heading nao ca"),
+                section_role="hr",
+                tenant_id=None,
+            )
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert result.chunk_count == 1
+
+
+async def test_upload_accepts_docx_file(admin_pool: Pool) -> None:
+    """`.docx` thật (dựng bằng `python-docx`, không phải giả `.md` đổi tên) — đi qua
+    `extract._extract_docx` rồi `chunk_window.cut_window`, ghi thật vào `kb.chunks`."""
+    from io import BytesIO as _BytesIO
+
+    from docx import Document
+
+    doc = Document()
+    doc.add_paragraph("Chinh sach nghi phep.")
+    doc.add_paragraph("Bao truoc it nhat 3 ngay lam viec.")
+    buf = _BytesIO()
+    doc.save(buf)
+
+    tenant_id = await _seed_tenant(admin_pool, "documents-probe-i")
+    admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+    await _seed_section(admin_pool, tenant_id, "hr", admin_id)
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        async with _simulate_request_connection():
+            result = await upload_document(
+                file=_md_upload_file("chinh-sach.docx", buf.getvalue()),
+                section_role="hr",
+                tenant_id=None,
+            )
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert result.chunk_count == 1
+
+    async with admin_pool.connection() as conn:
+        await conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(tenant_id),))
+        cur = await conn.execute("SELECT text FROM kb.chunks WHERE tenant_id = %s", (str(tenant_id),))
+        row = await cur.fetchone()
+    assert row is not None
+    assert "Bao truoc it nhat 3 ngay lam viec." in row[0]
 
 
 async def test_company_admin_cannot_upload_for_other_tenant(admin_pool: Pool) -> None:
