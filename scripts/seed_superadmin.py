@@ -13,9 +13,10 @@ ngay trên `CREATE TABLE core.users`): tenant_id CỐ Ý không nullable để k
 `ResolvedContext`/`tenant_wall.py`/RLS ở mọi bảng khác.
 
 Chạy:
-    export STUDIO_SUPERADMIN_EMAIL=owner@agentcore.internal
-    export STUDIO_SUPERADMIN_PASSWORD=<mật khẩu thật, KHÔNG commit>
     uv run python apps/studio/scripts/seed_superadmin.py
+
+Script tự đọc `.env` theo thư mục làm việc hiện tại; đặt `STUDIO_SUPERADMIN_EMAIL` và
+`STUDIO_SUPERADMIN_PASSWORD` trong `.env` trước khi chạy.
 
 Idempotent — chạy lại nhiều lần không tạo trùng (`ON CONFLICT (email) DO NOTHING`).
 """
@@ -26,9 +27,13 @@ import asyncio
 import os
 import sys
 
+from dotenv import load_dotenv
 from studio_app.core._db import Pool, close_pools, get_admin_pool
 from studio_app.core.schema import ensure_all_schemas
 from studio_app.jwt_auth import hash_password, normalize_email
+
+# Khớp với phần còn lại của app: đọc `.env` theo thư mục làm việc hiện tại.
+load_dotenv()
 
 _SYSTEM_TENANT_NAME = "__system__"
 
