@@ -48,9 +48,23 @@ router = APIRouter(prefix="/api/admin/documents", tags=["documents"])
 
 # Chưa có tiền lệ giới hạn kích thước upload nào trong repo — 1 MiB là giá trị mặc định hợp lý cho
 # tài liệu văn bản thuần (`.md`/`.txt`/`.docx`), chỉnh sau nếu cần qua config thay vì hardcode nếu
-# nhu cầu thật. `.docx` có overhead XML/zip nên cùng 1 MiB chứa ÍT chữ hơn `.md`/`.txt` — chấp nhận
-# được, không phải bug: hạn mức này chặn KÍCH THƯỚC UPLOAD, không hứa một lượng chữ tối thiểu.
+# nhu cầu thật.
 _MAX_UPLOAD_BYTES = 1 * 1024 * 1024
+
+# Hạn mức thứ HAI, theo SỐ TỪ sau khi trích. Cần nó vì `_MAX_UPLOAD_BYTES` chỉ chặn được KHỐI
+# LƯỢNG CHỮ chừng nào byte còn tỉ lệ với chữ — đúng với `.md`/`.txt`, SAI với `.docx`: `.docx` là
+# một file ZIP, nội dung được NÉN chứ không phình vì "overhead XML". Đo thật trên cùng hạn mức
+# 1 MiB: `.txt` thuần ~168.000 từ (~247 chunk) · `.docx` văn xuôi tiếng Việt ~606.000 từ (~891
+# chunk) · `.docx` nội dung lặp ~14.400.000 từ (~21.000 chunk).
+#
+# Số chunk mới là thứ sinh ra chi phí, không phải số byte: mỗi chunk là một mục trong lô embedding
+# ≤90 (`providers/embeddings.py::_BATCH`), mỗi lô một lời gọi API trả tiền với timeout 120s. 21.000
+# chunk là ~234 lời gọi TUẦN TỰ nằm trong ĐÚNG MỘT HTTP request, rồi `KbPipeline.index` ghi cả
+# 21.000 dòng trong MỘT transaction. Nên chặn theo đúng đơn vị đó.
+#
+# 200.000 nằm TRÊN mức văn xuôi thật của một file 1 MiB (~168.000 từ) để không siết cửa nào đang
+# mở — `.md`/`.txt` hợp lệ hôm nay upload được thì sau bản vá vẫn upload được.
+_MAX_WORDS = 200_000
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
@@ -138,6 +152,17 @@ async def upload_document(
         text = extract_text(file.filename, raw)
     except UnsupportedFormatError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # Đếm SAU khi trích, không phải trên `raw`: với `.docx` thì `len(raw)` không nói gì về lượng
+    # chữ (xem `_MAX_WORDS`). `cut_window` split lại lần nữa ở dưới — thừa một lần `split()` trên
+    # tối đa 200k từ (~10ms), rẻ hơn nhiều so với đổi chữ ký `cut_window` ở packages/kb chỉ để
+    # chuyền sẵn list từ qua.
+    word_count = len(text.split())
+    if word_count > _MAX_WORDS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"tài liệu quá dài: {word_count} từ, tối đa {_MAX_WORDS}",
+        )
 
     # Tiền tố `tenant_uuid.hex` bắt buộc: `chunk_id` (`{doc_id}#c{n}`) là PRIMARY KEY toàn bảng
     # `kb.chunks`, KHÔNG tenant-scoped — 2 tenant cùng `doc_id` sẽ `ON CONFLICT DO UPDATE` đè lẫn
