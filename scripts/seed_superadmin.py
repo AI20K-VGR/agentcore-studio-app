@@ -36,6 +36,7 @@ load_dotenv(_ROOT_DIR / ".env")
 
 _SYSTEM_TENANT_NAME = "__system__"
 
+
 async def _ensure_system_tenant(admin: Pool) -> str:
     """Trả `id` (text) của tenant hệ thống, tự tạo nếu chưa có. Không dùng UUID hardcode như
     `seed_demo_tenants.py` (ankor/borea) vì tenant này không cần khớp hằng số ở quadrant nào khác
