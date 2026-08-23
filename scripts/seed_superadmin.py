@@ -15,6 +15,9 @@ ngay trên `CREATE TABLE core.users`): tenant_id CỐ Ý không nullable để k
 Chạy:
     uv run python apps/studio/scripts/seed_superadmin.py
 
+Script tự đọc `.env` theo thư mục làm việc hiện tại; đặt `STUDIO_SUPERADMIN_EMAIL` và
+`STUDIO_SUPERADMIN_PASSWORD` trong `.env` trước khi chạy.
+
 Idempotent — chạy lại nhiều lần không tạo trùng (`ON CONFLICT (email) DO NOTHING`).
 """
 
@@ -23,16 +26,14 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-from pathlib import Path
 
 from dotenv import load_dotenv
 from studio_app.core._db import Pool, close_pools, get_admin_pool
 from studio_app.core.schema import ensure_all_schemas
 from studio_app.jwt_auth import hash_password, normalize_email
 
-# Tự động tìm nạp file .env ở thư mục gốc (lùi 3 cấp thư mục từ apps/studio/scripts)
-_ROOT_DIR = Path(__file__).resolve().parents[3]
-load_dotenv(_ROOT_DIR / ".env")
+# Khớp với phần còn lại của app: đọc `.env` theo thư mục làm việc hiện tại.
+load_dotenv()
 
 _SYSTEM_TENANT_NAME = "__system__"
 
