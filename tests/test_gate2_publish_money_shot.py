@@ -60,9 +60,9 @@ from typing import Any
 from uuid import UUID
 
 import pytest
-from studio_contracts import CaseResult, Recipe, Scorecard
+from studio_contracts import CaseResult, Edge, Node, NodeType, Recipe, Scorecard
 from studio_evalhub.compute import compute_scorecard
-from studio_workbench import create_recipe_d4
+from studio_workbench import create_recipe
 from studio_workbench.publish import publish
 from studio_workbench.publish import recipe_hash as _recipe_hash
 
@@ -73,11 +73,25 @@ _THRESHOLD_CITATION = 0.95
 
 
 def _recipe(agent_id: str) -> Recipe:
-    """Recipe thật qua `create_recipe_d4` — cùng hàm `eval_adapter.py::EngineAgentRunner.
-    certified_recipe` dùng ở nhánh không tiêm `recipe=` (neo bằng tên, không phải số dòng — số
-    dòng ở đây đã trôi từ trước cả bản vá này), nên bài này đi qua `graph_lint` y như đường thật
-    chứ không qua một DAG dựng riêng cho test."""
-    return create_recipe_d4(agent_id=agent_id, tenant_id=ANKOR_ID)
+    """Recipe thật qua `create_recipe` với cùng DAG 3-node mà `eval_adapter.py::EngineAgentRunner.
+    certified_recipe` tự dựng ở nhánh không tiêm `recipe=` (workbench#41 — `create_recipe_d4` đã bị
+    xoá, `certified_recipe` chuyển sang `create_recipe` với DAG cố định KB_RETRIEVE->LLM_STEP->END,
+    neo bằng tên hàm, không phải số dòng), nên bài này đi qua `graph_lint` y như đường thật chứ
+    không qua một DAG dựng riêng cho test."""
+    nodes = [
+        Node(id="n1", type=NodeType.KB_RETRIEVE, params={"top_k": 3}),
+        Node(id="n2", type=NodeType.LLM_STEP, params={"temperature": 0.0}),
+        Node(id="n4", type=NodeType.END, params={}),
+    ]
+    edges = [Edge(from_="n1", to="n2"), Edge(from_="n2", to="n4")]
+    return create_recipe(
+        agent_id=agent_id,
+        tenant_id=ANKOR_ID,
+        instructions="Tra cứu quy trình và bảo mật Callisto.",
+        tool_whitelist=[],
+        nodes=nodes,
+        edges=edges,
+    )
 
 
 def _scorecard(*, verdict: str, recipe_hash: str | None, agent_id: str) -> Scorecard:

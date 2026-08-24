@@ -61,10 +61,10 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from studio_contracts import LLM, EmbeddingService, KbSearch, Recipe, TraceWriter
+from studio_contracts import LLM, Edge, EmbeddingService, KbSearch, Node, NodeType, Recipe, TraceWriter
 from studio_engine import agent_loop
 from studio_evalhub.agent_runner import AgentAnswer, CaseRun
-from studio_workbench import create_recipe_d4
+from studio_workbench import create_recipe
 from studio_workbench.recipe_ops import without_query
 from studio_workbench.tenant_wall import resolve_session
 
@@ -108,8 +108,9 @@ class EngineAgentRunner:
     def certified_recipe(self, *, agent_id: str, tenant_id: UUID, section_roles: list[str]) -> Recipe:
         """Recipe **gốc** của run — thứ mà `recipe_hash` phải băm, và thứ `publish()` phải chứng nhận.
 
-        **Không mang `query` — CHỈ ĐÚNG cho nhánh không tiêm `recipe=` (dựng `create_recipe_d4` rồi
-        gỡ query bên dưới).** Đó là điều làm câu *"scorecard này chứng nhận recipe nào"* có đáp án
+        **Không mang `query` — CHỈ ĐÚNG cho nhánh không tiêm `recipe=` (dựng qua `create_recipe`
+        với DAG cố định rồi gỡ query bên dưới).** Đó là điều làm câu *"scorecard này chứng nhận
+        recipe nào"* có đáp án
         đơn nhất cho nhánh đó: `query` là **dữ liệu đề bài của golden-set**, không phải cấu hình
         agent — một agent đã publish không có query cố định. Nhánh tiêm (dòng dưới) KHÔNG áp lại
         bất biến này: nếu canvas admin vẽ có `params["query"]` gõ sẵn trong 1 node `kb-retrieve`,
@@ -121,15 +122,38 @@ class EngineAgentRunner:
         SWE trên `kit#127`: *"recipe được CHẤM và recipe được PUBLISH là hai đối tượng khác nhau về
         cấu trúc"* — hai cái chỉ bằng nhau khi caller đưa recipe thật vào thay vì để adapter tự dựng.
 
-        Không truyền ⇒ dựng `create_recipe_d4` như trước, nhưng **một lần cho cả run** và đã gỡ `query`.
+        Không truyền ⇒ dựng qua `create_recipe` (workbench#41 — `create_recipe_d4`/`_parse_kb_scope`
+        đã bị xoá), **một lần cho cả run**, và đã gỡ `query`.
+
+        `create_recipe` hardcode `kb_binding` cố định (`ankor/public` — xem module docstring của
+        `studio_workbench.recipe`), không còn nhận `scope`/`kb_id` làm tham số: nhánh này **đổi
+        hành vi thật** so với trước — `kb_binding.scope` không còn phản ánh `section_roles` của
+        caller. Vô hại cho việc chạy thật (`run_agent_loop()` không đọc `kb_binding` từ recipe để
+        quyết định phạm vi — `session_context` mới là hàng rào, xem docstring `run_case` dưới), chỉ
+        đổi giá trị NHÃN tự mô tả trên recipe được băm/publish.
 
         `tenant_id`/`section_roles` vẫn vào recipe vì contract còn hai trường đó, **nhưng chúng là
         nhãn**: `interpreter.run()` không tin chúng (`interpreter.py:180-188`), `session_context` mới
         là hàng rào. Chúng có mặt để recipe tự mô tả đúng, không để quyết định phạm vi chạy."""
         if self._recipe is not None:
             return self._recipe
-        scope = f"t/{','.join(section_roles)}" if section_roles else "t/"
-        built = create_recipe_d4(agent_id=agent_id or self._agent_id, tenant_id=tenant_id, scope=scope)
+        # DAG cố định 3-node (KB_RETRIEVE -> LLM_STEP -> END), giữ nguyên hình dạng `create_recipe_d4`
+        # từng dựng — `run_agent_loop()` không đọc `recipe.dag` (module docstring, mục app#44), nên
+        # node/edge ở đây chỉ tồn tại để thoả `Recipe.dag` (field bắt buộc trên contract).
+        nodes = [
+            Node(id="n1", type=NodeType.KB_RETRIEVE, params={"top_k": 3}),
+            Node(id="n2", type=NodeType.LLM_STEP, params={"temperature": 0.0}),
+            Node(id="n4", type=NodeType.END, params={}),
+        ]
+        edges = [Edge(from_="n1", to="n2"), Edge(from_="n2", to="n4")]
+        built = create_recipe(
+            agent_id=agent_id or self._agent_id,
+            tenant_id=tenant_id,
+            instructions="Tra cứu quy trình và bảo mật Callisto.",
+            tool_whitelist=[],
+            nodes=nodes,
+            edges=edges,
+        )
         return without_query(built)
 
     async def run_case(
