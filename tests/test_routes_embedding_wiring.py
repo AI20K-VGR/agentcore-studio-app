@@ -22,6 +22,12 @@ from studio_app.routes.documents import upload_document
 from studio_workbench.tenant_wall import ResolvedContext
 
 _ROUTE_FILES = ("runs.py", "publish.py", "chat.py", "documents.py")
+# app#44: `runs.py` (`POST /api/runs`, đổi hẳn thành connectivity-check tĩnh, mục D
+# `PROJECT-SCOPE-DEMO-DAY30.md`) không còn chạm KB/LLM/embedding nào cả — `build_embedding()` rơi
+# khỏi wiring của nó, chỉ còn ĐÚNG cho việc kiểm "không nhắc CallistoStubEmbedding"/"không đọc env"
+# (2 test dưới, vẫn hợp lệ trên cả 4 file kể cả khi 1 file không dùng build_embedding). DoD 2 gốc
+# (app#30) chỉ còn thật cho 3 route sau.
+_EMBEDDING_WIRED_ROUTE_FILES = ("publish.py", "chat.py", "documents.py")
 _ROUTES_DIR = Path(__file__).resolve().parents[1] / "src" / "studio_app" / "routes"
 
 
@@ -38,8 +44,11 @@ def test_no_route_imports_stub_embedding() -> None:
 
 def test_build_embedding_wired_in_all_four_routes() -> None:
     """`git grep -n "build_embedding" apps/studio/src/studio_app/routes/` khớp đúng 8 dòng (4
-    import + 4 gọi) — DoD 2. Mỗi file: đúng 1 import + đúng 1 lời gọi `build_embedding()`."""
-    for name in _ROUTE_FILES:
+    import + 4 gọi) — DoD 2 GỐC (app#30). app#44: `runs.py` rơi khỏi danh sách này — connectivity-
+    check tĩnh không chạm KB/LLM/embedding nào cả (mục D `PROJECT-SCOPE-DEMO-DAY30.md`) — nên giờ
+    chỉ còn ĐÚNG 3 route (`publish.py`/`chat.py`/`documents.py`), không phải 4 (tên hàm giữ nguyên
+    để không phá lịch sử git blame; nội dung mới chốt phản ánh bằng danh sách kiểm bên dưới)."""
+    for name in _EMBEDDING_WIRED_ROUTE_FILES:
         source = (_ROUTES_DIR / name).read_text(encoding="utf-8")
         assert source.count("import build_embedding") + source.count(", build_embedding") >= 1, (
             f"{name} thiếu import build_embedding"

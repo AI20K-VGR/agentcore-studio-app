@@ -1,193 +1,108 @@
-"""`POST /api/runs` + `GET /api/runs/{run_id}` (Kế hoạch 2, A3) — route Test THẬT, thay
-`packages/workbench/dev_playground_server.py` (server tạm, `http.server` trần, ngoài mọi package).
+"""`POST /api/runs` (Kế hoạch 2, A3 → app#44 mục D) — nút "Test", ĐỔI HẲN Ý NGHĨA.
 
-Khác `dev_playground_server.py` ở 3 điểm, đúng ý nghĩa "luồng thật" của GATE-2 (Day 20, #127):
-- `kb_search = PgKbSearch(...)` (Postgres/pgvector thật, fence RLS) thay `StaticKbSearch` (RAM).
-- `session = get_request_session()` (từ `Authorization: Bearer <jwt>`, qua `jwt_auth.verify_token`
-  + `tenant_wall.resolve_session`) thay
-  session giả dựng từ `recipe.tenant_id` client tự khai.
-- `trace_writer = PgTraceWriter(...)` (ghi Postgres thật) thay `InMemoryTraceWriter`.
+`PROJECT-SCOPE-DEMO-DAY30.md` mục D: bấm "Test" giờ chỉ xác nhận từng tool trong
+`agent_config.tool_whitelist` của agent có executor/dispatcher THẬT hay không (vd `kb_search: OK`,
+`calculator: OK`) — đây là **connectivity-check TĨNH**, KHÔNG chạy 1 lượt hội thoại thật, KHÔNG gọi
+LLM/KB, KHÔNG tạo trace hội thoại. 3 việc đó (chạy thử câu hỏi, xem trace, money-shot fence-proof)
+chuyển hẳn sang mục E (`routes/chat.py`) — đó mới là nơi LLM thật sự chạy vòng lặp với tool.
 
-Dùng `create_dynamic_recipe` (không phải `Recipe.model_validate(toàn bộ JSON client gửi)`) để
-`tenant_id` KHÔNG CÓ ĐƯỜNG NÀO lọt vào Recipe từ body client — tách tường minh ở chữ ký hàm, thay
-vì chỉ dựa vào `interpreter.run()` ghi đè sau (2 lớp phòng thủ thay vì 1).
+Trước app#44, route này dựng `Recipe` động từ `nodes`/`edges` client gửi
+(`studio_workbench.builder.create_dynamic_recipe`) rồi chạy `interpreter.run()` (DAG-walk cũ, thay
+`dev_playground_server.py`). Kiến trúc mới (1 LLM + N tool tự chọn) không còn khái niệm DAG/canvas
+ở tầng chạy — `run_agent_loop()` không đọc `recipe.dag` — nên toàn bộ luồng dựng recipe động qua
+`nodes`/`edges` không còn cần thiết CHO ENDPOINT NÀY: `RunRequest` chỉ còn `agent_id` +
+`tool_whitelist`, đúng dữ liệu tối thiểu để trả lời câu hỏi "tool này nối được chưa".
+
+`RunRequest`'s field DAG-shaped cũ (`nodes`/`edges`/`kb_id`/`scope`/`golden_set_ref`/threshold) dời
+sang `routes/publish.py::PublishRequest` — `/evaluate`/`/publish` KHÔNG đổi scope (mục F:
+"Eval chạy qua code path riêng, không đi qua nút Test — không bị ảnh hưởng"), vẫn cần
+`nodes`/`edges` để `create_dynamic_recipe(...)` dựng `recipe.dag` (field bắt buộc trên contract
+`Recipe` dù `run_agent_loop()` không đọc nó).
+
+`GET /api/runs/{run_id}` KHÔNG đổi — nó đọc lại trace CHAT thật (qua `PgTraceReader`), không liên
+quan gì tới connectivity-check của `POST` ở trên; `RunResponse` (trace shape) giữ nguyên, chỉ dùng
+cho GET từ app#44 trở đi.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field, ValidationError
-from studio_contracts import Edge, EmbeddingService, Node
-from studio_engine import interpreter
-from studio_kb.postgres import PgKbSearch
-from studio_kb.trace_reader import PgTraceReader, render_timeline, walk_from_dag
-from studio_workbench.builder import create_dynamic_recipe
-from studio_workbench.validator import graph_lint
+from pydantic import BaseModel, Field
+from studio_engine.agent_protocol import KB_SEARCH_TOOL
+from studio_kb.trace_reader import PgTraceReader
 
 from studio_app.authz import fetch_fresh_identity, require_admin
 from studio_app.core._db import get_pool
 from studio_app.middleware import get_request_connection, get_request_session
-from studio_app.obs.trace_writer import PgTraceWriter
-from studio_app.providers.factory import build_embedding, build_llm, build_tool_dispatch
-from studio_app.providers.tool_dispatch import find_unsupported_tool_call
+from studio_app.providers.tool_dispatch import SUPPORTED_TOOLS
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 
 
 class RunRequest(BaseModel):
+    """app#44 — tối giản hoá theo mục D: chỉ còn 2 field cần cho connectivity-check tĩnh.
+    `tenant_id` CỐ Ý KHÔNG có field ở đây (như bản trước app#44) — dù giờ route này không còn chạm
+    tenant/DB nào ngoài chính identity-check của `require_admin`, giữ nguyên kỷ luật "request body
+    không có chỗ để client khai tenant" cho nhất quán toàn bộ `apps/studio`."""
+
     agent_id: str
-    instructions: str
-    model: str
     tool_whitelist: list[str] = Field(default_factory=list)
-    kb_id: str
-    scope: str
-    nodes: list[dict[str, Any]]
-    edges: list[dict[str, Any]]
-    # PR-4 của `plans/real_embedding_plan.md` (lane AIE-2): mặc định chuyển sang bộ **2.0**.
-    #
-    # Đây là chỗ DUY NHẤT production chọn bộ golden — `apps/web` gửi field này (recipe mẫu
-    # `sample.ts`) nên UI ghi đè được, còn mọi caller không khai thì rơi vào đây.
-    #
-    # Vì sao đổi: bộ 1.0 chấm trên corpus 1.0 (140 chunk) mà `packages/kb` đã cutover sang corpus
-    # 2.0 (800 chunk, `kb#32`) và sang embedding thật 2048 chiều (`kb#43`). Giữ 1.0 là chấm một
-    # thước đo không còn khớp dữ liệu production. Số đo ở `evalhub#31` trên đúng bộ 2.0 + embedding
-    # thật: `success_rate 0.9889` · `citation_accuracy 1.0000` · verdict PASS (3/3 lượt), so với
-    # `0.4333`/`0.3636` của 1.0 + embedding bag-of-words dim-8 cũ (không phải model thật).
-    #
-    # **Điều kiện land (`app#30` — nối EmbeddingService thật vào 4 call-site) đã xong.** Trước đó
-    # corpus là vector Gemini còn query vẫn nhúng bằng bag-of-words dim-8 cũ ⇒ hai không gian khác
-    # nhau, đo được `recall@3 = 1/22` (ngẫu nhiên) và KHÔNG lỗi nào nổ. Đổi ref trước app#30 sẽ
-    # chấm câu hỏi 2.0 trên retrieval lệch không gian — không còn là rủi ro thật kể từ khi #30 merge
-    # (`test_no_route_imports_stub_embedding`/`test_routes_free_of_stub_embedding` khoá lại việc
-    # route nào lỡ nhắc tên hàm embedding giả cũ, nên chữ đó cố ý không xuất hiện nguyên văn ở đây).
-    golden_set_ref: str = "callisto-2.0-golden-30-v1"
-    # `ge=0.0, le=1.0` (kit#129 §3.1, vấn đề A, VinSOC AV-203052) — trước bản vá: client gửi
-    # `success_threshold: -999` được chấp nhận thẳng, mọi agent "đạt" bất kể chất lượng thật.
-    # Ràng buộc CHÍNH nằm ở contract (`ScorecardThreshold`, `create_dynamic_recipe` sẽ raise khi
-    # dựng recipe) — khai lại `Field` ở đây để FastAPI trả 422 SỚM (đúng lỗi input), thay vì để
-    # request đi hết `_evaluate()` rồi mới vỡ ở bước dựng recipe.
-    success_threshold: float = Field(default=0.9, ge=0.0, le=1.0)
-    citation_accuracy_threshold: float = Field(default=0.95, ge=0.0, le=1.0)
-    # `tenant_id` CỐ Ý KHÔNG có field ở đây — request body không có chỗ nào để client khai nó;
-    # tenant luôn tới từ `get_request_session()`, không phải body (đúng nguyên tắc "session luôn
-    # thắng client tự khai" — INV-1 — nhưng ở đây còn mạnh hơn: request THẬM CHÍ KHÔNG THỂ mang
-    # trường đó, chứ không phải "mang được nhưng bị bỏ qua").
+
+
+class ToolCheckResult(BaseModel):
+    tool: str
+    status: Literal["OK", "NOT_IMPLEMENTED"]
+
+
+class ConnectivityCheckResponse(BaseModel):
+    agent_id: str
+    results: list[ToolCheckResult]
+
+
+def _check_tool_connectivity(tool_whitelist: list[str]) -> list[dict[str, str]]:
+    """Với mỗi tool trong `tool_whitelist`, trả `"OK"` nếu có executor/dispatcher THẬT, ngược lại
+    `"NOT_IMPLEMENTED"`. Thứ tự giữ NGUYÊN theo `tool_whitelist` (không sort/dedupe) — UI hiển thị
+    đúng thứ tự agent khai.
+
+    `kb_search` LUÔN `"OK"`: nó có executor riêng (`KbRetrieveExecutor`, đã real) không đi qua
+    `ToolDispatch` — cùng bất biến A4 mà `run_agent_loop()` (engine#33) dùng ("kb_search luôn khả
+    dụng, không bị `tool_whitelist` chặn"). Tool khác `"OK"` nếu ∈ `SUPPORTED_TOOLS`
+    (`providers/tool_dispatch.py::RealToolDispatch` — nguồn sự thật DUY NHẤT dispatch được tool gì),
+    ngược lại `"NOT_IMPLEMENTED"` — không raise, không 400: đây là kết quả HIỂN THỊ, không phải lỗi
+    input (một agent có tool chưa nối được vẫn là 1 trạng thái hợp lệ để xem trước khi chat thật)."""
+    results: list[dict[str, str]] = []
+    for tool in tool_whitelist:
+        ok = tool == KB_SEARCH_TOOL or tool in SUPPORTED_TOOLS
+        results.append({"tool": tool, "status": "OK" if ok else "NOT_IMPLEMENTED"})
+    return results
+
+
+@router.post("", response_model=ConnectivityCheckResponse)
+async def create_run(body: RunRequest) -> ConnectivityCheckResponse:
+    session = get_request_session()
+
+    # Gate role-gap giữ nguyên từ bản trước app#44 (đã đóng, kit#41 review) — không phải mọi tài
+    # khoản đăng nhập đều gọi được, dù endpoint giờ không chạm KB/LLM/DB nào khác ngoài chính
+    # identity-check này.
+    identity = await fetch_fresh_identity(get_request_connection(), session.user)
+    require_admin(identity.roles)
+
+    results = _check_tool_connectivity(body.tool_whitelist)
+    return ConnectivityCheckResponse(agent_id=body.agent_id, results=[ToolCheckResult(**r) for r in results])
 
 
 class RunResponse(BaseModel):
+    """app#44 — GIỮ NGUYÊN, chỉ còn dùng cho `GET /api/runs/{run_id}` (đọc lại trace CHAT thật, xem
+    docstring module). KHÔNG còn là response của `POST` ở trên (đổi tên thành
+    `ConnectivityCheckResponse`, shape khác hẳn)."""
+
     run_id: str
     agent_id: str
     tenant_id: str
     events: list[dict[str, Any]]
     timeline_text: str
-
-
-@router.post("", response_model=RunResponse)
-async def create_run(body: RunRequest) -> RunResponse:
-    session = get_request_session()
-
-    # Gate role-gap đã phát hiện (trước bản vá này, BẤT KỲ tài khoản đã đăng nhập nào — kể cả
-    # employee chỉ có role nội dung, không "admin" — gọi thẳng được route này qua API dù UI không
-    # hiện nút Test cho họ). `require_admin` tra roles TƯƠI từ DB, không tin `session.roles` (JWT)
-    # — cùng nguyên tắc `routes/admin.py` đã dùng xuyên suốt.
-    identity = await fetch_fresh_identity(get_request_connection(), session.user)
-    require_admin(identity.roles)
-
-    try:
-        nodes = [Node.model_validate(n) for n in body.nodes]
-        edges = [Edge.model_validate(e) for e in body.edges]
-    except ValidationError as exc:
-        raise HTTPException(status_code=400, detail=f"node/edge không hợp lệ: {exc.errors()!r}") from exc
-
-    try:
-        recipe = create_dynamic_recipe(
-            agent_id=body.agent_id,
-            tenant_id=session.tenant_id,
-            instructions=body.instructions,
-            model=body.model,
-            tool_whitelist=body.tool_whitelist,
-            nodes=nodes,
-            edges=edges,
-            kb_id=body.kb_id,
-            scope=body.scope,
-            golden_set_ref=body.golden_set_ref,
-            success_threshold=body.success_threshold,
-            citation_accuracy_threshold=body.citation_accuracy_threshold,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    try:
-        graph_lint(recipe)
-    except ValueError as exc:
-        # Belt-and-suspenders phía server, cùng lý do comment gốc ở `dev_playground_server.py`:
-        # UI đã chặn export/test khi `graph_lint()` đỏ, nhưng client vẫn có thể gửi thẳng qua API.
-        raise HTTPException(status_code=400, detail=f"recipe không qua graph_lint(): {exc}") from exc
-
-    # PA-4 (app#41 review finding, dholmes0207): `graph_lint()` Rule 7 chỉ kiểm tool nằm trong
-    # `agent_config.tool_whitelist`, KHÔNG kiểm `RealToolDispatch` có dispatch được tool đó không.
-    # `kb_search` (kind `kb_retrieve`) nằm trong whitelist mặc định NHƯNG không phải tool
-    # `RealToolDispatch` implement — trước bản vá này, node `tool-call{kb_search}` qua sạch
-    # graph_lint() rồi mới crash ở `RealToolDispatch.dispatch()` GIỮA `interpreter.run()`, leak
-    # `ValueError` thành 500 trần (không có try/except quanh interpreter.run() ở route này). Chặn
-    # NGAY ĐÂY, trước khi tốn 1 lượt DB/LLM nào — 400 sạch, chỉ đúng cách sửa.
-    unsupported_tool = find_unsupported_tool_call(recipe)
-    if unsupported_tool is not None:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"tool {unsupported_tool!r} trong node tool-call không dispatch được — nếu là "
-                f"kb_search: kind của nó là kb_retrieve, dùng node kb-retrieve thay vì tool-call"
-            ),
-        )
-
-    # `Pool` (`get_pool()`), KHÔNG dùng `get_request_connection()` — review `app#17` đợt 3, "mở
-    # rộng connection-reuse pattern sang runs.py/publish.py/chat.py?". QUYẾT ĐỊNH: KHÔNG mở rộng
-    # trong PR này, nhưng đây KHÔNG PHẢI vì get_pool() "tiết kiệm" connection hơn — bản comment đầu
-    # ở đây (đợt 3) khẳng định vậy là SAI, đã tự phản chứng (đợt 4): `middleware.py`'s
-    # `tenant_context_middleware` ĐÃ giữ 1 connection từ CHÍNH pool này (`await pool.connection()`)
-    # bọc quanh TOÀN BỘ `await call_next(request)` — tức MỌI request (bất kể route) đã tốn 1
-    # connection suốt đời request rồi, KHÔNG PHỤ THUỘC route này dùng `get_pool()` hay
-    # `get_request_connection()`. `get_pool()` ở đây là connection THỨ HAI, checkout/trả lại riêng
-    # theo từng query của `PgKbSearch`/`PgTraceWriter` bên trong `interpreter.run()` — CỘNG THÊM
-    # vào connection middleware đã giữ, không phải thay thế nó. Với `max_size=8` (`core/_db.py`),
-    # dù route dùng `get_request_connection()` (không cộng thêm) hay `get_pool()` (cộng thêm tạm
-    # thời mỗi query) thì phần đáy — 1 connection/request suốt cả lượt `interpreter.run()` có thể
-    # kéo dài nhiều giây vì gọi LLM — VẪN CÒN NGUYÊN, khoảng 8 request đồng thời (bất kỳ route nào,
-    # không riêng route này) đã đủ ăn hết pool. Đây là rủi ro Important còn tồn tại từ đợt 3, CHƯA
-    # được PR này giải quyết — sửa đúng cần 1 trong 2: (a) đổi `PgKbSearch`/`PgTraceWriter`
-    # (`packages/kb`) nhận 1 connection thay vì cả `Pool`, để route này tái dùng
-    # `get_request_connection()` (giảm về đúng 1 connection/request, không cộng thêm — nhưng đổi
-    # chữ ký 1 package dùng chung, ngoài scope PR này), hoặc (b) tái cấu trúc middleware để không
-    # giữ connection xuyên suốt `call_next()` cho các route không cần nó suốt cả lượt chạy. Không
-    # làm ở đây — ghi lại tường minh làm follow-up, không phải để im như đợt 3 đã cảnh báo.
-    pool = await get_pool()
-    embedding: EmbeddingService = build_embedding()
-    kb_search = PgKbSearch(pool, embedding)
-    llm = build_llm()
-    trace_writer = PgTraceWriter(pool)
-    tool_dispatch = build_tool_dispatch(recipe.agent_config.tool_whitelist)
-
-    result = await interpreter.run(
-        recipe,
-        session_context=session,
-        kb_search=kb_search,
-        llm=llm,
-        embedding=embedding,
-        trace_writer=trace_writer,
-        tool_dispatch=tool_dispatch,
-    )
-
-    timeline_text = render_timeline(result.events, expected=walk_from_dag(recipe.dag))
-    return RunResponse(
-        run_id=result.run_id,
-        agent_id=recipe.agent_id,
-        tenant_id=str(recipe.tenant_id),
-        events=[e.model_dump(mode="json") for e in result.events],
-        timeline_text=timeline_text,
-    )
 
 
 @router.get("/{run_id}", response_model=RunResponse)
@@ -206,5 +121,11 @@ async def get_run(run_id: str) -> RunResponse:
         # trace), nên không tái tạo được cột "gap" chính xác ở đây; để trống có chủ đích, khác
         # `dev_playground_server.py` (nó cache `timeline_text` lúc POST). Theo dõi như 1 hạn chế
         # đã biết, không phải lỗi — client nên dùng `timeline_text` từ response POST gốc.
+        #
+        # app#44: "response POST gốc" ở trên nói tới THỜI KỲ TRƯỚC app#44 — `POST /api/runs` giờ
+        # không còn chạy interpreter/tạo trace (đổi hẳn thành connectivity-check), nên timeline
+        # thật chỉ còn tới từ `POST /api/agents/{id}/chat` (`routes/chat.py`). `render_timeline`
+        # (từng dùng ở đây) đã bỏ khỏi import — không còn `dag`/`nodes` nào ở tầng route này để
+        # dựng `expected` từ đó nữa.
         timeline_text="",
     )
