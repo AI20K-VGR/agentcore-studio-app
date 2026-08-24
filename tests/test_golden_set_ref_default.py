@@ -14,13 +14,15 @@ Hai bài, hai hỏng khác nhau, không bài nào thay được bài kia:
 
 from __future__ import annotations
 
-from studio_app.routes.publish import _GOLDEN_SET_DIR
-from studio_app.routes.runs import RunRequest
+from studio_app.routes.publish import _GOLDEN_SET_DIR, PublishRequest
 
 
 def test_mac_dinh_la_bo_golden_2_0() -> None:
-    """Bộ 2.0 là bộ khớp corpus mà `packages/kb` đang ingest (`kb#32` corpus, `kb#43` embedding)."""
-    assert RunRequest.model_fields["golden_set_ref"].default == "callisto-2.0-golden-30-v1"
+    """Bộ 2.0 là bộ khớp corpus mà `packages/kb` đang ingest (`kb#32` corpus, `kb#43` embedding).
+
+    app#44: field này dời từ `routes/runs.py::RunRequest` (đã đổi shape, mục D) sang
+    `routes/publish.py::PublishRequest` (`/evaluate`/`/publish`, không đổi scope)."""
+    assert PublishRequest.model_fields["golden_set_ref"].default == "callisto-2.0-golden-30-v1"
 
 
 def test_ref_mac_dinh_resolve_duoc_thanh_file_that() -> None:
@@ -30,7 +32,7 @@ def test_ref_mac_dinh_resolve_duoc_thanh_file_that() -> None:
     không phải 500, không phải fallback: route đơn giản là không chạy được. Bài này biến "ref gõ sai
     / ref không phải tên file" từ lỗi runtime của người dùng thành lỗi CI của người sửa mặc định.
     """
-    ref = RunRequest.model_fields["golden_set_ref"].default
+    ref = PublishRequest.model_fields["golden_set_ref"].default
     path = _GOLDEN_SET_DIR / f"{ref}.yaml"
     assert path.is_file(), (
         f"golden_set_ref mặc định {ref!r} không có file tương ứng ở {path} — "

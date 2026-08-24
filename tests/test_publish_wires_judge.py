@@ -39,8 +39,7 @@ import pytest
 import pytest_asyncio
 import studio_app.routes.publish as publish_module
 from studio_app.core._db import Pool, close_pools
-from studio_app.routes.publish import _evaluate
-from studio_app.routes.runs import RunRequest
+from studio_app.routes.publish import PublishRequest, _evaluate
 from studio_app.settings import LlmProvider, Settings
 from studio_contracts import Aggregate, CaseResult, Gate, GateThreshold, NodeType, Scorecard, Tokens, TraceEvent
 from studio_evalhub.agent_runner import AgentAnswer, CaseRun, StubAgentRunner
@@ -160,7 +159,7 @@ async def _bat_judge_ma_evaluate_dung(monkeypatch: pytest.MonkeyPatch, tmp_path:
     monkeypatch.setattr(publish_module, "build_llm", lambda: llm)
 
     nodes, edges = _minimal_valid_dag()
-    body = RunRequest(
+    body = PublishRequest(
         agent_id="agent-judge-wiring",
         instructions="Answer from KB only.",
         model="gpt-4o-mini",

@@ -45,6 +45,16 @@ review + approve trong hôm nay"*) — nới ranh giới có dấu vết, không
 **Cái này KHÔNG tự sinh `recipe_hash`.** Nó chỉ làm cho một hash **có nghĩa**: giờ đã có đúng một
 recipe để băm. Băm trên chuỗi byte nào (`by_alias`? `exclude_none`?) vẫn là câu hỏi mở của **SWE**
 (bút `Recipe`) — `DEC-D20-02` giữ nguyên: evalhub **nhận** giá trị, tuyệt đối không tự dẫn xuất.
+
+## app#44 — `run_case()` giờ chạy qua `agent_loop.run_agent_loop()`, không còn `interpreter.run()`
+
+Kiến trúc agent đổi (`PROJECT-SCOPE-DEMO-DAY30.md`): bỏ DAG 6-node tĩnh, thay bằng 1 LLM node + N
+tool tự chọn (`packages/engine` #33). `run_case()` KHÔNG còn `with_query(base, query)` +
+`interpreter.run()` — `query` đi thẳng qua kwarg `question=` của `run_agent_loop()`, và
+`run_agent_loop()` KHÔNG đọc `recipe.dag` (chỉ đọc `agent_config`/`kb_binding` của recipe). Mọi đoạn
+docstring dưới đây còn nhắc `interpreter.run()`/`model_copy` `params["query"]` mô tả HÀNH VI CŨ vẫn
+đúng cho `packages/engine::interpreter.run()` (fallback DAG-walk vẫn tồn tại, K2 engine#33) — chỉ
+KHÔNG còn là đường mà `run_case()` này đi qua nữa.
 """
 
 from __future__ import annotations
@@ -52,10 +62,10 @@ from __future__ import annotations
 from uuid import UUID
 
 from studio_contracts import LLM, EmbeddingService, KbSearch, Recipe, TraceWriter
-from studio_engine import interpreter
+from studio_engine import agent_loop
 from studio_evalhub.agent_runner import AgentAnswer, CaseRun
 from studio_workbench import create_recipe_d4
-from studio_workbench.recipe_ops import with_query, without_query
+from studio_workbench.recipe_ops import without_query
 from studio_workbench.tenant_wall import resolve_session
 
 from studio_app.providers.factory import build_tool_dispatch
@@ -71,7 +81,9 @@ def _llm_answer(final_state: dict[str, object]) -> dict[str, object]:
 
 
 class EngineAgentRunner:
-    """Adapter thật cho seam `AgentRunner`: bọc `studio_engine.interpreter.run`.
+    """Adapter thật cho seam `AgentRunner`: bọc `studio_engine.agent_loop.run_agent_loop` (app#44 —
+    trước đó `studio_engine.interpreter.run`, DAG-walk cũ; vẫn tồn tại trong `packages/engine` làm
+    fallback, K2 engine#33, chỉ không còn là đường adapter này gọi).
 
     Constructor-DI 4 collaborator (dựng/tiêm ở composition root): `kb_search` (DE `StaticKbSearch`),
     `llm`/`embedding` (providers), `trace_writer` (obs sink). Không giữ trạng thái giữa các case."""
@@ -128,49 +140,47 @@ class EngineAgentRunner:
         tenant_id: UUID,
         section_roles: list[str],
     ) -> CaseRun:
-        """Lấy **recipe gốc của run** (`certified_recipe`), bơm `query` của case vào bằng `model_copy`,
-        chạy qua interpreter thật, map `RunResult` → `CaseRun`.
+        """Lấy **recipe gốc của run** (`certified_recipe`), chạy qua `run_agent_loop()` thật với
+        `question=query` (app#44 — KHÔNG còn bơm `query` vào `recipe.dag` bằng `with_query`/
+        `model_copy`: vòng lặp mới không đọc `recipe.dag`), map `RunResult` → `CaseRun`.
 
         **Không dựng recipe mới mỗi case nữa** (`DEC-D20-07`) — đó là thứ làm golden-30 sinh 30 recipe
-        và khiến `recipe_hash` vô nghĩa. Biến thể per-case chỉ khác đúng một khoá `params["query"]`,
-        và nó là **dữ liệu chạy**, không phải một recipe khác.
+        và khiến `recipe_hash` vô nghĩa. `query` giờ là **input trực tiếp của lời gọi**
+        (`question=`), không còn là 1 khoá bơm vào recipe — recipe gốc dùng NGUYÊN VẸN, cùng object
+        cho mọi case trong 1 run (giữ đúng bất biến `DEC-D20-07`, chỉ đổi CƠ CHẾ truyền `query`).
 
         `section_roles` đi qua `session_context.roles` — phần danh tính do server resolve. Từ
-        `workbench#23` nó **không còn** xuống `node.params`: `interpreter.run()` luôn ghi đè hai khoá
-        `tenant_id`/`section_roles` từ session (`interpreter.py:320-327`), nên để chúng trong params là
-        dữ liệu chết. Nó vẫn vào `kb_binding.scope` của recipe gốc như một **nhãn tự mô tả**.
+        `workbench#23` nó **không còn** xuống `node.params`; vòng lặp mới không đọc `node.params` của
+        `recipe.dag` chút nào (`run_agent_loop` chỉ đọc `agent_config`/`kb_binding`), nên câu hỏi
+        "params có ghi đè được không" không còn áp dụng nữa — `tenant_id`/`section_roles` chỉ còn
+        sống trong `session_context` (fence tại `agent_loop.fenced_kb_params`, cùng cơ chế
+        `interpreter.run()` dùng cho DAG-walk, dùng chung 1 helper — `fence.py`). Nó vẫn vào
+        `kb_binding.scope` của recipe gốc như một **nhãn tự mô tả**.
 
         Thứ tự `section_roles` giữ **nguyên trạng**, không sắp lại: `scope` dựng bằng
         `','.join(section_roles)` nên đã phụ thuộc thứ tự đó từ trước D8, và `list[str]` là kiểu khai ở
         cả `GoldenCase.section_roles` lẫn Protocol `AgentRunner.run_case`. Sắp riêng một phía sẽ làm
         `scope` và `roles` mô tả hai thứ tự khác nhau cho cùng một case.
 
-        `tenant_id` KHÔNG còn đi qua `recipe.tenant_id` để tới kb-retrieve (xem docstring module):
-        `resolve_session` dựng danh tính server-side, và `interpreter.run()` lấy tenant từ đó. Recipe
-        vẫn nhận `tenant_id` vì contract còn trường đó, nhưng nếu hai bên lệch thì **session thắng** —
-        đó chính là INV-1.
+        `tenant_id` KHÔNG còn đi qua `recipe.tenant_id` để tới `kb_search` (xem docstring module):
+        `resolve_session` dựng danh tính server-side, và `run_agent_loop()` lấy tenant từ
+        `session_context` (fence giống hệt `interpreter.run()`, cùng helper `fenced_kb_params`).
+        Recipe vẫn nhận `tenant_id` vì contract còn trường đó, nhưng nếu hai bên lệch thì **session
+        thắng** — đó chính là INV-1.
 
         Đi qua `resolve_session` thật của SWE chứ không tự dựng `ResolvedContext`: nó là cổng
         fail-closed theo contract của chủ hàm (`tenant_wall.py`), nên adapter được kiểm đầu vào miễn phí
         thay vì tự tin rằng `tenant_id` luôn hợp lệ. `user` là `"eval-harness"` — đây là harness chạy,
         không phải một người dùng thật; nói dối chỗ này sẽ làm trace khó truy nguồn.
 
-        GRAPH-LINT-CONTRACT (kit#129 item 3, thẩm định VinSOC finding C / DEC-A): hàm này KHÔNG tự
-        gọi `graph_lint()`. `certified_recipe()` ở trên có hai nhánh: (a) trả `self._recipe` —
-        recipe được tiêm ở constructor — NGUYÊN VẸN; caller sản xuất DUY NHẤT trong production
-        (`routes/publish.py::_evaluate`) giờ ĐÃ truyền `recipe=` (`kit#127` đóng ở review `app#26`
-        ⛔ — trước đó nhánh này chưa từng chạy thật, KHÔNG truyền, khiến recipe được CHẤM khác hẳn
-        recipe được PUBLISH), và an toàn vì `_evaluate` gọi `graph_lint(recipe)` NGAY TRƯỚC khi dựng
-        `EngineAgentRunner(recipe=recipe, ...)`, đúng tiền điều kiện dòng dưới đòi hỏi; hoặc (b) tự
-        dựng `create_recipe_d4(...)` — một recipe cố định, KHÔNG bắt nguồn từ `nodes`/`edges` người
-        dùng gửi lên (đường còn lại, dùng khi caller không tiêm `recipe=`, ví dụ eval-harness chạy
-        rời khỏi route thật), nên không có DAG chưa-kiểm nào của người dùng chạm tới
-        `interpreter.run()` qua đường này. Đổi thứ tự 2 lệnh gọi đó ở `_evaluate` (graph_lint sau
-        khi dựng runner, thay vì trước) làm mất tiền điều kiện này —
-        `tests/test_graph_lint_before_interpreter_run.py` đang allowlist hàm này theo tên; đọc lại
-        docstring bài test đó trước khi đổi hợp đồng này."""
+        **`graph_lint()` (app#44)**: hàm này KHÔNG tự gọi, và giờ KHÔNG CẦN — `run_agent_loop()`
+        không walk `recipe.dag`, nên hợp đồng "phải graph_lint trước khi tới DAG-walk" (kit#129 item
+        3, `DEC-A`) không còn áp dụng cho đường này nữa; `tests/test_graph_lint_before_interpreter_run.py`
+        đã bị RETIRE cùng app#44 vì chính lý do đó (đọc commit đó nếu cần lịch sử). `certified_recipe()`
+        ở trên vẫn có 2 nhánh (a) recipe tiêm từ constructor (`routes/publish.py::_evaluate`) hoặc (b)
+        tự dựng `create_recipe_d4(...)` — cả hai giờ đều an toàn KHÔNG CẦN graph_lint đi trước, vì
+        không nhánh nào của `run_agent_loop()` từng đọc `dag.nodes`/`dag.edges`."""
         base = self.certified_recipe(agent_id=agent_id, tenant_id=tenant_id, section_roles=section_roles)
-        recipe = with_query(base, query)
         session_context = resolve_session({"tenant_id": tenant_id, "user": "eval-harness", "roles": section_roles})
         # `tool_dispatch=` (engine#32 review finding): trước fix này thiếu tham số, nên MỌI recipe
         # eval-gate qua đây âm thầm fallback về `WhitelistToolDispatch` (stub `interpreter.py`).
@@ -190,16 +200,15 @@ class EngineAgentRunner:
         # hash (`certified_recipe()` docstring, D16 golden-batch determinism) — hai side-effect nằm
         # ngoài phạm vi finding này. Fixture `create_recipe_d4` là của `packages/workbench` (SWE) —
         # sửa mặc định đó là quyết định riêng, không phải phần của fix này.
-        result = await interpreter.run(
-            recipe,
+        result = await agent_loop.run_agent_loop(
+            base,
             kb_search=self._kb_search,
             llm=self._llm,
             embedding=self._embedding,
             trace_writer=self._trace_writer,
             session_context=session_context,
-            tool_dispatch=(
-                build_tool_dispatch(recipe.agent_config.tool_whitelist) if self._recipe is not None else None
-            ),
+            question=query,
+            tool_dispatch=(build_tool_dispatch(base.agent_config.tool_whitelist) if self._recipe is not None else None),
         )
         llm_out = _llm_answer(result.final_state)
         raw_citations = llm_out.get("citations")

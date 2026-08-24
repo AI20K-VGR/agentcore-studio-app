@@ -26,13 +26,15 @@ recipe được băm giờ CHÍNH LÀ recipe được harness chạy qua từng 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import studio_kb
 import yaml  # type: ignore[import-untyped, unused-ignore]
 from fastapi import APIRouter, HTTPException
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from studio_contracts import Edge, Node, Recipe, Scorecard
+from studio_engine.agent_loop import AgentLoopExhausted
 from studio_evalhub.harness import EvalHarness
 from studio_evalhub.judge import LLMJudge
 from studio_kb.doc_factory import TENANT_IDS
@@ -48,10 +50,37 @@ from studio_app.eval_adapter import EngineAgentRunner
 from studio_app.middleware import get_request_connection, get_request_session
 from studio_app.obs.trace_writer import PgTraceWriter
 from studio_app.providers.factory import build_embedding, build_llm
-from studio_app.routes.runs import RunRequest
 from studio_app.settings import get_settings
 
 router = APIRouter(prefix="/api/agents", tags=["publish"])
+
+
+class PublishRequest(BaseModel):
+    """app#44 — TÁCH RIÊNG khỏi `routes/runs.py::RunRequest` (trước đó `/evaluate`/`/publish` dùng
+    CHUNG 1 model với `POST /api/runs`). `routes/runs.py` đổi hẳn shape theo mục D
+    (`PROJECT-SCOPE-DEMO-DAY30.md`) thành connectivity-check tĩnh — không còn `nodes`/`edges`/
+    `kb_id`/`scope`/`golden_set_ref`/threshold nào cả. `/evaluate`/`/publish` thì KHÔNG đổi: vẫn
+    cần `nodes`/`edges` để `create_dynamic_recipe(...)` dựng `recipe.dag` (Recipe.dag vẫn là field
+    bắt buộc trên contract dù `run_agent_loop()` không đọc nó — xem `docs/system-architecture.md`),
+    nên contract HTTP của 2 route này giữ NGUYÊN, chỉ đổi TÊN class + nơi khai (từ `runs.py` sang
+    đây, để không còn phụ thuộc chéo giữa 2 route có scope khác hẳn nhau)."""
+
+    agent_id: str
+    instructions: str
+    model: str
+    tool_whitelist: list[str] = Field(default_factory=list)
+    kb_id: str
+    scope: str
+    nodes: list[dict[str, Any]]
+    edges: list[dict[str, Any]]
+    # Xem giải thích đầy đủ (bộ golden 2.0, app#30, mốc land) ở docstring gốc `routes/runs.py::RunRequest`
+    # trước app#44 — không lặp lại ở đây, lý do chọn mặc định này không đổi.
+    golden_set_ref: str = "callisto-2.0-golden-30-v1"
+    success_threshold: float = Field(default=0.9, ge=0.0, le=1.0)
+    citation_accuracy_threshold: float = Field(default=0.95, ge=0.0, le=1.0)
+    # `tenant_id` CỐ Ý KHÔNG có field ở đây — cùng lý do T1 IDOR đã khoá ở `RunRequest` gốc
+    # (`test_routes_runs.py`, trước app#44): tenant luôn tới từ `get_request_session()`.
+
 
 # DEC-D16-01: composition root là nơi DUY NHẤT được phép biết golden-set nằm ở đâu trên đĩa.
 #
@@ -89,7 +118,7 @@ def _resolve_golden_set_path(ref: str) -> Path | None:
     return None
 
 
-async def _evaluate(agent_id: str, body: RunRequest, session: ResolvedContext) -> tuple[Recipe, Scorecard]:
+async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContext) -> tuple[Recipe, Scorecard]:
     """Dựng recipe từ canvas + chạy NGUYÊN golden_set_ref qua `EvalHarness.run()` thật — dùng chung
     cho cả `/evaluate` (chỉ xem điểm, KHÔNG ghi DB) lẫn `/publish` (chấm rồi ghi DB nếu đạt). Mỗi
     lần gọi route nào cũng chấm LẠI TỪ ĐẦU — route `/publish` không tin bất kỳ Scorecard nào UI đã
@@ -212,12 +241,31 @@ async def _evaluate(agent_id: str, body: RunRequest, session: ResolvedContext) -
         # trong recipe (DEC-D16-01: ref là khoá, tên file chỉ là đường dẫn) — lỗi INPUT của
         # client (chọn sai `golden_set_ref`), không phải lỗi hệ thống. Phát hiện thật lúc test tay
         # route này: trước bản vá này, lỗi rơi thẳng thành 500 không kiểm soát.
+        #
+        # app#44: từ khi `EngineAgentRunner.run_case()` (eval_adapter.py) chạy qua `run_agent_loop()`
+        # thay `interpreter.run()`, `ValueError` KHÔNG còn chỉ có 1 nguồn — `WhitelistGuardedDispatch`
+        # (engine) cũng ném đúng kiểu này khi LLM tự phát `TOOL_CALL:` một tool NGOÀI
+        # `agent_config.tool_whitelist` (model tự ý gọi, không phải lỗi client khai `golden_set_ref`
+        # sai). Message KHÔNG còn giả định cứng nguyên nhân — trả nguyên `str(exc)` (đã đủ cụ thể ở
+        # cả 2 nguồn) thay vì diễn giải sai 1 trong 2 trường hợp.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (AgentLoopExhausted, PermissionError) as exc:
+        # app#44 — 2 loại exception MỚI `run_agent_loop()` có thể ném mà `interpreter.run()` không
+        # có (xem docstring `agent_loop.py`, "Handoff to app#44"): `AgentLoopExhausted` (hết
+        # `max_turns` chưa có câu trả lời cuối trên 1 case golden-set) và `PermissionError`
+        # (`session_context.tenant_id` không phải UUID hợp lệ sau fence — phòng thủ, không nên
+        # trúng thật qua đường `resolve_session` thật). Quyết định đã chốt với user (AskUserQuestion,
+        # cùng phiên app#44): CẢ HAI map 500 — đây là lỗi hệ thống/recipe hỏng khi chấm golden-set,
+        # không phải lỗi INPUT của client gọi `/evaluate`/`/publish`, cùng mức nghiêm trọng
+        # `graph_lint()` đỏ trên recipe đã published từng dùng ở `routes/chat.py`. Không bắt bằng
+        # `except Exception` chung: giữ MỌI exception KHÁC (bug thật, lỗi lập trình) lộ nguyên dạng
+        # thay vì bị nuốt thành 500 vô danh.
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
     return recipe, scorecard
 
 
 @router.post("/{agent_id}/evaluate")
-async def evaluate_agent(agent_id: str, body: RunRequest) -> dict[str, object]:
+async def evaluate_agent(agent_id: str, body: PublishRequest) -> dict[str, object]:
     """Chấm điểm NGUYÊN golden_set_ref qua `EvalHarness` thật, trả `Scorecard` — KHÔNG gọi
     `publish()`, không ghi `wb.recipes`. Dùng cho UI hiện điểm TRƯỚC khi quyết bấm Publish, để nút
     Publish có căn cứ bật/tắt mà không phải "bấm thử xem có được không"."""
@@ -237,7 +285,7 @@ async def evaluate_agent(agent_id: str, body: RunRequest) -> dict[str, object]:
 
 
 @router.post("/{agent_id}/publish")
-async def publish_agent(agent_id: str, body: RunRequest) -> dict[str, object]:
+async def publish_agent(agent_id: str, body: PublishRequest) -> dict[str, object]:
     """409 giờ chỉ còn nghĩa "recipe chưa qua được gate" (`gate.verdict == 'FAIL'`) — KHÔNG còn
     LUÔN 409 như trước khi `recipe_hash` (DEC-03) có producer thật (xem docstring module + `_evaluate`
     ở trên: `EvalHarness().run()` giờ được truyền `recipe_hash=recipe_hash(recipe)` thật)."""

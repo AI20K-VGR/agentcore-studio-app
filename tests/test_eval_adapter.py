@@ -30,6 +30,7 @@ from studio_app.eval_adapter import EngineAgentRunner, _llm_answer
 from studio_app.providers.fakes import ExtractiveFakeLLM, FakeEmbedding, FakeLLM
 from studio_contracts import LLM, Edge, Node, NodeType, Recipe, TraceEvent
 from studio_contracts.kb import KbSearchResultItem
+from studio_engine import agent_loop as engine_agent_loop
 from studio_engine import interpreter as engine_interpreter
 from studio_engine.interpreter import RunResult
 from studio_workbench import create_dynamic_recipe, create_recipe_d4
@@ -67,13 +68,38 @@ class _RecordingKbSearch:
 
 
 class _ScriptedLLM:
-    """LLM fake trả 1 chuỗi cố định (FakeLLM của providers là hash-seeded, không điều khiển nội dung được)."""
+    """LLM fake trả 1 chuỗi cố định (FakeLLM của providers là hash-seeded, không điều khiển nội dung được).
+
+    app#44: dưới `run_agent_loop`, 1 chuỗi cố định luôn được đọc là `FinalAnswer` NGAY lượt 1 (không
+    khớp `TOOL_CALL:`) — `kb_search` không bao giờ chạy qua double này. Vẫn hợp lệ cho case "trả lời
+    ngay, không cần tool" (Lớp A biến thể "không tool"); case cần chunk thật để chấm citation phải
+    dùng `_MultiTurnScriptedLLM` bên dưới thay vì cái này (khác DAG cũ, nơi `kb-retrieve` chạy vô
+    điều kiện trước `llm-step` nên `_ScriptedLLM` một câu vẫn "thấy" được chunk qua trace dù không
+    tự gọi tool)."""
 
     def __init__(self, response: str) -> None:
         self._response = response
 
     async def complete(self, prompt: str, **kwargs: object) -> str:  # noqa: ARG002
         return self._response
+
+
+class _MultiTurnScriptedLLM:
+    """LLM fake trả lần lượt từng phần tử `responses` — 1 phần tử = 1 lượt `complete()`. Không đọc
+    prompt (khác `ExtractiveFakeLLM`) — dùng khi cần kịch bản CỐ ĐỊNH độc lập với nội dung KB thật
+    trả về: mở rộng `_ScriptedLLM` cho vòng lặp mới (engine#33), nơi trigger `kb_search` đòi ít nhất
+    2 lượt (`TOOL_CALL:` rồi final-answer) thay vì 1 lượt DAG cũ chạy `kb-retrieve` vô điều kiện.
+    Gọi quá số phần tử đã script → `IndexError` thẳng (không lặp lại phần tử cuối, tránh che giấu
+    lỗi kịch bản thiếu lượt)."""
+
+    def __init__(self, responses: list[str]) -> None:
+        self._responses = responses
+        self._calls = 0
+
+    async def complete(self, prompt: str, **kwargs: object) -> str:  # noqa: ARG002
+        response = self._responses[self._calls]
+        self._calls += 1
+        return response
 
 
 class _CollectingTraceWriter:
@@ -94,10 +120,22 @@ def _runner(kb: _RecordingKbSearch, llm: LLM, writer: _CollectingTraceWriter) ->
 
 
 async def test_run_case_maps_llm_output_to_agent_answer() -> None:
-    """KHÓA A1: final_state llm-step → AgentAnswer; citations = LLM-trích ∩ retrieved (grounding engine)."""
+    """KHÓA A1: final_state llm-step → AgentAnswer; citations = LLM-trích ∩ retrieved (grounding engine).
+
+    app#44: `kb_search` không còn chạy vô điều kiện (khác DAG cũ) — LLM double phải TỰ phát
+    `TOOL_CALL: kb_search` (lượt 1) rồi trả lời trích dẫn (lượt 2), `_MultiTurnScriptedLLM` thay
+    `_ScriptedLLM` một câu. Event sequence giờ `["llm-step","kb-retrieve","llm-step"]` — không còn
+    `tool-call`/`end` cố định (đó là 2 trong 6 `NodeType` của DAG cũ, vòng lặp mới chỉ phát 3:
+    `LLM_STEP`/`KB_RETRIEVE`/`TOOL_CALL`, và `TOOL_CALL` chỉ khi model gọi 1 tool KHÁC `kb_search`)."""
     kb = _RecordingKbSearch([_item("ankor-leave-001#c1"), _item("ankor-leave-001#c2")])
     writer = _CollectingTraceWriter()
-    runner = _runner(kb, _ScriptedLLM("Cần báo trước 3 ngày làm việc [ankor-leave-001#c1]."), writer)
+    llm = _MultiTurnScriptedLLM(
+        [
+            'TOOL_CALL: {"tool": "kb_search", "params": {"query": "nghỉ phép?"}}',
+            "Cần báo trước 3 ngày làm việc [ankor-leave-001#c1].",
+        ]
+    )
+    runner = _runner(kb, llm, writer)
 
     case_run = await runner.run_case(
         agent_id="agent-callisto-d4", query="nghỉ phép?", tenant_id=TENANT_ID, section_roles=["public"]
@@ -106,20 +144,28 @@ async def test_run_case_maps_llm_output_to_agent_answer() -> None:
     assert case_run.answer.answer == "Cần báo trước 3 ngày làm việc [ankor-leave-001#c1]."
     assert case_run.answer.citations == ["ankor-leave-001#c1"]
     assert case_run.answer.refused is False
-    assert [e.node_type.value for e in case_run.events] == ["kb-retrieve", "llm-step", "tool-call", "end"]
+    assert [e.node_type.value for e in case_run.events] == ["llm-step", "kb-retrieve", "llm-step"]
 
 
 async def test_run_case_threads_tenant_uuid_and_roles() -> None:
-    """KHÓA A2 (D-13): tenant_id UUID + section_roles đi tới kb.search; mọi event mang đúng UUID, 1 run_id."""
+    """KHÓA A2 (D-13): tenant_id UUID + section_roles đi tới kb.search; mọi event mang đúng UUID, 1 run_id.
+
+    app#44: `query` LLM tự phát trong `TOOL_CALL:` — không còn từ `node.params["query"]` tĩnh của DAG."""
     kb = _RecordingKbSearch([_item("ankor-expense-001#c2")])
     writer = _CollectingTraceWriter()
-    runner = _runner(kb, _ScriptedLLM("Tối đa 20 triệu đồng [ankor-expense-001#c2]."), writer)
+    llm = _MultiTurnScriptedLLM(
+        [
+            'TOOL_CALL: {"tool": "kb_search", "params": {"query": "duyệt chi?"}}',
+            "Tối đa 20 triệu đồng [ankor-expense-001#c2].",
+        ]
+    )
+    runner = _runner(kb, llm, writer)
 
     case_run = await runner.run_case(
         agent_id="agent-callisto-d4", query="duyệt chi?", tenant_id=TENANT_ID, section_roles=["finance"]
     )
 
-    assert kb.calls[0] == ("duyệt chi?", TENANT_ID, ["finance"], 3)
+    assert kb.calls[0] == ("duyệt chi?", TENANT_ID, ["finance"], 5)
     assert {e.tenant_id for e in case_run.events} == {TENANT_ID}
     assert len({e.run_id for e in case_run.events}) == 1
 
@@ -138,6 +184,13 @@ async def test_inv1_recipe_khai_tenant_khac_thi_session_thang() -> None:
     Chạy `interpreter.run` TRỰC TIẾP, không qua `run_case`: adapter dựng recipe *từ* cùng `tenant_id` mà
     nó đưa vào `resolve_session`, nên qua đường đó hai giá trị luôn khớp và không tạo ra được thế lệch
     cần kiểm. Thế lệch là điều kiện thí nghiệm, không phải cách adapter được gọi thật.
+
+    app#44: bài này CỐ Ý vẫn nhắm `interpreter.run()` (DAG-walk, không phải `run_agent_loop()`) — nó
+    khoá fence ở TẦNG interpreter/node.params (`kb_node.params["tenant_id"]` bị ghi đè), một cơ chế
+    chỉ tồn tại trên đường DAG-walk (fallback vẫn sống, K2 engine#33). Fence tương đương cho
+    `run_agent_loop()` là `agent_loop.fenced_kb_params` (cùng helper `fence.py` cả 2 đường dùng
+    chung) — không cần bài riêng ở đây vì logic override đã chung 1 hàm, xem `packages/engine`'s
+    test riêng cho `fenced_kb_params`.
 
     Ba assert, và assert đầu là cầu chì:
 
@@ -199,56 +252,65 @@ async def test_inv1_recipe_khai_tenant_khac_thi_session_thang() -> None:
 
 async def test_run_case_events_passthrough_from_trace() -> None:
     """KHÓA A3: CaseRun.events == events đã emit qua trace_writer, nguyên vẹn cùng thứ tự —
-    đây là nguồn chấm citation của evalhub, adapter không được tự chế/lọc."""
+    đây là nguồn chấm citation của evalhub, adapter không được tự chế/lọc.
+
+    app#44: 3 event (`llm-step`,`kb-retrieve`,`llm-step`) — không còn 4 node DAG cố định."""
     kb = _RecordingKbSearch([_item("ankor-leave-001#c1")])
     writer = _CollectingTraceWriter()
-    runner = _runner(kb, _ScriptedLLM("ok [ankor-leave-001#c1]"), writer)
+    llm = _MultiTurnScriptedLLM(
+        ['TOOL_CALL: {"tool": "kb_search", "params": {"query": "q?"}}', "ok [ankor-leave-001#c1]"]
+    )
+    runner = _runner(kb, llm, writer)
 
     case_run = await runner.run_case(
         agent_id="agent-callisto-d4", query="q?", tenant_id=TENANT_ID, section_roles=["public"]
     )
 
     assert case_run.events == writer.events
-    assert len(case_run.events) == 4
+    assert len(case_run.events) == 3
 
 
 @pytest.mark.parametrize(
-    "llm_text",
+    "final_answer_text",
     [
         "Cần báo trước 3 ngày làm việc [ankor-leave-001#c1].",  # trả lời có trích dẫn grounded
         _REFUSAL,  # tín hiệu từ chối của engine ở D5 (sentinel); D6 engine đổi luật — xem docstring
     ],
 )
-async def test_run_case_surfaces_engine_refusal_faithfully(llm_text: str) -> None:
+async def test_run_case_surfaces_engine_refusal_faithfully(final_answer_text: str) -> None:
     """KHÓA A4 (ENGINE-AGNOSTIC): adapter phải phản ánh ĐÚNG quyết định `refused`/`citations` mà
     engine đưa ra — bất kể engine quyết bằng luật nào (sentinel `[[REFUSED]]` ở D5 · grounding ở
-    engine#10/D6 · luật khác sau này).
+    engine#10/D6 · công thức `(not citations) and (not used_non_kb_tool)` của vòng lặp mới, A5/DEC-4
+    ở engine#33 · luật khác sau này).
 
-    Cách làm: chạy `interpreter.run` TRỰC TIẾP để lấy quyết định GỐC của engine trong `final_state`,
-    rồi chạy adapter trên cùng input và so hai bên. Nhờ vậy test pin đúng hợp đồng của adapter (map
-    trung thực, không tự chế/nuốt cờ) mà KHÔNG pin luật refusal của engine — luật đó thuộc engine và
-    có test riêng bên đó. Bản trước của test này drive refusal qua sentinel nên sẽ vỡ oan khi
-    engine#10 (#27) bỏ sentinel."""
+    Cách làm: chạy `run_agent_loop` TRỰC TIẾP (app#44 — trước đó `interpreter.run`) để lấy quyết
+    định GỐC của engine trong `final_state`, rồi chạy adapter trên CÙNG input (cùng kịch bản
+    `_MultiTurnScriptedLLM`: TOOL_CALL kb_search lượt 1, `final_answer_text` lượt 2 — cần 2 lượt vì
+    vòng lặp mới không chạy kb_search vô điều kiện như DAG cũ) và so hai bên. Nhờ vậy test pin đúng
+    hợp đồng của adapter (map trung thực, không tự chế/nuốt cờ) mà KHÔNG pin luật refusal của engine
+    — luật đó thuộc engine và có test riêng bên đó."""
     query, roles = "nghỉ phép?", ["public"]
+    scripted_responses = ['TOOL_CALL: {"tool": "kb_search", "params": {"query": "nghỉ phép?"}}', final_answer_text]
 
     # (1) Sự thật gốc — engine tự quyết.
     # `session_context` dựng bằng CHÍNH `resolve_session` mà adapter dùng, cùng dict đầu vào: so hai
     # bên chỉ có nghĩa khi danh tính hai lượt giống nhau. Tự dựng `ResolvedContext` tay ở đây sẽ mở ra
     # khả năng lượt (1) và lượt (2) chạy dưới hai danh tính khác nhau mà test vẫn xanh.
-    raw = await engine_interpreter.run(
-        create_recipe_d4(agent_id="agent-callisto-d4", tenant_id=TENANT_ID, scope="t/public", query=query),
+    raw = await engine_agent_loop.run_agent_loop(
+        create_recipe_d4(agent_id="agent-callisto-d4", tenant_id=TENANT_ID, scope="t/public"),
         kb_search=_RecordingKbSearch([_item("ankor-leave-001#c1")]),
-        llm=_ScriptedLLM(llm_text),
+        llm=_MultiTurnScriptedLLM(scripted_responses),
         embedding=FakeEmbedding(),
         trace_writer=_CollectingTraceWriter(),
         session_context=resolve_session({"tenant_id": TENANT_ID, "user": "eval-harness", "roles": roles}),
+        question=query,
     )
     engine_out = _llm_answer(raw.final_state)
 
     # (2) Adapter đi cùng đường, cùng input
     case_run = await _runner(
         _RecordingKbSearch([_item("ankor-leave-001#c1")]),
-        _ScriptedLLM(llm_text),
+        _MultiTurnScriptedLLM(scripted_responses),
         _CollectingTraceWriter(),
     ).run_case(agent_id="agent-callisto-d4", query=query, tenant_id=TENANT_ID, section_roles=roles)
 
@@ -288,23 +350,28 @@ async def test_refusal_must_be_expressible_somehow() -> None:
 # ---------------------------------------------------------------------------
 
 
-class _StubInterpreter:
-    """Namespace fake thay `eval_adapter.interpreter`; ghi lại recipe để pin đường adapter→builder."""
+class _StubAgentLoop:
+    """Namespace fake thay `eval_adapter.agent_loop` (app#44 — trước đó `eval_adapter.interpreter`);
+    ghi lại recipe + `question` để pin đường adapter→builder."""
 
     def __init__(self, result: RunResult) -> None:
         self._result = result
         self.recipes: list[Recipe] = []
+        self.questions: list[str] = []
 
-    async def run(self, recipe: Recipe, **kwargs: object) -> RunResult:  # noqa: ARG002
+    async def run_agent_loop(self, recipe: Recipe, **kwargs: object) -> RunResult:
         self.recipes.append(recipe)
+        question = kwargs["question"]
+        assert isinstance(question, str)
+        self.questions.append(question)
         return self._result
 
 
 def _patched(
     monkeypatch: pytest.MonkeyPatch, final_state: dict[str, object]
-) -> tuple[EngineAgentRunner, _StubInterpreter]:
-    stub = _StubInterpreter(RunResult(run_id="r-test", events=[], final_state=final_state))
-    monkeypatch.setattr(eval_adapter, "interpreter", stub)
+) -> tuple[EngineAgentRunner, _StubAgentLoop]:
+    stub = _StubAgentLoop(RunResult(run_id="r-test", events=[], final_state=final_state))
+    monkeypatch.setattr(eval_adapter, "agent_loop", stub)
     runner = _runner(_RecordingKbSearch([]), _ScriptedLLM("unused"), _CollectingTraceWriter())
     return runner, stub
 
@@ -360,8 +427,11 @@ async def test_refused_coercion(monkeypatch: pytest.MonkeyPatch, llm_out: dict[s
 
 
 async def test_recipe_construction_via_real_builder(monkeypatch: pytest.MonkeyPatch) -> None:
-    """KHÓA B8a: builder THẬT (chỉ patch interpreter) — tenant_id vào recipe (D-13), agent_id ""
-    → fallback, section_roles round-trip qua scope "t/a,b" của adapter."""
+    """KHÓA B8a: builder THẬT (chỉ patch agent_loop) — tenant_id vào recipe (D-13), agent_id ""
+    → fallback, section_roles round-trip qua scope "t/a,b" của adapter.
+
+    app#44: `query` giờ quan sát được qua `stub.questions` (kwarg `question=`), KHÔNG còn
+    `node.params["query"]` — vòng lặp mới không đọc `recipe.dag` để lấy câu hỏi."""
     runner, stub = _patched(monkeypatch, {"n2": {"answer": "x"}})
     await runner.run_case(agent_id="", query="q?", tenant_id=TENANT_ID, section_roles=["public", "finance"])
 
@@ -373,7 +443,8 @@ async def test_recipe_construction_via_real_builder(monkeypatch: pytest.MonkeyPa
     assert recipe.kb_binding.scope == "t/public,finance"
     kb_node = next(n for n in recipe.dag.nodes if n.type.value == "kb-retrieve")
     assert "section_roles" not in kb_node.params
-    assert kb_node.params["query"] == "q?"
+    assert "query" not in kb_node.params, "app#44: query không còn bơm vào node.params"
+    assert stub.questions[0] == "q?"
 
 
 async def test_recipe_construction_empty_roles(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -412,8 +483,11 @@ async def test_prompt_carries_retrieved_chunk_ids() -> None:
         agent_id="a", query="nghỉ phép báo trước bao lâu?", tenant_id=TENANT_ID, section_roles=["public"]
     )
 
-    assert len(llm.prompts_seen) == 1, "llm-step phải được gọi đúng 1 lần"
-    prompt = llm.prompts_seen[0]
+    # app#44: 2 lượt — lượt 1 (chưa search) phát TOOL_CALL, lượt 2 (đã có observation) đọc chunk.
+    # Khác DAG cũ (1 lượt, chunk đã có sẵn trước khi llm-step chạy).
+    assert len(llm.prompts_seen) == 2, "llm.complete() phải được gọi đúng 2 lượt (tool-call rồi final-answer)"
+    assert "nghỉ phép báo trước bao lâu?" in llm.prompts_seen[0], "lượt 1 phải mang câu hỏi (chưa có chunk)"
+    prompt = llm.prompts_seen[1]
     assert "[ankor-leave-001#c1]\nBáo trước 3 ngày làm việc." in prompt
     assert "nghỉ phép báo trước bao lâu?" in prompt, "câu hỏi phải đi kèm đoạn trích"
 
@@ -448,7 +522,9 @@ async def test_empty_retrieval_reaches_the_model_as_an_explicit_absence() -> Non
         agent_id="a", query="thang lương gồm những bậc nào?", tenant_id=TENANT_ID, section_roles=["engineering"]
     )
 
-    assert len(llm.prompts_seen) == 1
+    # app#44: 2 lượt — lượt 1 phát TOOL_CALL (chưa biết retrieval sẽ rỗng), lượt 2 nhận observation
+    # rỗng và từ chối ngay (không search lại — `ExtractiveFakeLLM` phân biệt được nhờ header block).
+    assert len(llm.prompts_seen) == 2
     assert "thang lương gồm những bậc nào?" in llm.prompts_seen[0]
     assert case_run.answer.citations == [], "không chunk nào truy xuất ⇒ không citation nào grounded"
 
@@ -521,14 +597,21 @@ def _tool_call_recipe(tenant_id: UUID, expression: str) -> Recipe:
 
 
 async def test_run_case_dispatches_real_tool_when_recipe_is_injected() -> None:
-    """KHÓA D1: recipe TIÊM (branch (a), như `routes/publish.py::_evaluate` dùng thật) có node
-    `tool-call(calculator)` → `TraceEvent.outputs` của node đó PHẢI là `{"expression", "result"}`
-    thật (`RealToolDispatch`), KHÔNG PHẢI marker stub `{"tool", "status": "stub-dispatched"}`
-    (`WhitelistToolDispatch`, hành vi trước fix)."""
+    """KHÓA D1: recipe TIÊM (branch (a), như `routes/publish.py::_evaluate` dùng thật), LLM tự phát
+    `TOOL_CALL: {"tool":"calculator",...}` → `TraceEvent.outputs` của event `tool-call` đó PHẢI là
+    `{"expression", "result"}` thật (`RealToolDispatch`), KHÔNG PHẢI marker stub `{"tool", "status":
+    "stub-dispatched"}` (`WhitelistToolDispatch`, hành vi trước fix engine#32).
+
+    app#44: `_tool_call_recipe`'s `dag` (kể cả node `tool-call` sẵn trong đó) KHÔNG còn được đọc —
+    `run_agent_loop` chỉ cần `agent_config.tool_whitelist` chứa `"calculator"`; tool call thật sự
+    đến từ chính LLM double tự phát tín hiệu, không từ 1 node DAG cố định."""
     recipe = _tool_call_recipe(TENANT_ID, "6 * 7")
+    llm = _MultiTurnScriptedLLM(
+        ['TOOL_CALL: {"tool": "calculator", "params": {"expression": "6 * 7"}}', "Kết quả là 42."]
+    )
     runner = EngineAgentRunner(
         kb_search=_RecordingKbSearch([_item("ankor-leave-001#c1")]),
-        llm=_ScriptedLLM("ok"),
+        llm=llm,
         embedding=FakeEmbedding(),
         trace_writer=_CollectingTraceWriter(),
         recipe=recipe,
@@ -541,19 +624,33 @@ async def test_run_case_dispatches_real_tool_when_recipe_is_injected() -> None:
     assert tool_event.outputs.get("status") != "stub-dispatched"
 
 
-async def test_run_case_without_injected_recipe_still_uses_stub_dispatch() -> None:
-    """KHÓA D2 (phạm vi CỐ Ý hẹp): branch (b) — `self._recipe is None`, `create_recipe_d4` tự dựng
-    (whitelist mặc định `["kb_search"]`) — vẫn giữ hành vi CŨ (`WhitelistToolDispatch` stub), không
-    đổi. Nếu ai đó sau này mở rộng fix sang branch (b) mà không sửa fixture `create_recipe_d4`
-    trước, bài `test_run_case_maps_llm_output_to_agent_answer` (Lớp A) sẽ đỏ với
-    `ValueError: unsupported tool: kb_search` — bài này giải thích tại sao và khoá ranh giới."""
+async def test_run_case_kb_search_always_available_even_without_injected_recipe() -> None:
+    """KHÓA D2 (app#44 — thay hẳn bài cũ, xem lý do dưới): branch (b) — `self._recipe is None`,
+    `create_recipe_d4` tự dựng whitelist mặc định `["kb_search"]`. Vòng lặp mới KHÔNG BAO GIỜ đưa
+    `kb_search` qua `ToolDispatch`/`WhitelistToolDispatch` nữa — nó có nhánh riêng
+    (`agent_loop.KB_SEARCH_TOOL`, A4: "kb_search luôn khả dụng, không bị `tool_whitelist` chặn") —
+    nên toàn bộ lớp bug bài D2 CŨ khoá ("kb_search lỡ đi qua stub tool-dispatch, ra
+    `{'tool':'kb_search','status':'stub-dispatched'}`") giờ KHÔNG THỂ xảy ra được nữa CẤU TRÚC, kể
+    cả khi caller không tiêm `recipe=`/`tool_dispatch=` gì cả. Bài này pin đúng bất biến MỚI thay
+    cho bất biến cũ đã hết ý nghĩa: `kb_search` luôn ra event `kb-retrieve` thật (`{"chunks": [...]}`),
+    không bao giờ ra event `tool-call` nào."""
     kb = _RecordingKbSearch([_item("ankor-leave-001#c1")])
     writer = _CollectingTraceWriter()
-    runner = _runner(kb, _ScriptedLLM("ok [ankor-leave-001#c1]"), writer)
+    llm = _MultiTurnScriptedLLM(
+        ['TOOL_CALL: {"tool": "kb_search", "params": {"query": "q?"}}', "ok [ankor-leave-001#c1]"]
+    )
+    runner = _runner(kb, llm, writer)
 
     case_run = await runner.run_case(
         agent_id="agent-callisto-d4", query="q?", tenant_id=TENANT_ID, section_roles=["public"]
     )
 
-    tool_event = next(e for e in case_run.events if e.node_type == NodeType.TOOL_CALL)
-    assert tool_event.outputs == {"tool": "kb_search", "status": "stub-dispatched"}
+    assert not any(e.node_type == NodeType.TOOL_CALL for e in case_run.events), (
+        "kb_search không bao giờ được đi qua ToolDispatch/tool-call — nó có nhánh riêng ở engine"
+    )
+    kb_event = next(e for e in case_run.events if e.node_type == NodeType.KB_RETRIEVE)
+    chunks = kb_event.outputs["chunks"]
+    assert isinstance(chunks, list)
+    first_chunk = chunks[0]
+    assert isinstance(first_chunk, dict)
+    assert first_chunk["chunk_id"] == "ankor-leave-001#c1"

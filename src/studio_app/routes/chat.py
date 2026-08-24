@@ -1,13 +1,24 @@
 """`POST /api/agents/{agent_id}/chat` (Kế hoạch 2, A5) — chat với agent ĐÃ PUBLISH.
 
-Rủi ro thiết kế lớn nhất trong Kế hoạch 2, nói thẳng trong chính docstring này: `Recipe.dag`'s
-node `kb-retrieve` mang `query` CỐ ĐỊNH tại thời điểm build recipe (`builder.py`'s tham số
-`query: str`) — contract hiện tại KHÔNG có khái niệm "hỏi câu khác mỗi lượt chat" trên cùng 1
-recipe đã publish. Route này vì vậy KHÔNG thể chỉ đọc `wb.recipes.recipe` rồi chạy thẳng — nó phải
-thay `params["query"]` của MỌI node `kb-retrieve` bằng tin nhắn user gửi, TRƯỚC KHI chạy
-`interpreter.run()` (`studio_workbench.recipe_ops.with_query()` — dùng CHUNG với
-`eval_adapter.py`, không tự viết lại phép biến đổi này lần 2 ở đây, xem docstring module đó). Đây
-là biến đổi CỤC BỘ ở tầng gọi — không đổi `wb.recipes` đã lưu, không đổi contract `Recipe`/`Node`.
+**app#44 — nối qua `run_agent_loop()` (engine#33), bỏ hẳn DAG-walk cũ.** Trước app#44, route này
+phải thay `params["query"]` của MỌI node `kb-retrieve` bằng tin nhắn user gửi (`with_query()`)
+TRƯỚC KHI chạy `interpreter.run()`, vì `Recipe.dag`'s node `kb-retrieve` mang `query` CỐ ĐỊNH tại
+thời điểm build recipe. Kiến trúc mới (`PROJECT-SCOPE-DEMO-DAY30.md`) không còn khái niệm đó:
+`run_agent_loop()` nhận `question: str` trực tiếp qua kwarg, KHÔNG đọc `recipe.dag` chút nào — nên
+`with_query()` không còn cần thiết ở đây nữa (recipe published dùng NGUYÊN VẸN).
+
+Cũng bỏ `graph_lint()`/`find_unsupported_tool_call()`: cả hai thuộc lớp kiểm DAG-shaped (7 luật đồ
+thị / quét node `tool-call` trong `recipe.dag`) — `PROJECT-SCOPE-DEMO-DAY30.md` mục C nói rõ
+"Không còn trong demo: banner lỗi `graph_lint` 7 luật đồ thị cũ", và `run_agent_loop()` không bao
+giờ đọc `recipe.dag` nên không có gì để 2 hàm đó kiểm trước nữa — 1 tool ngoài `tool_whitelist` giờ
+chỉ có thể tới từ chính LLM tự phát `TOOL_CALL:` lúc CHẠY, bị chặn bởi `WhitelistGuardedDispatch`
+(engine, belt 2) và raise `ValueError` — bắt ở khối `except` bên dưới, không còn preflight tĩnh.
+
+3 exception MỚI `run_agent_loop()` có thể ném mà `interpreter.run()` không có (docstring
+`agent_loop.py`, "Handoff to app#44") — `AgentLoopExhausted`/`ValueError`/`PermissionError` — đều
+map **500** (quyết định chốt với user qua AskUserQuestion, cùng phiên app#44): cả 3 là lỗi hệ
+thống/recipe đã published nhưng hỏng khi CHẠY, không phải lỗi INPUT của client gọi `/chat`, cùng
+mức nghiêm trọng `graph_lint()` đỏ/tool không dispatch được mà route này từng dùng trước app#44.
 
 Tenant fence: KHÔNG tự thêm `WHERE tenant_id = %s` — dựa hẳn vào RLS của `wb.recipes`
 (`schema.py`, `USING (tenant_id = current_setting('app.tenant_id'))`) trên connection đã
@@ -20,11 +31,10 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from studio_contracts import Recipe
-from studio_engine import interpreter
+from studio_engine import agent_loop
+from studio_engine.agent_loop import AgentLoopExhausted
 from studio_kb.postgres import PgKbSearch
-from studio_workbench.recipe_ops import with_query
 from studio_workbench.tenant_wall import ResolvedContext
-from studio_workbench.validator import graph_lint
 
 from studio_app.authz import fetch_fresh_identity, fetch_tenant_section_names, require_admin
 from studio_app.core._db import get_pool
@@ -32,7 +42,6 @@ from studio_app.eval_adapter import _llm_answer
 from studio_app.middleware import get_request_connection, get_request_session
 from studio_app.obs.trace_writer import PgTraceWriter
 from studio_app.providers.factory import build_embedding, build_llm, build_tool_dispatch
-from studio_app.providers.tool_dispatch import find_unsupported_tool_call
 
 router = APIRouter(prefix="/api/agents", tags=["chat"])
 
@@ -85,13 +94,6 @@ async def chat(agent_id: str, body: ChatRequest) -> ChatResponse:
         # hai đúng tinh thần defense-in-depth toàn codebase này theo, không tin RLS là đủ một mình.
         raise HTTPException(status_code=403, detail="recipe published thuộc tenant khác phiên hiện tại")
 
-    recipe = with_query(recipe, body.message)
-
-    try:
-        graph_lint(recipe)
-    except ValueError as exc:
-        raise HTTPException(status_code=500, detail=f"recipe đã published nhưng graph_lint() đỏ: {exc}") from exc
-
     # `body.as_roles` — CHỈ admin/superadmin được giả lập role khác (tra TƯƠI từ DB, không tin
     # `session.roles`/JWT, cùng nguyên tắc mọi route nhạy cảm khác). Validate mỗi role giả lập phải
     # là 1 section THẬT của tenant hiện tại — chặn gõ nhầm/role rác, không phải mở rộng quyền (chỉ
@@ -104,7 +106,8 @@ async def chat(agent_id: str, body: ChatRequest) -> ChatResponse:
         # `fetch_tenant_section_names` tự trừ `RESERVED_ROLE_NAMES` (review app#21 — tầng 2 lặp
         # lại, xem docstring hàm đó): trước bản vá, 1 dòng `core.sections` cũ tên "superadmin" sẽ
         # lọt vào `valid_section_names`, cho phép `as_roles=["superadmin"]` đi thẳng vào
-        # `session_context.roles` — đầu vào của hàng rào nội dung KB ở `interpreter.run()`.
+        # `session_context.roles` — đầu vào của hàng rào nội dung KB ở `run_agent_loop()` (trước
+        # app#44: `interpreter.run()` — cùng cơ chế fence, `fenced_kb_params`, dùng chung).
         valid_section_names = await fetch_tenant_section_names(conn, session.tenant_id)
         invalid = set(body.as_roles) - valid_section_names
         if invalid:
@@ -114,37 +117,34 @@ async def chat(agent_id: str, body: ChatRequest) -> ChatResponse:
             )
         session_context = ResolvedContext(tenant_id=session.tenant_id, user=session.user, roles=body.as_roles)
 
-    # PA-4 (app#41 review finding, dholmes0207) — cùng lý do `routes/runs.py` đã thêm, đặt SAU
-    # khối `as_roles` ở trên (authz phải quyết định TRƯỚC khi lộ recipe published có hỏng hay
-    # không — 1 caller không được phép giả lập role không nên nhận tín hiệu gì về nội dung
-    # recipe). Recipe ở ĐÂY đã publish (không phải client-tạo), nên tool không dispatch được là
-    # dữ liệu published bị hỏng — cùng mức nghiêm trọng `graph_lint()` đỏ ở trên, 500 không phải
-    # 400.
-    unsupported_tool = find_unsupported_tool_call(recipe)
-    if unsupported_tool is not None:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"recipe đã published nhưng node tool-call dùng tool {unsupported_tool!r} không "
-                f"dispatch được — nếu là kb_search: kind của nó là kb_retrieve, không phải tool-call"
-            ),
-        )
-
     # `Pool` (không phải `get_request_connection()`) — rủi ro pool self-deadlock CHƯA được giải
     # quyết ở route này, xem giải thích đầy đủ + lý do ở `routes/runs.py` (review `app#17` đợt 4,
     # sửa lại 1 lập luận SAI ở đợt 3: `get_pool()` là connection THỨ HAI cộng thêm vào connection
     # middleware đã giữ suốt request, không phải "tiết kiệm" hơn).
     pool = await get_pool()
     embedding = build_embedding()
-    result = await interpreter.run(
-        recipe,
-        session_context=session_context,
-        kb_search=PgKbSearch(pool, embedding),
-        llm=build_llm(),
-        embedding=embedding,
-        trace_writer=PgTraceWriter(pool),
-        tool_dispatch=build_tool_dispatch(recipe.agent_config.tool_whitelist),
-    )
+    try:
+        result = await agent_loop.run_agent_loop(
+            recipe,
+            session_context=session_context,
+            kb_search=PgKbSearch(pool, embedding),
+            llm=build_llm(),
+            embedding=embedding,
+            trace_writer=PgTraceWriter(pool),
+            question=body.message,
+            tool_dispatch=build_tool_dispatch(recipe.agent_config.tool_whitelist),
+        )
+    except (AgentLoopExhausted, ValueError, PermissionError) as exc:
+        # app#44 — 3 exception `run_agent_loop()` có thể ném mà `interpreter.run()` không có (xem
+        # docstring module này + "Handoff to app#44" ở `agent_loop.py`): `AgentLoopExhausted` (hết
+        # `max_turns` chưa trả lời cuối), `ValueError` (LLM tự phát `TOOL_CALL:` một tool NGOÀI
+        # `tool_whitelist` — thay thế preflight tĩnh `find_unsupported_tool_call()` đã bỏ ở trên,
+        # giờ bắt lúc CHẠY qua `WhitelistGuardedDispatch`), `PermissionError` (`tenant_id` hỏng sau
+        # fence — phòng thủ, không nên trúng thật qua `session` thật). Cả 3 map 500 — quyết định
+        # chốt với user (AskUserQuestion, cùng phiên app#44), cùng mức nghiêm trọng `graph_lint()`
+        # đỏ/tool không dispatch được mà route này từng dùng (đã bỏ ở trên). Không bắt bằng
+        # `except Exception` chung: giữ MỌI exception KHÁC (bug thật) lộ nguyên dạng.
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
     try:
         llm_out = _llm_answer(result.final_state)
