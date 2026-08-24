@@ -39,7 +39,7 @@ from studio_evalhub.harness import EvalHarness
 from studio_evalhub.judge import LLMJudge
 from studio_kb.doc_factory import TENANT_IDS
 from studio_kb.postgres import PgKbSearch
-from studio_workbench.builder import create_dynamic_recipe
+from studio_workbench import create_recipe
 from studio_workbench.publish import publish, recipe_hash
 from studio_workbench.tenant_wall import ResolvedContext
 from studio_workbench.validator import graph_lint
@@ -59,25 +59,26 @@ class PublishRequest(BaseModel):
     """app#44 — TÁCH RIÊNG khỏi `routes/runs.py::RunRequest` (trước đó `/evaluate`/`/publish` dùng
     CHUNG 1 model với `POST /api/runs`). `routes/runs.py` đổi hẳn shape theo mục D
     (`PROJECT-SCOPE-DEMO-DAY30.md`) thành connectivity-check tĩnh — không còn `nodes`/`edges`/
-    `kb_id`/`scope`/`golden_set_ref`/threshold nào cả. `/evaluate`/`/publish` thì KHÔNG đổi: vẫn
-    cần `nodes`/`edges` để `create_dynamic_recipe(...)` dựng `recipe.dag` (Recipe.dag vẫn là field
-    bắt buộc trên contract dù `run_agent_loop()` không đọc nó — xem `docs/system-architecture.md`),
-    nên contract HTTP của 2 route này giữ NGUYÊN, chỉ đổi TÊN class + nơi khai (từ `runs.py` sang
-    đây, để không còn phụ thuộc chéo giữa 2 route có scope khác hẳn nhau)."""
+    `kb_id`/`scope`/`golden_set_ref`/threshold nào cả. `/evaluate`/`/publish` vẫn cần `nodes`/
+    `edges` để `create_recipe(...)` dựng `recipe.dag` (Recipe.dag vẫn là field bắt buộc trên
+    contract dù `run_agent_loop()` không đọc nó — xem `docs/system-architecture.md`).
+
+    kit#212/workbench#39: `model`/`kb_id`/`scope`/`success_threshold`/`citation_accuracy_threshold`
+    không còn là input client — `create_recipe()` hardcode cố định các giá trị này làm quyết định
+    nền tảng. `temperature` thay vào đó là input cấu hình động thật của người dùng."""
 
     agent_id: str
     instructions: str
-    model: str
     tool_whitelist: list[str] = Field(default_factory=list)
-    kb_id: str
-    scope: str
     nodes: list[dict[str, Any]]
     edges: list[dict[str, Any]]
     # Xem giải thích đầy đủ (bộ golden 2.0, app#30, mốc land) ở docstring gốc `routes/runs.py::RunRequest`
     # trước app#44 — không lặp lại ở đây, lý do chọn mặc định này không đổi.
     golden_set_ref: str = "callisto-2.0-golden-30-v1"
-    success_threshold: float = Field(default=0.9, ge=0.0, le=1.0)
-    citation_accuracy_threshold: float = Field(default=0.95, ge=0.0, le=1.0)
+    # kit#212/workbench#39 — model/kb_id/scope/success_threshold/citation_accuracy_threshold không
+    # còn là input client: create_recipe() hardcode cố định các giá trị này làm quyết định nền
+    # tảng. temperature thay vào đó là input cấu hình động thật của người dùng.
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     # `tenant_id` CỐ Ý KHÔNG có field ở đây — cùng lý do T1 IDOR đã khoá ở `RunRequest` gốc
     # (`test_routes_runs.py`, trước app#44): tenant luôn tới từ `get_request_session()`.
 
@@ -137,19 +138,15 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
         raise HTTPException(status_code=400, detail=f"node/edge không hợp lệ: {exc.errors()!r}") from exc
 
     try:
-        recipe = create_dynamic_recipe(
+        recipe = create_recipe(
             agent_id=body.agent_id,
             tenant_id=session.tenant_id,
             instructions=body.instructions,
-            model=body.model,
             tool_whitelist=body.tool_whitelist,
             nodes=nodes,
             edges=edges,
-            kb_id=body.kb_id,
-            scope=body.scope,
+            temperature=body.temperature,
             golden_set_ref=body.golden_set_ref,
-            success_threshold=body.success_threshold,
-            citation_accuracy_threshold=body.citation_accuracy_threshold,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -191,7 +188,7 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
         # nhau về `agent_config`/`dag`/`kb_binding` (đo được: recipe được chấm còn có 1 node
         # `tool-call` admin chưa từng vẽ) — cổng đối chiếu hash ở `publish()` khi đó so hash CANVAS
         # với chính nó, không so được với thứ THẬT SỰ đã chạy, nên luôn khớp một cách vô nghĩa.
-        # `graph_lint(recipe)` đã chạy Ở TRÊN, ngay sau khi `create_dynamic_recipe(...)` dựng xong
+        # `graph_lint(recipe)` đã chạy Ở TRÊN, ngay sau khi `create_recipe(...)` dựng xong
         # recipe (neo bằng TÊN lệnh gọi, không phải số dòng — số dòng đã trôi thật ngay trong PR
         # này, review app#26 🟡) — đúng tiền điều kiện `GRAPH-LINT-CONTRACT`
         # mà `run_case` (eval_adapter.py) đòi hỏi cho nhánh `recipe=` được tiêm.

@@ -13,7 +13,7 @@ from studio_app.providers.fakes import FakeEmbedding, FakeLLM
 from studio_contracts import Edge, Node, NodeType, TraceEvent
 from studio_contracts.kb import KbSearchResultItem
 from studio_engine import interpreter as engine_interpreter
-from studio_workbench import create_dynamic_recipe
+from studio_workbench import create_recipe
 from studio_workbench.tenant_wall import resolve_session
 
 _TENANT_ID = UUID("d0000000-0000-0000-0000-000000000004")
@@ -39,19 +39,16 @@ async def test_calculator_tool_call_returns_real_result_not_stub_marker() -> Non
     """Recipe 2-node `tool-call(calculator) -> end`, chạy qua `interpreter.run()` với
     `tool_dispatch=build_tool_dispatch(...)` — output KHÔNG còn là `stub-dispatched` cũ (engine#31
     xưa), phải là `{"expression", "result"}` thật."""
-    recipe = create_dynamic_recipe(
+    recipe = create_recipe(
         agent_id="smoke-calc-agent",
         tenant_id=_TENANT_ID,
         instructions="x",
-        model="m",
         tool_whitelist=["calculator"],
         nodes=[
             Node(id="n1", type=NodeType.TOOL_CALL, params={"tool": "calculator", "expression": "6 * 7"}),
             Node(id="n2", type=NodeType.END, params={}),
         ],
         edges=[Edge(from_="n1", to="n2")],
-        kb_id="kb-smoke",
-        scope="public",
     )
 
     result = await engine_interpreter.run(

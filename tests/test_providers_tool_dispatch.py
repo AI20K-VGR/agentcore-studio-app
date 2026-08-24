@@ -8,7 +8,7 @@ from datetime import datetime
 import pytest
 from studio_app.providers.tool_dispatch import SUPPORTED_TOOLS, RealToolDispatch, find_unsupported_tool_call
 from studio_contracts import Edge, Node, NodeType, Recipe
-from studio_workbench import create_dynamic_recipe
+from studio_workbench import create_recipe
 
 _FIXED_NOW = datetime(2026, 8, 22, 12, 0, 0)
 _ANKOR_ID = "a0000000-0000-0000-0000-000000000001"
@@ -22,15 +22,12 @@ def _recipe_with_tool_call(tool: str, whitelist: list[str]) -> Recipe:
     """Dựng 1 Recipe với đúng 1 node `tool-call{tool}` — workbench#31 đã bỏ node này khỏi
     `create_recipe_d4()` (kb_search có kind kb_retrieve, không bao giờ nên là tool-call), nên các
     test dưới không còn mượn được d4 để dựng lớp lỗi này nữa; dựng tường minh qua
-    `create_dynamic_recipe` để vẫn khoá đúng hành vi `find_unsupported_tool_call()`."""
-    return create_dynamic_recipe(
+    `create_recipe` để vẫn khoá đúng hành vi `find_unsupported_tool_call()`."""
+    return create_recipe(
         agent_id="agent-tool-dispatch-test",
         tenant_id=_ANKOR_ID,
         instructions="x",
-        model="gemini-2.5-flash",
         tool_whitelist=whitelist,
-        kb_id="kb-callisto-v1",
-        scope="ankor/public",
         nodes=[
             Node(id="n1", type=NodeType.TOOL_CALL, params={"tool": tool}),
             Node(id="n2", type=NodeType.END, params={}),

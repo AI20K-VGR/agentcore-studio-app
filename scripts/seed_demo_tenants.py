@@ -8,7 +8,7 @@ thuộc `apps/studio`).
 
 **BẮT BUỘC dùng đúng UUID hardcode** đã dùng xuyên suốt hệ thống (không để cột `id` tự sinh
 `gen_random_uuid()`):
-- `ANKOR_ID`/`BOREA_ID` — `packages/workbench/src/studio_workbench/builder.py`
+- `ANKOR_ID`/`BOREA_ID` — `packages/workbench/src/studio_workbench/recipe.py`
 - `TENANT_IDS["ankor"/"borea"]` — `packages/kb/src/studio_kb/doc_factory.py`
 
 Nếu seed bằng UUID ngẫu nhiên, `core.tenants` sẽ có 2 hàng nhưng KHÔNG khớp với bất kỳ hằng số
@@ -42,7 +42,7 @@ from studio_app.core._db import close_pools, get_admin_pool
 from studio_app.core.schema import ensure_all_schemas
 from studio_app.jwt_auth import hash_password
 
-# Khớp 1:1 với `studio_workbench.builder.ANKOR_ID`/`BOREA_ID` và
+# Khớp 1:1 với `studio_workbench.ANKOR_ID`/`BOREA_ID` và
 # `studio_kb.doc_factory.TENANT_IDS` — 3 nơi đều phải ra cùng giá trị, đây là SSOT thứ 3 (không
 # import chéo được vì `apps/studio` không được import lúc build-time bởi 2 package kia, và bản
 # thân script này đứng ngoài mọi quadrant nên không có `.importlinter` nào cấm nó import cả 2 để
@@ -68,13 +68,11 @@ def _assert_matches_known_constants() -> None:
     hằng số ở 1 trong 2 nơi mà quên đổi ở đây, script sẽ báo lỗi rõ ràng thay vì âm thầm seed sai
     UUID rồi để lỗi lộ ra rất xa, khó truy (đúng tinh thần fail-loud toàn codebase này theo)."""
     from studio_kb.doc_factory import TENANT_IDS
-    from studio_workbench.builder import ANKOR_ID, BOREA_ID
+    from studio_workbench import ANKOR_ID, BOREA_ID
 
     expected = {"ankor": ANKOR_ID, "borea": BOREA_ID}
     if expected != _DEMO_TENANTS:
-        raise AssertionError(
-            f"seed_demo_tenants: UUID lệch với studio_workbench.builder — có {_DEMO_TENANTS}, cần {expected}"
-        )
+        raise AssertionError(f"seed_demo_tenants: UUID lệch với studio_workbench — có {_DEMO_TENANTS}, cần {expected}")
     if _DEMO_TENANTS != TENANT_IDS:
         raise AssertionError(
             f"seed_demo_tenants: UUID lệch với studio_kb.doc_factory.TENANT_IDS — có {_DEMO_TENANTS}, cần {TENANT_IDS}"
