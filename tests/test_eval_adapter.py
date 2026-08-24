@@ -649,4 +649,8 @@ async def test_run_case_kb_search_always_available_even_without_injected_recipe(
         "kb_search không bao giờ được đi qua ToolDispatch/tool-call — nó có nhánh riêng ở engine"
     )
     kb_event = next(e for e in case_run.events if e.node_type == NodeType.KB_RETRIEVE)
-    assert kb_event.outputs["chunks"][0]["chunk_id"] == "ankor-leave-001#c1"
+    chunks = kb_event.outputs["chunks"]
+    assert isinstance(chunks, list)
+    first_chunk = chunks[0]
+    assert isinstance(first_chunk, dict)
+    assert first_chunk["chunk_id"] == "ankor-leave-001#c1"
