@@ -82,8 +82,10 @@ class _StubEvalHarness:
 
 def _minimal_valid_dag() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """`kb-retrieve -> end`, 2 node — tối thiểu để qua được `graph_lint()` bên trong `_evaluate()`,
-    khác hẳn `create_recipe_d4`'s DAG 6-node cố định (đúng điểm bài này cần phân biệt: recipe canvas
-    và recipe fallback phải là 2 thứ RÕ RÀNG khác nhau, không trùng tình cờ)."""
+    khác hẳn DAG 3-node cố định (`eval_adapter.py::_CERTIFIED_NODES`, workbench#41 — trước đây
+    `create_recipe_d4`) mà `certified_recipe()` tự dựng ở nhánh không tiêm `recipe=` (đúng điểm bài
+    này cần phân biệt: recipe canvas và recipe fallback phải là 2 thứ RÕ RÀNG khác nhau, không
+    trùng tình cờ)."""
     nodes = [
         {"id": "n1", "type": "kb-retrieve", "params": {}},
         {"id": "n2", "type": "end", "params": {}},
@@ -113,8 +115,8 @@ async def test_evaluate_injects_the_canvas_recipe_it_returns_into_the_runner(
 
     assert _SpyEngineAgentRunner.last_kwargs.get("recipe") is recipe, (
         "EngineAgentRunner phải được tiêm ĐÚNG object recipe mà _evaluate() trả về (thứ publish() "
-        "sẽ băm/ghi) — thiếu recipe= khiến certified_recipe() (eval_adapter.py) tự dựng "
-        "create_recipe_d4(...) để chạy, một recipe KHÁC hẳn canvas (kit#127, review app#26 ⛔): "
+        "sẽ băm/ghi) — thiếu recipe= khiến certified_recipe() (eval_adapter.py) tự dựng qua "
+        "create_recipe() để chạy, một recipe KHÁC hẳn canvas (kit#127, review app#26 ⛔): "
         "recipe_hash() khi đó băm một object mà harness chưa bao giờ chạm tới."
     )
 

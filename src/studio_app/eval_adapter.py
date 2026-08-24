@@ -51,10 +51,12 @@ recipe để băm. Băm trên chuỗi byte nào (`by_alias`? `exclude_none`?) v�
 Kiến trúc agent đổi (`PROJECT-SCOPE-DEMO-DAY30.md`): bỏ DAG 6-node tĩnh, thay bằng 1 LLM node + N
 tool tự chọn (`packages/engine` #33). `run_case()` KHÔNG còn `with_query(base, query)` +
 `interpreter.run()` — `query` đi thẳng qua kwarg `question=` của `run_agent_loop()`, và
-`run_agent_loop()` KHÔNG đọc `recipe.dag` (chỉ đọc `agent_config`/`kb_binding` của recipe). Mọi đoạn
-docstring dưới đây còn nhắc `interpreter.run()`/`model_copy` `params["query"]` mô tả HÀNH VI CŨ vẫn
-đúng cho `packages/engine::interpreter.run()` (fallback DAG-walk vẫn tồn tại, K2 engine#33) — chỉ
-KHÔNG còn là đường mà `run_case()` này đi qua nữa.
+`run_agent_loop()` KHÔNG đọc `recipe.dag` chút nào (đã grep `agent_loop.py`: chỉ chạm
+`recipe.agent_config.{tool_whitelist,instructions,model}` + `recipe.agent_id` — KHÔNG có dòng
+`recipe.kb_binding` nào; `interpreter.py` cũng vậy). Mọi đoạn docstring dưới đây còn nhắc
+`interpreter.run()`/`model_copy` `params["query"]` mô tả HÀNH VI CŨ vẫn đúng cho
+`packages/engine::interpreter.run()` (fallback DAG-walk vẫn tồn tại, K2 engine#33) — chỉ KHÔNG còn
+là đường mà `run_case()` này đi qua nữa.
 """
 
 from __future__ import annotations
@@ -69,6 +71,27 @@ from studio_workbench.recipe_ops import without_query
 from studio_workbench.tenant_wall import resolve_session
 
 from studio_app.providers.factory import build_tool_dispatch
+
+# DAG cố định 3-node (KB_RETRIEVE -> LLM_STEP -> END), giữ nguyên hình dạng `create_recipe_d4`
+# (workbench#41, đã xoá) từng dựng — `run_agent_loop()` không đọc `recipe.dag` (module docstring,
+# mục app#44), nên node/edge ở đây chỉ tồn tại để thoả `Recipe.dag` (field bắt buộc trên contract).
+# Hằng số module (không inline trong `certified_recipe()`) để test khác (`test_gate2_publish_
+# money_shot.py::_recipe`) import được thay vì chép tay hình dạng này — chép tay thì khẳng định
+# "cùng DAG với đường thật" chỉ còn là lời hứa trong docstring, không phải điều được ép buộc.
+#
+# `params["query"]` trên node n1 PHẢI có mặt (không phải chi tiết thẩm mỹ): `without_query()` bên
+# dưới gỡ đúng khoá này để giữ bất biến DEC-D20-07 ("recipe gốc không mang query"); thiếu khoá đó
+# thì `without_query()` thành no-op và mutant xoá lời gọi nó sẽ sống (đo được — review app#57).
+_CERTIFIED_NODES = [
+    Node(
+        id="n1",
+        type=NodeType.KB_RETRIEVE,
+        params={"query": "Nhân viên xin nghỉ phép cần báo trước bao lâu?", "top_k": 3},
+    ),
+    Node(id="n2", type=NodeType.LLM_STEP, params={"temperature": 0.0}),
+    Node(id="n4", type=NodeType.END, params={}),
+]
+_CERTIFIED_EDGES = [Edge(from_="n1", to="n2"), Edge(from_="n2", to="n4")]
 
 
 def _llm_answer(final_state: dict[str, object]) -> dict[str, object]:
@@ -129,30 +152,28 @@ class EngineAgentRunner:
         `studio_workbench.recipe`), không còn nhận `scope`/`kb_id` làm tham số: nhánh này **đổi
         hành vi thật** so với trước — `kb_binding.scope` không còn phản ánh `section_roles` của
         caller. Vô hại cho việc chạy thật (`run_agent_loop()` không đọc `kb_binding` từ recipe để
-        quyết định phạm vi — `session_context` mới là hàng rào, xem docstring `run_case` dưới), chỉ
-        đổi giá trị NHÃN tự mô tả trên recipe được băm/publish.
+        quyết định phạm vi — `session_context` mới là hàng rào, xem docstring `run_case` dưới).
 
-        `tenant_id`/`section_roles` vẫn vào recipe vì contract còn hai trường đó, **nhưng chúng là
-        nhãn**: `interpreter.run()` không tin chúng (`interpreter.py:180-188`), `session_context` mới
-        là hàng rào. Chúng có mặt để recipe tự mô tả đúng, không để quyết định phạm vi chạy."""
+        **`kb_binding` không còn là NHÃN tự mô tả theo tenant/case nữa** (khác `tenant_id` bên
+        dưới) — từ workbench#39, nó là một hằng số nền tảng cố định, giống hệt nhau cho mọi
+        agent/tenant/case. Với agent của tenant KHÁC `ankor`, recipe được băm/publish sẽ mang
+        `kb_binding.scope="ankor/public"` dù chạy cho tenant đó — không sai theo nghĩa CHẠY (không
+        ai đọc field này để quyết định phạm vi), nhưng recipe không còn tự mô tả đúng tenant của
+        chính nó trên trục này. Quyết định của bút chủ workbench (workbench#39), không phải một
+        oversight của lần sửa này.
+
+        `tenant_id` vẫn vào recipe vì contract còn trường đó, **nhưng nó là nhãn**:
+        `interpreter.run()` không tin nó (`interpreter.py:180-188`), `session_context` mới là hàng
+        rào. Nó có mặt để recipe tự mô tả đúng danh tính, không để quyết định phạm vi chạy."""
         if self._recipe is not None:
             return self._recipe
-        # DAG cố định 3-node (KB_RETRIEVE -> LLM_STEP -> END), giữ nguyên hình dạng `create_recipe_d4`
-        # từng dựng — `run_agent_loop()` không đọc `recipe.dag` (module docstring, mục app#44), nên
-        # node/edge ở đây chỉ tồn tại để thoả `Recipe.dag` (field bắt buộc trên contract).
-        nodes = [
-            Node(id="n1", type=NodeType.KB_RETRIEVE, params={"top_k": 3}),
-            Node(id="n2", type=NodeType.LLM_STEP, params={"temperature": 0.0}),
-            Node(id="n4", type=NodeType.END, params={}),
-        ]
-        edges = [Edge(from_="n1", to="n2"), Edge(from_="n2", to="n4")]
         built = create_recipe(
             agent_id=agent_id or self._agent_id,
             tenant_id=tenant_id,
             instructions="Tra cứu quy trình và bảo mật Callisto.",
             tool_whitelist=[],
-            nodes=nodes,
-            edges=edges,
+            nodes=_CERTIFIED_NODES,
+            edges=_CERTIFIED_EDGES,
         )
         return without_query(built)
 
@@ -174,17 +195,19 @@ class EngineAgentRunner:
         cho mọi case trong 1 run (giữ đúng bất biến `DEC-D20-07`, chỉ đổi CƠ CHẾ truyền `query`).
 
         `section_roles` đi qua `session_context.roles` — phần danh tính do server resolve. Từ
-        `workbench#23` nó **không còn** xuống `node.params`; vòng lặp mới không đọc `node.params` của
-        `recipe.dag` chút nào (`run_agent_loop` chỉ đọc `agent_config`/`kb_binding`), nên câu hỏi
-        "params có ghi đè được không" không còn áp dụng nữa — `tenant_id`/`section_roles` chỉ còn
-        sống trong `session_context` (fence tại `agent_loop.fenced_kb_params`, cùng cơ chế
-        `interpreter.run()` dùng cho DAG-walk, dùng chung 1 helper — `fence.py`). Nó vẫn vào
-        `kb_binding.scope` của recipe gốc như một **nhãn tự mô tả**.
+        `workbench#23` nó **không còn** xuống `node.params`; vòng lặp mới không đọc `node.params`
+        của `recipe.dag` chút nào, và (workbench#39/#41) cũng không đọc `recipe.kb_binding` — đã
+        grep `agent_loop.py`/`interpreter.py`: không dòng nào chạm `recipe.kb_binding`, chỉ chạm
+        `recipe.agent_config.{tool_whitelist,instructions,model}` + `recipe.agent_id`. Câu hỏi
+        "params có ghi đè được không" vì thế không còn áp dụng — `tenant_id`/`section_roles` chỉ
+        còn sống trong `session_context` (fence tại `agent_loop.fenced_kb_params`, cùng cơ chế
+        `interpreter.run()` dùng cho DAG-walk, dùng chung 1 helper — `fence.py`).
 
-        Thứ tự `section_roles` giữ **nguyên trạng**, không sắp lại: `scope` dựng bằng
-        `','.join(section_roles)` nên đã phụ thuộc thứ tự đó từ trước D8, và `list[str]` là kiểu khai ở
-        cả `GoldenCase.section_roles` lẫn Protocol `AgentRunner.run_case`. Sắp riêng một phía sẽ làm
-        `scope` và `roles` mô tả hai thứ tự khác nhau cho cùng một case.
+        **`kb_binding` của recipe gốc KHÔNG còn mô tả `section_roles` của case này** (đổi từ
+        workbench#39/#41): `create_recipe` hardcode `kb_binding` cố định làm quyết định nền tảng,
+        không nhận `scope`/`kb_id` làm tham số — nên `kb_binding.scope` không phải, và không còn có
+        thể là, một nhãn theo `section_roles`/tenant của case đang chạy. `section_roles` chỉ còn
+        sống trong `session_context`, không đi đâu khác.
 
         `tenant_id` KHÔNG còn đi qua `recipe.tenant_id` để tới `kb_search` (xem docstring module):
         `resolve_session` dựng danh tính server-side, và `run_agent_loop()` lấy tenant từ
@@ -201,8 +224,9 @@ class EngineAgentRunner:
         không walk `recipe.dag`, nên hợp đồng "phải graph_lint trước khi tới DAG-walk" (kit#129 item
         3, `DEC-A`) không còn áp dụng cho đường này nữa; `tests/test_graph_lint_before_interpreter_run.py`
         đã bị RETIRE cùng app#44 vì chính lý do đó (đọc commit đó nếu cần lịch sử). `certified_recipe()`
-        ở trên vẫn có 2 nhánh (a) recipe tiêm từ constructor (`routes/publish.py::_evaluate`) hoặc (b)
-        tự dựng `create_recipe_d4(...)` — cả hai giờ đều an toàn KHÔNG CẦN graph_lint đi trước, vì
+        ở trên vẫn có 2 nhánh (a) recipe tiêm từ constructor (`routes/publish.py::_evaluate`) hoặc
+        (b) tự dựng qua `create_recipe` (`_CERTIFIED_NODES`/`_CERTIFIED_EDGES`) — cả hai giờ đều an
+        toàn KHÔNG CẦN graph_lint đi trước, vì
         không nhánh nào của `run_agent_loop()` từng đọc `dag.nodes`/`dag.edges`."""
         base = self.certified_recipe(agent_id=agent_id, tenant_id=tenant_id, section_roles=section_roles)
         session_context = resolve_session({"tenant_id": tenant_id, "user": "eval-harness", "roles": section_roles})
@@ -215,15 +239,14 @@ class EngineAgentRunner:
         # (eval-gate/publish) mà `routes/runs.py`/`routes/chat.py` (`app#41`) đã nối đúng còn adapter
         # thì chưa — lỗ hổng issue #32 muốn đóng.
         #
-        # CỐ Ý không tiêm ở branch (b) (`self._recipe is None` — tự dựng `create_recipe_d4`, dùng khi
-        # eval-harness chạy rời khỏi route thật, ví dụ `test_eval_adapter.py`): fixture đó khai
-        # `tool_whitelist=["kb_search"]` mặc định và đặt "kb_search" vào node `tool-call` — tổ hợp
-        # `RealToolDispatch` không hỗ trợ (kb_search có kind `kb_retrieve` riêng, không đi qua
-        # `ToolDispatch`; xem `providers/tool_dispatch.py`). Tiêm ở đây sẽ đổi `RealToolDispatch`'s
-        # `unsupported tool: kb_search` thành lỗi cứng cho MỌI test hiện có, và đổi cả recipe được
-        # hash (`certified_recipe()` docstring, D16 golden-batch determinism) — hai side-effect nằm
-        # ngoài phạm vi finding này. Fixture `create_recipe_d4` là của `packages/workbench` (SWE) —
-        # sửa mặc định đó là quyết định riêng, không phải phần của fix này.
+        # CỐ Ý không tiêm ở branch (b) (`self._recipe is None` — tự dựng qua `create_recipe`, dùng khi
+        # eval-harness chạy rời khỏi route thật, ví dụ `test_eval_adapter.py`): `_CERTIFIED_NODES`
+        # khai `tool_whitelist=[]` (không tool nào được whitelist) và không có node `tool-call` nào
+        # trong DAG cố định — tiêm `RealToolDispatch` ở đây không đổi hành vi CHẠY (LLM không có tool
+        # nào để gọi dù dùng dispatcher nào), nhưng vẫn đổi object được hash (`certified_recipe()`
+        # docstring, D16 golden-batch determinism) nếu sau này thêm tool vào `_CERTIFIED_NODES` — nằm
+        # ngoài phạm vi finding gốc (engine#32). Sửa mặc định đó là quyết định riêng của bút chủ
+        # `packages/workbench`, không phải phần của fix này.
         result = await agent_loop.run_agent_loop(
             base,
             kb_search=self._kb_search,
