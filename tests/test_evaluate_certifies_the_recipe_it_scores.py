@@ -31,8 +31,7 @@ import pytest
 import pytest_asyncio
 import studio_app.routes.publish as publish_module
 from studio_app.core._db import Pool, close_pools
-from studio_app.routes.publish import _evaluate
-from studio_app.routes.runs import RunRequest
+from studio_app.routes.publish import PublishRequest, _evaluate
 from studio_contracts import Aggregate, CaseResult, Gate, GateThreshold, Scorecard
 from studio_workbench.publish import recipe_hash as _real_recipe_hash
 from studio_workbench.tenant_wall import ResolvedContext
@@ -101,7 +100,7 @@ async def test_evaluate_injects_the_canvas_recipe_it_returns_into_the_runner(
     monkeypatch.setattr(publish_module, "EvalHarness", _StubEvalHarness)
 
     nodes, edges = _minimal_valid_dag()
-    body = RunRequest(
+    body = PublishRequest(
         agent_id="agent-inject-check",
         instructions="Answer from KB only.",
         model="gpt-4o-mini",
