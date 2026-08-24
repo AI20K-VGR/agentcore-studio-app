@@ -26,7 +26,7 @@ cho GET từ app#44 trở đi.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -51,14 +51,17 @@ class RunRequest(BaseModel):
     tool_whitelist: list[str] = Field(default_factory=list)
 
 
-class ToolCheckResult(BaseModel):
-    tool: str
-    status: Literal["OK", "NOT_IMPLEMENTED"]
-
-
 class ConnectivityCheckResponse(BaseModel):
+    """`results`: `list[dict[str, str]]` chứ không phải 1 sub-model riêng (`{"tool": str, "status":
+    "OK"|"NOT_IMPLEMENTED"}`) — CỐ Ý, bug thật đã trúng ở CI (không lộ ra local vì DB-dependent test
+    này skip khi thiếu Postgres): `_check_tool_connectivity()` trả thẳng `list[dict[str, str]]`,
+    và một sub-model Pydantic (`ToolCheckResult`) so `==` với `dict` KHÔNG BAO GIỜ bằng nhau (Pydantic
+    `BaseModel.__eq__` so kiểu, không so giá trị với `dict` trần) — làm mọi test so `response.results
+    == [{"tool":...,"status":...}, ...]` đỏ dù giá trị JSON ra hệt nhau. Giữ nguyên dict thẳng để
+    FastAPI vẫn validate/serialize đúng shape mà không cần lớp trung gian."""
+
     agent_id: str
-    results: list[ToolCheckResult]
+    results: list[dict[str, str]]
 
 
 def _check_tool_connectivity(tool_whitelist: list[str]) -> list[dict[str, str]]:
@@ -90,7 +93,7 @@ async def create_run(body: RunRequest) -> ConnectivityCheckResponse:
     require_admin(identity.roles)
 
     results = _check_tool_connectivity(body.tool_whitelist)
-    return ConnectivityCheckResponse(agent_id=body.agent_id, results=[ToolCheckResult(**r) for r in results])
+    return ConnectivityCheckResponse(agent_id=body.agent_id, results=results)
 
 
 class RunResponse(BaseModel):
