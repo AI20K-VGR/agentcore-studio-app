@@ -72,9 +72,7 @@ def _assert_matches_known_constants() -> None:
 
     expected = {"ankor": ANKOR_ID, "borea": BOREA_ID}
     if expected != _DEMO_TENANTS:
-        raise AssertionError(
-            f"seed_demo_tenants: UUID lệch với studio_workbench — có {_DEMO_TENANTS}, cần {expected}"
-        )
+        raise AssertionError(f"seed_demo_tenants: UUID lệch với studio_workbench — có {_DEMO_TENANTS}, cần {expected}")
     if _DEMO_TENANTS != TENANT_IDS:
         raise AssertionError(
             f"seed_demo_tenants: UUID lệch với studio_kb.doc_factory.TENANT_IDS — có {_DEMO_TENANTS}, cần {TENANT_IDS}"
