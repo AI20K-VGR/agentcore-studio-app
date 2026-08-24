@@ -182,7 +182,8 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
         embedding=embedding,
         trace_writer=PgTraceWriter(pool),
         # kit#127 (review app#26 ⛔) — recipe được CHẤM phải là recipe được PUBLISH. Không truyền
-        # `recipe=` ở đây, `certified_recipe()` (eval_adapter.py) tự dựng `create_recipe_d4(...)` —
+        # `recipe=` ở đây, `certified_recipe()` (eval_adapter.py) tự dựng `create_recipe_d4(...)`
+        # (workbench#41 — nay là `create_recipe(...)`, cùng ý nghĩa) —
         # một recipe CỐ ĐỊNH, không liên quan gì tới canvas — làm recipe THẬT SỰ chạy qua từng case
         # golden-set, trong khi `recipe_hash(recipe)` ở dưới băm recipe CANVAS. Hai đối tượng khác
         # nhau về `agent_config`/`dag`/`kb_binding` (đo được: recipe được chấm còn có 1 node

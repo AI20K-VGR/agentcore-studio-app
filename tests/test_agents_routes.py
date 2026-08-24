@@ -20,7 +20,8 @@ from studio_app.routes.agents import (
     list_agents,
     rollback_agent,
 )
-from studio_workbench import create_recipe_d4
+from studio_contracts import Edge, Node, NodeType, Recipe
+from studio_workbench import create_recipe
 from studio_workbench.tenant_wall import ResolvedContext
 
 
@@ -73,6 +74,26 @@ async def _seed_user(admin_pool: Pool, tenant_id: UUID, email: str, roles: list[
             "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
             (str(tenant_id), email, "not-a-real-hash", roles),
         )
+
+
+def _seed_recipe(agent_id: str, tenant_id: UUID) -> Recipe:
+    """workbench#41 — `create_recipe_d4()` đã bị xoá. Dựng thủ công cùng hình dạng DAG 3-node nó
+    từng tự sinh (KB_RETRIEVE -> LLM_STEP -> END) — 2 test dùng hàm này chỉ cần recipe có cạnh
+    thật, không đụng chi tiết `kb_binding`/`instructions`."""
+    nodes = [
+        Node(id="n1", type=NodeType.KB_RETRIEVE, params={"top_k": 3}),
+        Node(id="n2", type=NodeType.LLM_STEP, params={"temperature": 0.0}),
+        Node(id="n4", type=NodeType.END, params={}),
+    ]
+    edges = [Edge(from_="n1", to="n2"), Edge(from_="n2", to="n4")]
+    return create_recipe(
+        agent_id=agent_id,
+        tenant_id=tenant_id,
+        instructions="Tra cứu quy trình và bảo mật Callisto.",
+        tool_whitelist=[],
+        nodes=nodes,
+        edges=edges,
+    )
 
 
 _RECIPE_JSON = '{"agent_id": "placeholder", "tenant_id": "placeholder"}'
@@ -282,7 +303,7 @@ async def test_get_agent_recipe_normalizes_from_alias_regardless_of_write_path(a
     await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
 
     agent_id = "agent-k1"
-    recipe = create_recipe_d4(agent_id=agent_id, tenant_id=tenant_id)
+    recipe = _seed_recipe(agent_id, tenant_id)
     async with admin_pool.connection() as conn, conn.transaction():
         await _bind_tenant(conn, tenant_id)
         await conn.execute(
@@ -299,7 +320,7 @@ async def test_get_agent_recipe_normalizes_from_alias_regardless_of_write_path(a
         middleware._request_session.reset(token)  # type: ignore[arg-type]
 
     edges = result.recipe["dag"]["edges"]  # type: ignore[index]
-    assert edges, "seed (create_recipe_d4) phải sinh cạnh thật — nếu rỗng, assert dưới vô nghĩa"
+    assert edges, "seed (_seed_recipe) phải sinh cạnh thật — nếu rỗng, assert dưới vô nghĩa"
     assert all("from" in e and "from_" not in e for e in edges), (
         f"route phải chuẩn hoá lại alias dây bất kể đường ghi cũ để lại 'from_' — thấy {edges}"
     )
@@ -325,7 +346,7 @@ async def test_get_agent_recipe_rejects_row_invalid_under_current_contract(admin
     await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
 
     agent_id = "agent-l1"
-    recipe_dict = create_recipe_d4(agent_id=agent_id, tenant_id=tenant_id).model_dump(mode="json", by_alias=True)
+    recipe_dict = _seed_recipe(agent_id, tenant_id).model_dump(mode="json", by_alias=True)
     recipe_dict["scorecard_threshold"]["success"] = -999
     async with admin_pool.connection() as conn, conn.transaction():
         await _bind_tenant(conn, tenant_id)

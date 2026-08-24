@@ -16,7 +16,8 @@ from fastapi import HTTPException
 from studio_app import middleware
 from studio_app.core._db import Pool, close_pools, get_pool
 from studio_app.routes.chat import ChatRequest, chat
-from studio_workbench import create_recipe_d4
+from studio_contracts import Edge, Node, NodeType
+from studio_workbench import create_recipe
 from studio_workbench.tenant_wall import ResolvedContext
 
 
@@ -64,7 +65,23 @@ async def _seed_user(admin_pool: Pool, tenant_id: UUID, email: str, roles: list[
 
 
 async def _seed_published_recipe(admin_pool: Pool, tenant_id: UUID, agent_id: str) -> None:
-    recipe = create_recipe_d4(agent_id=agent_id, tenant_id=tenant_id)
+    # workbench#41 — create_recipe_d4() đã bị xoá. Dựng thủ công cùng hình dạng DAG 3-node nó
+    # từng tự sinh (KB_RETRIEVE -> LLM_STEP -> END); chỉ cần recipe published hợp lệ qua
+    # _load_published_recipe(), không đụng chi tiết kb_binding/instructions.
+    nodes = [
+        Node(id="n1", type=NodeType.KB_RETRIEVE, params={"top_k": 3}),
+        Node(id="n2", type=NodeType.LLM_STEP, params={"temperature": 0.0}),
+        Node(id="n4", type=NodeType.END, params={}),
+    ]
+    edges = [Edge(from_="n1", to="n2"), Edge(from_="n2", to="n4")]
+    recipe = create_recipe(
+        agent_id=agent_id,
+        tenant_id=tenant_id,
+        instructions="Tra cứu quy trình và bảo mật Callisto.",
+        tool_whitelist=[],
+        nodes=nodes,
+        edges=edges,
+    )
     async with admin_pool.connection() as conn, conn.transaction():
         await _bind_tenant(conn, tenant_id)
         await conn.execute(

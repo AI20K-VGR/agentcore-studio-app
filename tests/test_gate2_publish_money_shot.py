@@ -60,9 +60,10 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+from studio_app.eval_adapter import _CERTIFIED_EDGES, _CERTIFIED_NODES
 from studio_contracts import CaseResult, Recipe, Scorecard
 from studio_evalhub.compute import compute_scorecard
-from studio_workbench import create_recipe_d4
+from studio_workbench import create_recipe
 from studio_workbench.publish import publish
 from studio_workbench.publish import recipe_hash as _recipe_hash
 
@@ -73,11 +74,20 @@ _THRESHOLD_CITATION = 0.95
 
 
 def _recipe(agent_id: str) -> Recipe:
-    """Recipe thật qua `create_recipe_d4` — cùng hàm `eval_adapter.py::EngineAgentRunner.
-    certified_recipe` dùng ở nhánh không tiêm `recipe=` (neo bằng tên, không phải số dòng — số
-    dòng ở đây đã trôi từ trước cả bản vá này), nên bài này đi qua `graph_lint` y như đường thật
-    chứ không qua một DAG dựng riêng cho test."""
-    return create_recipe_d4(agent_id=agent_id, tenant_id=ANKOR_ID)
+    """Recipe thật qua `create_recipe`, DAG **import trực tiếp** từ `eval_adapter.py::
+    _CERTIFIED_NODES`/`_CERTIFIED_EDGES` — cùng hằng số `EngineAgentRunner.certified_recipe` tự
+    dựng ở nhánh không tiêm `recipe=` (workbench#41 — `create_recipe_d4` đã bị xoá). Import thay vì
+    chép tay: khẳng định "cùng DAG với đường thật" được `import` ép buộc, không chỉ là lời hứa
+    trong docstring — ngày `certified_recipe()` đổi DAG, bài này tự động đổi theo, không cần ai
+    nhớ sửa 2 chỗ. Nhờ vậy bài này đi qua `graph_lint` y như đường thật."""
+    return create_recipe(
+        agent_id=agent_id,
+        tenant_id=ANKOR_ID,
+        instructions="Tra cứu quy trình và bảo mật Callisto.",
+        tool_whitelist=[],
+        nodes=_CERTIFIED_NODES,
+        edges=_CERTIFIED_EDGES,
+    )
 
 
 def _scorecard(*, verdict: str, recipe_hash: str | None, agent_id: str) -> Scorecard:

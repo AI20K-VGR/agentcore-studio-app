@@ -60,9 +60,8 @@ import pytest
 from studio_app import eval_adapter
 from studio_app.eval_adapter import EngineAgentRunner
 from studio_app.providers.fakes import FakeEmbedding
-from studio_contracts import NodeType, Recipe, TraceEvent
+from studio_contracts import AgentConfig, Dag, Edge, KbBinding, Node, NodeType, Recipe, ScorecardThreshold, TraceEvent
 from studio_engine.interpreter import RunResult
-from studio_workbench import create_recipe_d4
 
 TENANT_ID = UUID("a0000000-0000-0000-0000-000000000001")
 OTHER_TENANT = UUID("b0000000-0000-0000-0000-000000000001")
@@ -222,8 +221,31 @@ async def test_recipe_caller_truyen_vao_duoc_dung_NGUYEN_TRANG(monkeypatch: pyte
     `recipe=` này **là** bản vá, không phải tiện ích.
 
     Dùng một recipe có `tenant_id`/`scope` **khác hẳn** mặc định của adapter: nếu adapter lỡ dựng lại
-    thay vì dùng cái được đưa, hai giá trị đó sẽ lộ ra ngay."""
-    ngoai = create_recipe_d4(agent_id="agent-canvas", tenant_id=OTHER_TENANT, scope="borea/finance")
+    thay vì dùng cái được đưa, hai giá trị đó sẽ lộ ra ngay.
+
+    workbench#41 — `create_recipe_d4` đã bị xoá, và `create_recipe` hardcode `kb_binding` cố định
+    (`ankor/public`, không nhận `scope`/`kb_id` làm tham số) nên không dựng được recipe có
+    `kb_binding.scope` tuỳ ý qua nó nữa. Dựng `Recipe` thủ công tại đây — bài này CỐ Ý cần một giá
+    trị `scope` khác hẳn mặc định của adapter để phát hiện adapter lỡ dựng lại thay vì dùng nguyên
+    recipe được tiêm."""
+    ngoai = Recipe(
+        agent_id="agent-canvas",
+        tenant_id=OTHER_TENANT,
+        agent_config=AgentConfig(
+            instructions="Tra cứu quy trình và bảo mật Callisto.", model="gemini-2.5-flash", tool_whitelist=[]
+        ),
+        dag=Dag(
+            nodes=[
+                Node(id="n1", type=NodeType.KB_RETRIEVE, params={"top_k": 3}),
+                Node(id="n2", type=NodeType.LLM_STEP, params={"temperature": 0.0}),
+                Node(id="n4", type=NodeType.END, params={}),
+            ],
+            edges=[Edge(from_="n1", to="n2"), Edge(from_="n2", to="n4")],
+        ),
+        kb_binding=KbBinding(kb_id="kb-callisto-v1", scope="borea/finance"),
+        golden_set_ref="callisto-golden-30-v1",
+        scorecard_threshold=ScorecardThreshold(success=0.9, citation_accuracy=0.95),
+    )
     runner, stub = _patched(monkeypatch, recipe=ngoai)
 
     base = runner.certified_recipe(agent_id="bị-bỏ-qua", tenant_id=TENANT_ID, section_roles=["public"])
