@@ -2,10 +2,16 @@
 `EvalHarness.run()` (evalhub, đã implement xong) ra `Scorecard`, rồi gọi `publish()`
 (`studio_workbench.publish`, đã implement xong PR#22/D18) để gate + ghi `wb.recipes`.
 
-`golden_set_path`: theo đúng `DEC-D16-01` (evalhub/docs/decisions/scorecard.md) —
-"`src/studio_evalhub/` tuyệt đối không mang hằng số `packages/kb/...`... composition root
-(CLI/`apps/studio`/fixture) là chỗ DUY NHẤT biết golden-30 nằm ở đâu" — nên hằng số đường dẫn
-NẰM Ở ĐÂY, đúng chỗ được chỉ định, không phải một vi phạm layering.
+**Bộ golden đọc từ `eval.golden_sets`, không còn từ đĩa** (cutover, `evalhub#47`/`#48`). Trước bản
+vá này route glob `studio_kb/golden/*.yaml` rồi khớp `golden_set_ref` khai bên trong — một đường
+**không có khái niệm tenant**: mọi tenant bị chấm bằng đúng một file, và bộ case mà một tenant tự
+nạp qua `POST /api/admin/golden-sets` (app#56) không bao giờ được dùng để chấm. Giờ route đọc theo
+`(tenant_id phiên, recipe.golden_set_ref)` qua `read_golden_set`, và RLS `FORCE` trên
+`eval.golden_sets` là hàng rào — không phải một mệnh đề `WHERE` mà route tự nhớ viết.
+
+`DEC-D16-01` (evalhub/docs/decisions/scorecard.md) vẫn được giữ, chỉ dời chỗ: "composition root là
+chỗ DUY NHẤT biết golden-30 nằm ở đâu" giờ ứng với **đường nạp** (`core/golden_seed.py`, cùng
+`apps/studio`) thay vì đường đọc. Route này sau cutover không còn biết gì về đĩa.
 
 **KHÔNG còn LUÔN trả 409** (sửa lại đợt review app#26 — trước bản vá này, `EvalHarness.run()` gọi
 ở `_evaluate()` bên dưới không truyền `recipe_hash=`, nên `compute_scorecard()` luôn nhận `None`
@@ -25,16 +31,15 @@ recipe được băm giờ CHÍNH LÀ recipe được harness chạy qua từng 
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-import studio_kb
-import yaml  # type: ignore[import-untyped, unused-ignore]
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, ValidationError
 from studio_contracts import Edge, Node, Recipe, Scorecard
 from studio_engine.agent_loop import AgentLoopExhausted
+from studio_evalhub.golden_case import GoldenSet
+from studio_evalhub.golden_store import GoldenSetNotFound, GoldenSetScopeError, read_golden_set
 from studio_evalhub.harness import EvalHarness
 from studio_evalhub.judge import LLMJudge
 from studio_kb.doc_factory import TENANT_IDS
@@ -83,40 +88,34 @@ class PublishRequest(BaseModel):
     # (`test_routes_runs.py`, trước app#44): tenant luôn tới từ `get_request_session()`.
 
 
-# DEC-D16-01: composition root là nơi DUY NHẤT được phép biết golden-set nằm ở đâu trên đĩa.
-#
-# `kit#181` — công thức cũ đi ngược 3 cấp (`parent.parent.parent`), giả định `golden/` nằm
-# CẠNH `src/` (đúng ở workspace editable-install CŨ: `.../packages/kb/src/studio_kb/__init__.py`
-# → 3 cấp → `.../packages/kb`). Wheel install (`--no-editable`, đúng cách image build) phẳng
-# hơn 1 cấp — không có `src/` — nên 3 cấp đi LỐ ra khỏi `site-packages`, luôn 400.
-#
-# `kb#37`/`kit#181` sửa CẢ HAI phía đồng thời: `golden/` dời vào NGAY TRONG cây package
-# (`packages/kb/src/studio_kb/golden/`), nên giờ chỉ cần đi ngược ĐÚNG 1 cấp — và công thức đó
-# cho cùng một kết quả cấu trúc ở cả 2 layout (editable: `src/studio_kb/golden`; wheel:
-# `site-packages/studio_kb/golden`) vì `golden/` là con trực tiếp của thư mục chứa
-# `__init__.py` ở cả hai. Không còn phụ thuộc layout nào khác — không cần config/env riêng.
-_GOLDEN_SET_DIR = Path(studio_kb.__file__).resolve().parent / "golden"
+async def _load_golden_set(ref: str, tenant_id: UUID) -> GoldenSet:
+    """Bộ case của `(tenant_id, ref)` từ `eval.golden_sets`. Không có ⇒ 400, sai scope ⇒ 500.
 
+    Dùng `get_request_connection()` chứ không mở connection mới từ `get_pool()`: `eval.golden_sets`
+    bật RLS `FORCE`, và chỉ connection do `tenant_context_middleware` giữ mới đã `SET LOCAL
+    app.tenant_id`. Một connection mới lấy từ pool **chưa** bind — dưới `FORCE` nó không lỗi, nó
+    trả 0 dòng, và route sẽ báo "chưa nạp bộ case" cho một tenant đã nạp đầy đủ. Đây đúng là ca mà
+    `GoldenSetScopeError` tồn tại để tách ra, nên nó được map 500 (lỗi hệ thống) chứ không gộp vào
+    400 cùng `GoldenSetNotFound` (trạng thái hợp lệ của dữ liệu).
 
-def _resolve_golden_set_path(ref: str) -> Path | None:
-    """Tìm file `.yaml` trong `_GOLDEN_SET_DIR` mà `golden_set_ref` KHAI BÊN TRONG khớp `ref`.
-
-    KHÔNG suy đường dẫn bằng cách ghép `f"{ref}.yaml"` — đúng anti-pattern `golden_loader.py`
-    (`load_golden_set`, DEC-D16-01) cảnh báo: tên file không ổn định qua thời gian (evidence
-    trong docstring đó — cùng bộ 30 case DE đổi tên file 2 lần, `golden_set_ref` bên trong không
-    đổi), và corpus thật đã có ca lệch tên/ref (`smoke-5.yaml` khai `golden_set_ref:
-    "callisto-smoke-5-v0"`). Route này build path để TRUYỀN vào `load_golden_set(path,
-    expect_ref=...)` — chính hàm đó đã enforce cross-check ref-trong-file == expect_ref, nên
-    resolver ở đây chỉ cần tìm đúng file, không cần lặp lại việc validate.
+    400 cho `GoldenSetNotFound`, cùng mã lỗi mà đường-đọc-file cũ trả khi không khớp file nào — với
+    client, "ref này không chấm được" không đổi bản chất. Thông điệp nêu tên script nạp: sau cutover,
+    nguyên nhân phổ biến nhất không còn là gõ sai ref mà là **DB chưa được seed**, và một thông điệp
+    chỉ nói "không tìm thấy" sẽ để người đọc đi tìm nhầm chỗ.
     """
-    for path in sorted(_GOLDEN_SET_DIR.glob("*.yaml")):
-        try:
-            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except yaml.YAMLError:
-            continue
-        if isinstance(raw, dict) and raw.get("golden_set_ref") == ref:
-            return path
-    return None
+    try:
+        return await read_golden_set(get_request_connection(), ref, tenant_id)
+    except GoldenSetNotFound as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"golden_set_ref {ref!r} chưa có trong eval.golden_sets cho tenant này. "
+                f"Nạp bộ đóng gói sẵn: `uv run python apps/studio/scripts/seed_golden_sets.py`, "
+                f"hoặc tự nạp bộ của bạn qua `POST /api/admin/golden-sets`."
+            ),
+        ) from exc
+    except GoldenSetScopeError as exc:
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
 
 async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContext) -> tuple[Recipe, Scorecard]:
@@ -156,15 +155,11 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"recipe không qua graph_lint(): {exc}") from exc
 
-    golden_set_path = _resolve_golden_set_path(recipe.golden_set_ref)
-    if golden_set_path is None:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"golden_set_ref {recipe.golden_set_ref!r} không khớp golden_set_ref khai trong "
-                f"bất kỳ file .yaml nào ở {_GOLDEN_SET_DIR}"
-            ),
-        )
+    # `session.tenant_id`, KHÔNG phải `recipe.tenant_id` — dù hai giá trị này bằng nhau ở đây
+    # (`create_recipe(tenant_id=session.tenant_id)` ngay trên). Đọc từ recipe sẽ là lần đầu tiên
+    # trong route này một quyết định phạm vi lấy từ đối tượng do client dựng nên; hôm nay vô hại,
+    # nhưng nó dựng sẵn đúng khuôn mà INV-1 tồn tại để cấm. Phiên khai tenant, recipe thì không.
+    golden = await _load_golden_set(recipe.golden_set_ref, session.tenant_id)
 
     # `Pool` (không phải `get_request_connection()`) — rủi ro pool self-deadlock CHƯA được giải
     # quyết ở route này, xem giải thích đầy đủ + lý do ở `routes/runs.py` (review `app#17` đợt 4,
@@ -200,7 +195,7 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
         scorecard = await EvalHarness().run(
             recipe.agent_id,
             recipe.golden_set_ref,
-            golden_set_path=golden_set_path,
+            golden_set=golden,
             runner=runner,
             tenant_ids=tenant_ids,
             threshold_success=recipe.scorecard_threshold.success,
@@ -234,10 +229,12 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
             ),
         )
     except ValueError as exc:
-        # `load_golden_set` (evalhub) raise ValueError khi file không khớp `golden_set_ref` khai
-        # trong recipe (DEC-D16-01: ref là khoá, tên file chỉ là đường dẫn) — lỗi INPUT của
-        # client (chọn sai `golden_set_ref`), không phải lỗi hệ thống. Phát hiện thật lúc test tay
-        # route này: trước bản vá này, lỗi rơi thẳng thành 500 không kiểm soát.
+        # Cutover: nguồn `ValueError` đầu tiên của khối này đã BIẾN MẤT khỏi đây. Trước, `EvalHarness.
+        # run()` tự gọi `load_golden_set(path, expect_ref=…)` và ném `ValueError` khi ref trong file
+        # lệch ref khai trong recipe. Giờ bộ case được đọc + kiểm TRƯỚC lời gọi này
+        # (`_load_golden_set` ở trên), nên ca đó không còn đi qua đường này nữa — và `GoldenSetNotFound`
+        # tuy LÀ một `ValueError` cũng không tới được đây vì đã bị bắt tại chỗ đọc, sớm hơn hẳn.
+        # Giữ nguyên khối: nguồn thứ hai bên dưới vẫn sống.
         #
         # app#44: từ khi `EngineAgentRunner.run_case()` (eval_adapter.py) chạy qua `run_agent_loop()`
         # thay `interpreter.run()`, `ValueError` KHÔNG còn chỉ có 1 nguồn — `WhitelistGuardedDispatch`

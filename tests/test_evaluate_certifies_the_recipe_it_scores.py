@@ -33,6 +33,7 @@ import studio_app.routes.publish as publish_module
 from studio_app.core._db import Pool, close_pools
 from studio_app.routes.publish import PublishRequest, _evaluate
 from studio_contracts import Aggregate, CaseResult, Gate, GateThreshold, Scorecard
+from studio_evalhub.golden_case import GoldenCase, GoldenSet
 from studio_workbench.publish import recipe_hash as _real_recipe_hash
 from studio_workbench.tenant_wall import ResolvedContext
 
@@ -92,11 +93,39 @@ def _minimal_valid_dag() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     return nodes, edges
 
 
+async def _fake_load_golden_set(ref: str, tenant_id: UUID) -> GoldenSet:
+    """Thay `_load_golden_set` (đọc `eval.golden_sets`) — cutover file→DB.
+
+    Bài trong file này CỐ Ý không đụng DB (xem `_SentinelPool`): chúng đo việc nối dây quanh
+    `EvalHarness.run()`, không đo nguồn bộ case. Sau cutover `_evaluate()` cần một request-scoped
+    connection đã bind `app.tenant_id` — dựng thật ở đây sẽ kéo cả DB + middleware vào một bài
+    không nói gì về hai thứ đó, và mỗi tầng thêm vào là một chỗ bài đỏ vì lý do khác.
+
+    Nguồn bộ case có bài riêng, đúng chỗ: `test_publish_reads_golden_from_db.py`.
+    """
+    del tenant_id
+    return GoldenSet(
+        golden_set_ref=ref,
+        cases=[
+            GoldenCase(
+                case_id="c1",
+                query="q?",
+                tenant="ankor",
+                section_roles=["public"],
+                expected_tenant="ankor",
+                expected_section_role="public",
+                expected="a",
+            )
+        ],
+    )
+
+
 async def test_evaluate_injects_the_canvas_recipe_it_returns_into_the_runner(
     pool: Pool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     del pool  # chỉ để trigger skip-nếu-thiếu-DSN đúng quy ước chung của suite, không tự query
     monkeypatch.setattr(publish_module, "EngineAgentRunner", _SpyEngineAgentRunner)
+    monkeypatch.setattr(publish_module, "_load_golden_set", _fake_load_golden_set)
     monkeypatch.setattr(publish_module, "EvalHarness", _StubEvalHarness)
 
     nodes, edges = _minimal_valid_dag()
