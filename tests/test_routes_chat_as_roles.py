@@ -1,7 +1,8 @@
 """`routes/chat.py::chat` — `body.as_roles` (admin giả lập role để test chat, xem docstring
 `ChatRequest.as_roles`). Chỉ test 2 nhánh CHẶN (403 không-admin, 400 role-giả-lập-không-tồn-tại) —
-cả 2 raise TRƯỚC KHI chạm `interpreter.run()`, nên không cần dựng đủ KB/LLM thật, chỉ cần 1 recipe
-published hợp lệ để qua được `_load_published_recipe()` + `graph_lint()`."""
+cả 2 raise TRƯỚC KHI chạm `run_agent_loop()` (app#44 — trước đó `interpreter.run()`), nên không cần
+dựng đủ KB/LLM thật, chỉ cần 1 recipe published hợp lệ để qua được `_load_published_recipe()`
+(`graph_lint()` đã bị bỏ khỏi route này ở app#44 — không còn là tiền điều kiện nữa)."""
 
 from __future__ import annotations
 
