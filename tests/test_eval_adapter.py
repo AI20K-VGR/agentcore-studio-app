@@ -319,6 +319,27 @@ async def test_run_case_surfaces_engine_refusal_faithfully(final_answer_text: st
     assert case_run.answer.citations == ([str(c) for c in raw_cites] if isinstance(raw_cites, list) else [])
 
 
+class _KbThenTextLLM:
+    """Lượt 1 gọi `kb_search`, lượt 2 trả `text` — hình dạng tối thiểu để `run_agent_loop` đi qua
+    nhánh truy xuất trước khi trả lời.
+
+    Hẹp hơn `_MultiTurnScriptedLLM` (`test_eval_adapter_agent_loop.py`) có chủ đích: bài dùng nó chỉ
+    cần **một** lượt tool rồi một câu trả lời, và một double nhận nguyên kịch bản sẽ mời người sau
+    nhét thêm lượt vào chỗ không cần. Không import chéo module test: pytest không gom chúng thành
+    package, nên import như thế sẽ vỡ ngày ai đó đổi tên file kia."""
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self.calls = 0
+
+    async def complete(self, prompt: str, **kwargs: object) -> str:
+        del prompt, kwargs
+        self.calls += 1
+        if self.calls == 1:
+            return 'TOOL_CALL: {"tool": "kb_search", "params": {"query": "hoi cheo tenant?"}}'
+        return self._text
+
+
 async def test_refusal_must_be_expressible_somehow() -> None:
     """KHÓA A5 (cross-quadrant): phải TỒN TẠI ít nhất một cách để agent nói "tôi từ chối" và engine
     ghi nhận `refused=True`. Nếu không còn cách nào thì nhánh từ-chối của scorecard (SC-04/05, hai
@@ -326,17 +347,40 @@ async def test_refusal_must_be_expressible_somehow() -> None:
 
     Không hardcode tín hiệu nào: thử các ứng viên hợp lý, chỉ cần MỘT cái hoạt động. Cùng lý do với
     A4 — sống sót khi engine đổi luật (điểm gãy #14 daily-note D6 của DongAnh2704: đổi sang
-    `refused = not citations` sinh dương-tính-giả; test này bắt chiều ngược lại: mất hẳn tín hiệu)."""
+    `refused = not citations` sinh dương-tính-giả; test này bắt chiều ngược lại: mất hẳn tín hiệu).
+
+    ## `engine#37`/`engine#39` — vì sao fixture đổi từ `_ScriptedLLM` sang `_KbThenTextLLM`
+
+    Vòng lặp đổi luật: `refused = used_kb_search and (not citations) and (not used_non_kb_tool)`.
+    Vế `used_kb_search` là bản vá cho `engine#37` — trước đó một agent trả lời thẳng, **không tra
+    cứu gì**, vẫn bị dán `refused=True` (chế độ chatbot standalone `agentcore-studio-web#14`), tức
+    *"chưa thử"* đọc y hệt *"đã thử và hàng rào chặn sạch"*.
+
+    `_ScriptedLLM` trả một chuỗi cố định nên dưới `run_agent_loop` nó **luôn** được đọc là
+    `FinalAnswer` ngay lượt 1 — `kb_search` không bao giờ chạy (docstring của chính class đó đã ghi).
+    Sau bản vá, mọi ứng viên qua double ấy ra `refused=False`, và bài này đỏ **vì fixture mô phỏng
+    đúng ca mà bản vá vừa sửa**, không phải vì tín hiệu từ chối biến mất.
+
+    Bài giữ nguyên **mục đích**, đổi **fixture** cho khớp ngữ nghĩa mới: từ chối bây giờ nghĩa là
+    *đã tra cứu và không grounded được gì*. Một agent nói "tôi không biết" mà chưa tra cứu **không**
+    phải đang từ chối vì hàng rào — nó chưa thử, và gộp hai thứ đó làm một chính là bug `engine#37`.
+
+    ⚠️ **Đừng "đơn giản hoá" lại về `_ScriptedLLM`.** Bài sẽ đỏ, và người sửa dễ kết luận nhầm rằng
+    engine mất tín hiệu từ chối — trong khi thứ mất là lượt tra cứu trong fixture."""
     candidates = [_REFUSAL, "", "Không có thông tin trong tài liệu được cấp."]
     refused_flags = []
     for text in candidates:
+        llm = _KbThenTextLLM(text)
         case_run = await _runner(
             _RecordingKbSearch([_item("ankor-leave-001#c1")]),
-            _ScriptedLLM(text),
+            llm,
             _CollectingTraceWriter(),
         ).run_case(
             agent_id="agent-callisto-d4", query="hỏi chéo tenant?", tenant_id=TENANT_ID, section_roles=["public"]
         )
+        # Tiền đề của phép đo: lượt truy xuất PHẢI đã chạy. Không có assert này thì một double hỏng
+        # (trả `FinalAnswer` ngay lượt 1) làm cả bài xanh-rỗng theo đúng cách nó vừa đỏ.
+        assert llm.calls >= 2, f"kb_search chưa chạy cho ứng viên {text!r} — phép đo bên dưới rỗng"
         refused_flags.append(case_run.answer.refused)
 
     assert any(refused_flags), (
