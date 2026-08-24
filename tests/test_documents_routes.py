@@ -92,7 +92,9 @@ async def test_company_admin_uploads_document(admin_pool: Pool) -> None:
 
     assert result.section_role == "hr"
     assert result.chunk_count == 1
-    assert result.doc_id.startswith(tenant_id.hex)
+    # `doc_id` (cột `kb.chunks.doc_id`, tách khỏi PK `chunk_id`) = slug thuần của tên file, KHÔNG
+    # còn tenant-hex-prefixed — xem docstring `routes/documents.py` (quyết định doc_id column).
+    assert result.doc_id == "leave"
 
     async with admin_pool.connection() as conn:
         # `kb.chunks` có `FORCE ROW LEVEL SECURITY` — cắn cả owner nếu chưa `set_config`
@@ -102,6 +104,71 @@ async def test_company_admin_uploads_document(admin_pool: Pool) -> None:
         row = await cur.fetchone()
     assert row is not None
     assert row[0] == 1
+
+
+async def test_upload_doc_id_la_slug_ten_file(admin_pool: Pool) -> None:
+    """`doc_id` = `_slugify(stem)` thuần — hoa/khoảng trắng trong tên file phải bị gộp/hạ chữ
+    (khớp quyết định doc_id column, khác `chunk_id_prefix` vẫn giữ hash để tránh đụng PK)."""
+    tenant_id = await _seed_tenant(admin_pool, "documents-probe-m")
+    admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+    await _seed_section(admin_pool, tenant_id, "hr", admin_id)
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        async with _simulate_request_connection():
+            result = await upload_document(
+                file=_md_upload_file("Bao Cao Q1.md", _VALID_MD),
+                section_role="hr",
+                tenant_id=None,
+            )
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert result.doc_id == "bao-cao-q1"
+
+
+async def test_reupload_cung_doc_id_xoa_orphan_chunk(admin_pool: Pool) -> None:
+    """Re-upload CÙNG tên file với nội dung NGẮN HƠN (ít chunk hơn) không còn để lại `chunk_id`
+    mồ côi — đóng giới hạn cũ đã ghi trong docstring `routes/documents.py` (route giờ gọi
+    `pipeline.delete_by_doc_id` trước khi ghi chunk mới)."""
+    tenant_id = await _seed_tenant(admin_pool, "documents-probe-n")
+    admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+    await _seed_section(admin_pool, tenant_id, "hr", admin_id)
+
+    # 1000 từ > WORDS_PER_CHUNK (850) → 2 chunk ở lần upload đầu.
+    long_text = " ".join(f"tu{i}" for i in range(1000)).encode()
+    short_text = b"noi dung rat ngan sau khi sua lai file."
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        async with _simulate_request_connection():
+            first = await upload_document(
+                file=_md_upload_file("bao-cao.txt", long_text),
+                section_role="hr",
+                tenant_id=None,
+            )
+            assert first.chunk_count == 2
+
+            second = await upload_document(
+                file=_md_upload_file("bao-cao.txt", short_text),
+                section_role="hr",
+                tenant_id=None,
+            )
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert second.chunk_count == 1
+    assert second.doc_id == first.doc_id
+
+    async with admin_pool.connection() as conn:
+        await conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(tenant_id),))
+        cur = await conn.execute(
+            "SELECT count(*) FROM kb.chunks WHERE tenant_id = %s AND doc_id = %s",
+            (str(tenant_id), second.doc_id),
+        )
+        row = await cur.fetchone()
+    assert row is not None
+    assert row[0] == 1  # không còn 1 chunk mồ côi từ lần upload trước (2 - 1 = 1 dư nếu chưa vá)
 
 
 async def test_upload_rejects_unknown_section_role(admin_pool: Pool) -> None:
