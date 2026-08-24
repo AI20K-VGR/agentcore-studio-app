@@ -162,10 +162,7 @@ async def _bat_judge_ma_evaluate_dung(monkeypatch: pytest.MonkeyPatch, tmp_path:
     body = PublishRequest(
         agent_id="agent-judge-wiring",
         instructions="Answer from KB only.",
-        model="gpt-4o-mini",
         tool_whitelist=[],
-        kb_id="kb-1",
-        scope="t/public",
         nodes=nodes,
         edges=edges,
     )

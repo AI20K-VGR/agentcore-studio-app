@@ -103,10 +103,7 @@ async def test_evaluate_injects_the_canvas_recipe_it_returns_into_the_runner(
     body = PublishRequest(
         agent_id="agent-inject-check",
         instructions="Answer from KB only.",
-        model="gpt-4o-mini",
         tool_whitelist=[],
-        kb_id="kb-1",
-        scope="t/public",
         nodes=nodes,
         edges=edges,
     )

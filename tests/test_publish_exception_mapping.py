@@ -77,10 +77,7 @@ def _body() -> PublishRequest:
     return PublishRequest(
         agent_id="agent-exc-mapping",
         instructions="x",
-        model="m",
         tool_whitelist=[],
-        kb_id="kb-1",
-        scope="t/public",
         nodes=[{"id": "n1", "type": "kb-retrieve", "params": {}}, {"id": "n2", "type": "end", "params": {}}],
         edges=[{"from": "n1", "to": "n2"}],
     )
@@ -96,6 +93,13 @@ async def _run_evaluate_with(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ex
     _RaisingEvalHarness._exc = exc
     monkeypatch.setattr(publish_module, "EvalHarness", _RaisingEvalHarness)
     monkeypatch.setattr(publish_module, "get_settings", lambda: _settings(tmp_path))
+    # `_SpyRunner` discards every kwarg it receives, nhưng `_evaluate()` vẫn gọi `build_llm()`/
+    # `build_embedding()` thật trước khi tới đó — 2 hàm đó tự gọi `get_settings()` từ
+    # `studio_app.settings` (không đi qua `publish_module.get_settings` đã patch ở trên, tham
+    # chiếu module khác), nên môi trường không có biến `STUDIO_*` thật sẽ vỡ ở đây trước khi
+    # chạm được exception cần đo. Không cần giá trị thật — `_SpyRunner` không bao giờ dùng chúng.
+    monkeypatch.setattr(publish_module, "build_llm", lambda: None)
+    monkeypatch.setattr(publish_module, "build_embedding", lambda: None)
 
     session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@acme.com", roles=["admin"])
     with pytest.raises(HTTPException) as exc_info:

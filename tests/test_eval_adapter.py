@@ -33,7 +33,7 @@ from studio_contracts.kb import KbSearchResultItem
 from studio_engine import agent_loop as engine_agent_loop
 from studio_engine import interpreter as engine_interpreter
 from studio_engine.interpreter import RunResult
-from studio_workbench import create_dynamic_recipe, create_recipe_d4
+from studio_workbench import create_recipe, create_recipe_d4
 from studio_workbench.tenant_wall import resolve_session
 
 # CỐ Ý khác `ANKOR_ID` default của workbench (a0…01) — nếu adapter "quên" thread tenant_id xuống
@@ -622,11 +622,10 @@ async def test_extractive_fake_reads_only_the_top_chunk() -> None:
 
 
 def _tool_call_recipe(tenant_id: UUID, expression: str) -> Recipe:
-    return create_dynamic_recipe(
+    return create_recipe(
         agent_id="agent-tool-dispatch-check",
         tenant_id=tenant_id,
         instructions="x",
-        model="m",
         tool_whitelist=["calculator"],
         nodes=[
             Node(id="n1", type=NodeType.KB_RETRIEVE, params={"top_k": 3}),
@@ -635,8 +634,6 @@ def _tool_call_recipe(tenant_id: UUID, expression: str) -> Recipe:
             Node(id="n4", type=NodeType.END, params={}),
         ],
         edges=[Edge(from_="n1", to="n2"), Edge(from_="n2", to="n3"), Edge(from_="n3", to="n4")],
-        kb_id="kb-smoke",
-        scope="public",
     )
 
 
