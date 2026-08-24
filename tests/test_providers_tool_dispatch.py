@@ -7,13 +7,36 @@ from datetime import datetime
 
 import pytest
 from studio_app.providers.tool_dispatch import SUPPORTED_TOOLS, RealToolDispatch, find_unsupported_tool_call
-from studio_workbench import create_recipe_d4
+from studio_contracts import Edge, Node, NodeType
+from studio_workbench import create_dynamic_recipe
 
 _FIXED_NOW = datetime(2026, 8, 22, 12, 0, 0)
+_ANKOR_ID = "a0000000-0000-0000-0000-000000000001"
 
 
 def _dispatch(whitelist: list[str]) -> RealToolDispatch:
     return RealToolDispatch(whitelist, clock=lambda: _FIXED_NOW)
+
+
+def _recipe_with_tool_call(tool: str, whitelist: list[str]):
+    """Dựng 1 Recipe với đúng 1 node `tool-call{tool}` — workbench#31 đã bỏ node này khỏi
+    `create_recipe_d4()` (kb_search có kind kb_retrieve, không bao giờ nên là tool-call), nên các
+    test dưới không còn mượn được d4 để dựng lớp lỗi này nữa; dựng tường minh qua
+    `create_dynamic_recipe` để vẫn khoá đúng hành vi `find_unsupported_tool_call()`."""
+    return create_dynamic_recipe(
+        agent_id="agent-tool-dispatch-test",
+        tenant_id=_ANKOR_ID,
+        instructions="x",
+        model="gemini-2.5-flash",
+        tool_whitelist=whitelist,
+        kb_id="kb-callisto-v1",
+        scope="ankor/public",
+        nodes=[
+            Node(id="n1", type=NodeType.TOOL_CALL, params={"tool": tool}),
+            Node(id="n2", type=NodeType.END, params={}),
+        ],
+        edges=[Edge(from_="n1", to="n2")],
+    )
 
 
 # --- whitelist (defense-in-depth, kept per issue engine#32) --------------------------------
@@ -136,25 +159,32 @@ def test_supported_tools_is_exactly_calculator_and_current_datetime() -> None:
     assert frozenset({"calculator", "current_datetime"}) == SUPPORTED_TOOLS
 
 
-def test_find_unsupported_tool_call_flags_kb_search_in_default_recipe() -> None:
-    """`create_recipe_d4()` (packages/workbench, fixture dùng chung) hiện vẫn sinh node
-    `tool-call{tool:"kb_search"}` (nợ PA-3, theo dõi ở issue riêng packages/workbench + apps/web —
-    KHÔNG sửa ở đây). `kb_search` có kind `kb_retrieve` — không bao giờ nên là `tool-call` — đây
-    là instance thật của lớp lỗi mà hàm này phải bắt được."""
-    recipe = create_recipe_d4()
+def test_find_unsupported_tool_call_flags_kb_search_tool_call_node() -> None:
+    """`kb_search` có kind `kb_retrieve` — không bao giờ nên là node `tool-call` (workbench#31);
+    đây là instance thật của lớp lỗi mà hàm này phải bắt được, dựng tường minh vì
+    `create_recipe_d4()` không còn tự sinh node này nữa (bug gốc đã vá ở nguồn)."""
+    recipe = _recipe_with_tool_call("kb_search", whitelist=["kb_search"])
     assert find_unsupported_tool_call(recipe) == "kb_search"
 
 
 def test_find_unsupported_tool_call_returns_none_when_tool_supported() -> None:
-    """`create_recipe_d4(tool_whitelist=...)` đặt `tool_whitelist[0]` vào node tool-call
-    (`builder.py:196`) — đổi whitelist mặc định đủ để tự chứng minh hàm này KHÔNG false-positive
-    trên tool hợp lệ."""
-    recipe = create_recipe_d4(tool_whitelist=["calculator"])
+    """Không false-positive trên tool hợp lệ (∈ SUPPORTED_TOOLS)."""
+    recipe = _recipe_with_tool_call("calculator", whitelist=["calculator"])
     assert find_unsupported_tool_call(recipe) is None
 
 
 def test_find_unsupported_tool_call_generalizes_beyond_kb_search() -> None:
     """Lớp lỗi đúng phải là 'mọi tool ∈ whitelist mà ∉ SUPPORTED_TOOLS', không riêng kb_search —
     `http_fetch` (tool ma từng lộ ở apps/web AVAILABLE_TOOLS) là instance thứ hai."""
-    recipe = create_recipe_d4(tool_whitelist=["http_fetch"])
+    recipe = _recipe_with_tool_call("http_fetch", whitelist=["http_fetch"])
     assert find_unsupported_tool_call(recipe) == "http_fetch"
+
+
+def test_find_unsupported_tool_call_returns_none_when_recipe_has_no_tool_call_node() -> None:
+    """`create_recipe_d4()` (production call path, `eval_adapter.py`) không còn sinh node
+    `tool-call` nào từ workbench#31 — khoá lại rằng đó là None hợp lệ (không tool-call = không có
+    gì để soi), không phải false-negative của hàm này."""
+    from studio_workbench import create_recipe_d4
+
+    recipe = create_recipe_d4()
+    assert find_unsupported_tool_call(recipe) is None
