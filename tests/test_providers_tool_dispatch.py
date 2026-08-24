@@ -7,7 +7,7 @@ from datetime import datetime
 
 import pytest
 from studio_app.providers.tool_dispatch import SUPPORTED_TOOLS, RealToolDispatch, find_unsupported_tool_call
-from studio_contracts import Edge, Node, NodeType
+from studio_contracts import Edge, Node, NodeType, Recipe
 from studio_workbench import create_dynamic_recipe
 
 _FIXED_NOW = datetime(2026, 8, 22, 12, 0, 0)
@@ -18,7 +18,7 @@ def _dispatch(whitelist: list[str]) -> RealToolDispatch:
     return RealToolDispatch(whitelist, clock=lambda: _FIXED_NOW)
 
 
-def _recipe_with_tool_call(tool: str, whitelist: list[str]):
+def _recipe_with_tool_call(tool: str, whitelist: list[str]) -> Recipe:
     """Dựng 1 Recipe với đúng 1 node `tool-call{tool}` — workbench#31 đã bỏ node này khỏi
     `create_recipe_d4()` (kb_search có kind kb_retrieve, không bao giờ nên là tool-call), nên các
     test dưới không còn mượn được d4 để dựng lớp lỗi này nữa; dựng tường minh qua
