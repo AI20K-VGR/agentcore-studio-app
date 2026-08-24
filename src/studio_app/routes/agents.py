@@ -145,7 +145,7 @@ async def get_agent_recipe(agent_id: str, version: int | None = None) -> AgentRe
     #
     # Review app#37 round 2 (dholmes0207, N1): `str(exc)` echo `input_value` của field TRƯỢT
     # validate — hôm nay an toàn (field trượt luôn là `scorecard_threshold.success`, không nhạy
-    # cảm), nhưng `agent_config.instructions`/`kb_binding.scope` (`schema.py` xếp loại tenant PII,
+    # cảm), nhưng `agent_config.system_prompt`/`kb_binding.scope` (`schema.py` xếp loại tenant PII,
     # đúng lý do bật RLS `FORCE`) nằm CÙNG model. Ngày nào một ràng buộc mới rơi lên 1 trong 2 field
     # đó (đúng khuôn kit#129 §3.1 vừa làm với `scorecard_threshold`), `str(exc)` sẽ mang tenant PII
     # vào body 500 → access log của reverse-proxy/APM — đúng hạng lỗ mà

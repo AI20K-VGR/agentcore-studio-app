@@ -133,7 +133,7 @@ async def test_evaluate_injects_the_canvas_recipe_it_returns_into_the_runner(
     nodes, edges = _minimal_valid_dag()
     body = PublishRequest(
         agent_id="agent-inject-check",
-        instructions="Answer from KB only.",
+        system_prompt="Answer from KB only.",
         tool_whitelist=[],
         nodes=nodes,
         edges=edges,

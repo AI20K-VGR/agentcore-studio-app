@@ -207,7 +207,7 @@ async def test_inv1_recipe_khai_tenant_khac_thi_session_thang() -> None:
     recipe = create_recipe(
         agent_id="agent-callisto-d4",
         tenant_id=CLIENT_CLAIMED_TENANT_ID,  # ← client khai
-        instructions="Tra cứu quy trình và bảo mật Callisto.",
+        system_prompt="Tra cứu quy trình và bảo mật Callisto.",
         tool_whitelist=[],
         nodes=[
             Node(id="n1", type=NodeType.KB_RETRIEVE, params={"query": "nghỉ phép?", "top_k": 3}),
@@ -310,7 +310,7 @@ async def test_run_case_surfaces_engine_refusal_faithfully(final_answer_text: st
         create_recipe(
             agent_id="agent-callisto-d4",
             tenant_id=TENANT_ID,
-            instructions="Tra cứu quy trình và bảo mật Callisto.",
+            system_prompt="Tra cứu quy trình và bảo mật Callisto.",
             tool_whitelist=[],
             nodes=[
                 Node(id="n1", type=NodeType.KB_RETRIEVE, params={"top_k": 3}),
@@ -651,7 +651,7 @@ def _tool_call_recipe(tenant_id: UUID, expression: str) -> Recipe:
     return create_recipe(
         agent_id="agent-tool-dispatch-check",
         tenant_id=tenant_id,
-        instructions="x",
+        system_prompt="x",
         tool_whitelist=["calculator"],
         nodes=[
             Node(id="n1", type=NodeType.KB_RETRIEVE, params={"top_k": 3}),

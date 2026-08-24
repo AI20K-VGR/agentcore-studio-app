@@ -79,7 +79,7 @@ def _recipe() -> Recipe:
     return create_recipe(
         agent_id="agent-chat-test",
         tenant_id=TENANT_ID,
-        instructions="Tra cứu quy trình và bảo mật Callisto.",
+        system_prompt="Tra cứu quy trình và bảo mật Callisto.",
         tool_whitelist=[],
         nodes=nodes,
         edges=edges,

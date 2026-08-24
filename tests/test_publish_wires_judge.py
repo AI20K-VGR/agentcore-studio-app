@@ -190,7 +190,7 @@ async def _bat_judge_ma_evaluate_dung(monkeypatch: pytest.MonkeyPatch, tmp_path:
     nodes, edges = _minimal_valid_dag()
     body = PublishRequest(
         agent_id="agent-judge-wiring",
-        instructions="Answer from KB only.",
+        system_prompt="Answer from KB only.",
         tool_whitelist=[],
         nodes=nodes,
         edges=edges,

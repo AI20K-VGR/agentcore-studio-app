@@ -67,7 +67,7 @@ async def _seed_user(admin_pool: Pool, tenant_id: UUID, email: str, roles: list[
 async def _seed_published_recipe(admin_pool: Pool, tenant_id: UUID, agent_id: str) -> None:
     # workbench#41 — create_recipe_d4() đã bị xoá. Dựng thủ công cùng hình dạng DAG 3-node nó
     # từng tự sinh (KB_RETRIEVE -> LLM_STEP -> END); chỉ cần recipe published hợp lệ qua
-    # _load_published_recipe(), không đụng chi tiết kb_binding/instructions.
+    # _load_published_recipe(), không đụng chi tiết kb_binding/system_prompt.
     nodes = [
         Node(id="n1", type=NodeType.KB_RETRIEVE, params={"top_k": 3}),
         Node(id="n2", type=NodeType.LLM_STEP, params={"temperature": 0.0}),
@@ -77,7 +77,7 @@ async def _seed_published_recipe(admin_pool: Pool, tenant_id: UUID, agent_id: st
     recipe = create_recipe(
         agent_id=agent_id,
         tenant_id=tenant_id,
-        instructions="Tra cứu quy trình và bảo mật Callisto.",
+        system_prompt="Tra cứu quy trình và bảo mật Callisto.",
         tool_whitelist=[],
         nodes=nodes,
         edges=edges,

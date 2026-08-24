@@ -105,7 +105,7 @@ def _settings(tmp_path: Path) -> Settings:
 def _body() -> PublishRequest:
     return PublishRequest(
         agent_id="agent-golden-from-db",
-        instructions="x",
+        system_prompt="x",
         tool_whitelist=[],
         nodes=[{"id": "n1", "type": "kb-retrieve", "params": {}}, {"id": "n2", "type": "end", "params": {}}],
         edges=[{"from": "n1", "to": "n2"}],

@@ -26,7 +26,7 @@ def _recipe_with_tool_call(tool: str, whitelist: list[str]) -> Recipe:
     return create_recipe(
         agent_id="agent-tool-dispatch-test",
         tenant_id=_ANKOR_ID,
-        instructions="x",
+        system_prompt="x",
         tool_whitelist=whitelist,
         nodes=[
             Node(id="n1", type=NodeType.TOOL_CALL, params={"tool": tool}),
@@ -184,7 +184,7 @@ def test_find_unsupported_tool_call_returns_none_when_recipe_has_no_tool_call_no
     recipe = create_recipe(
         agent_id="agent-tool-dispatch-test",
         tenant_id=_ANKOR_ID,
-        instructions="x",
+        system_prompt="x",
         tool_whitelist=[],
         nodes=[
             Node(id="n1", type=NodeType.KB_RETRIEVE, params={"top_k": 3}),

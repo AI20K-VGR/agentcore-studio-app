@@ -232,7 +232,7 @@ async def test_recipe_caller_truyen_vao_duoc_dung_NGUYEN_TRANG(monkeypatch: pyte
         agent_id="agent-canvas",
         tenant_id=OTHER_TENANT,
         agent_config=AgentConfig(
-            instructions="Tra cứu quy trình và bảo mật Callisto.", model="gemini-2.5-flash", tool_whitelist=[]
+            system_prompt="Tra cứu quy trình và bảo mật Callisto.", model="gemini-2.5-flash", tool_whitelist=[]
         ),
         dag=Dag(
             nodes=[

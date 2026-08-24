@@ -73,7 +73,7 @@ class PublishRequest(BaseModel):
     nền tảng. `temperature` thay vào đó là input cấu hình động thật của người dùng."""
 
     agent_id: str
-    instructions: str
+    system_prompt: str
     tool_whitelist: list[str] = Field(default_factory=list)
     nodes: list[dict[str, Any]]
     edges: list[dict[str, Any]]
@@ -140,7 +140,7 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
         recipe = create_recipe(
             agent_id=body.agent_id,
             tenant_id=session.tenant_id,
-            instructions=body.instructions,
+            system_prompt=body.system_prompt,
             tool_whitelist=body.tool_whitelist,
             nodes=nodes,
             edges=edges,

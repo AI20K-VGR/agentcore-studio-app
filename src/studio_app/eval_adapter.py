@@ -52,7 +52,7 @@ Kiến trúc agent đổi (`PROJECT-SCOPE-DEMO-DAY30.md`): bỏ DAG 6-node tĩnh
 tool tự chọn (`packages/engine` #33). `run_case()` KHÔNG còn `with_query(base, query)` +
 `interpreter.run()` — `query` đi thẳng qua kwarg `question=` của `run_agent_loop()`, và
 `run_agent_loop()` KHÔNG đọc `recipe.dag` chút nào (đã grep `agent_loop.py`: chỉ chạm
-`recipe.agent_config.{tool_whitelist,instructions,model}` + `recipe.agent_id` — KHÔNG có dòng
+`recipe.agent_config.{tool_whitelist,system_prompt,model}` + `recipe.agent_id` — KHÔNG có dòng
 `recipe.kb_binding` nào; `interpreter.py` cũng vậy). Mọi đoạn docstring dưới đây còn nhắc
 `interpreter.run()`/`model_copy` `params["query"]` mô tả HÀNH VI CŨ vẫn đúng cho
 `packages/engine::interpreter.run()` (fallback DAG-walk vẫn tồn tại, K2 engine#33) — chỉ KHÔNG còn
@@ -170,7 +170,7 @@ class EngineAgentRunner:
         built = create_recipe(
             agent_id=agent_id or self._agent_id,
             tenant_id=tenant_id,
-            instructions="Tra cứu quy trình và bảo mật Callisto.",
+            system_prompt="Tra cứu quy trình và bảo mật Callisto.",
             tool_whitelist=[],
             nodes=_CERTIFIED_NODES,
             edges=_CERTIFIED_EDGES,
@@ -198,7 +198,7 @@ class EngineAgentRunner:
         `workbench#23` nó **không còn** xuống `node.params`; vòng lặp mới không đọc `node.params`
         của `recipe.dag` chút nào, và (workbench#39/#41) cũng không đọc `recipe.kb_binding` — đã
         grep `agent_loop.py`/`interpreter.py`: không dòng nào chạm `recipe.kb_binding`, chỉ chạm
-        `recipe.agent_config.{tool_whitelist,instructions,model}` + `recipe.agent_id`. Câu hỏi
+        `recipe.agent_config.{tool_whitelist,system_prompt,model}` + `recipe.agent_id`. Câu hỏi
         "params có ghi đè được không" vì thế không còn áp dụng — `tenant_id`/`section_roles` chỉ
         còn sống trong `session_context` (fence tại `agent_loop.fenced_kb_params`, cùng cơ chế
         `interpreter.run()` dùng cho DAG-walk, dùng chung 1 helper — `fence.py`).
