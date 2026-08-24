@@ -11,8 +11,10 @@ bộ" ở UI hiện là khung hiển thị (không gọi API), giữ chỗ cho l
 không có gì đảm bảo có cấu trúc `## title` như corpus Callisto 2.0 curate tay — `_cut_document`
 raise ngay khi thiếu heading, đúng thứ chặn `.txt`/`.docx` (gần như không bao giờ có `##`) và cả
 nhiều `.md` thật (ghi chú rời rạc, không heading). `cut_window` không quan tâm cấu trúc, chỉ cần có
-chữ. Xem `packages/kb/plans/multiformat_chunker_plan.md` cho số liệu đo (2000 token trần
-`gemini-embedding-001` → 850 từ/chunk là biên an toàn đo trên corpus thật).
+chữ. Xem `packages/kb/src/studio_kb/chunk_window.py` cho số liệu đo (2000 token trần
+`gemini-embedding-001` → 850 từ/chunk, chốt bằng A/B/C benchmark thật trên 100 câu hỏi, không phải
+suy luận — 850/170 thắng cả benchmark chính lẫn stress test ngữ cảnh dài, xem
+`packages/kb/chunking/report.md`).
 
 `section_role` KHÔNG dùng `SECTION_VOCAB` (`studio_kb.doc_factory_core` — 4 giá trị cố định chỉ
 dùng cho bộ tài liệu mẫu tĩnh `docs/callisto-2.0/`, xem `doc_factory_v2.py::load_corpus_v2`).
