@@ -41,7 +41,15 @@ Nó được giữ lại với đúng vai thật của nó (xem docstring của 
 recipe_hash()`: `sha256` trên `model_dump(mode="json", by_alias=True)` + `sort_keys=True`, xem
 docstring hàm đó để biết lý do từng cờ), và `DEC-D20-02` giữ nguyên: evalhub **nhận** giá trị,
 không tự dẫn xuất.
-"""
+
+## app#44 — `query` giờ là kwarg `question=`, không còn bơm vào `recipe.dag`
+
+`run_case()` không còn `with_query`/`model_copy` — `run_agent_loop()` (thay `interpreter.run()`)
+không đọc `recipe.dag` chút nào, nên "khác ĐÚNG một khoá `params['query']`" (đoạn trên, mô tả hành
+vi TRƯỚC app#44) không còn là phép đo đúng nữa. Bài `test_query_duoc_bom_dung_vao_kb_retrieve` đổi
+tên + phép đo: giờ khoá đúng **recipe truyền cho `run_agent_loop` là CHÍNH `certified_recipe()`
+(không đổi 1 byte nào)**, và `question=` kwarg mang đúng `query` của case — mạnh hơn phép đo cũ (cũ
+chỉ đảm bảo "khác đúng 1 khoá", giờ đảm bảo "không đổi khoá nào cả")."""
 
 from __future__ import annotations
 
@@ -55,7 +63,6 @@ from studio_app.providers.fakes import FakeEmbedding
 from studio_contracts import NodeType, Recipe, TraceEvent
 from studio_engine.interpreter import RunResult
 from studio_workbench import create_recipe_d4
-from studio_workbench.recipe_ops import without_query
 
 TENANT_ID = UUID("a0000000-0000-0000-0000-000000000001")
 OTHER_TENANT = UUID("b0000000-0000-0000-0000-000000000001")
@@ -76,23 +83,36 @@ class _StubTraceWriter:
         del event
 
 
-class _RecipeRecordingInterpreter:
-    """Namespace fake thay `eval_adapter.interpreter` — ghi lại **recipe interpreter thật sự nhận**.
+class _RecipeRecordingAgentLoop:
+    """Namespace fake thay `eval_adapter.agent_loop` (app#44 — trước đó `eval_adapter.interpreter`)
+    — ghi lại **recipe + question `run_agent_loop` thật sự nhận**, thành CẶP (không tách riêng như
+    file cũ): app#44 xoá hẳn `with_query`/`model_copy`, nên "recipe nhận được" và "query của case"
+    giờ là 2 tham số ĐỘC LẬP (`recipe`, `question=`) chứ không còn gộp vào 1 object nữa — ghi lại
+    thành cặp là cách duy nhất còn đo được "case nào ứng với recipe nào" mà không suy đoán.
 
-    Đây là chỗ đo đúng thứ cần đo: không phải recipe adapter *định* dựng, mà recipe **đi tới**
-    interpreter. Hai cái chỉ bằng nhau khi không có ai `model_copy` ở giữa mà quên."""
+    `question` khai `keyword-only, positional-or-keyword=False` trong chữ ký thật của
+    `run_agent_loop` — chặn `**kwargs` ở đây bằng cách LẤY THẲNG `question` ra khỏi `kwargs` thay vì
+    nhận nó như 1 tham số riêng, để chữ ký fake khớp đúng cách gọi thật (`question=` luôn qua
+    kwargs)."""
 
     def __init__(self) -> None:
-        self.recipes: list[Recipe] = []
+        self.calls: list[tuple[Recipe, str]] = []
 
-    async def run(self, recipe: Recipe, **kwargs: object) -> RunResult:  # noqa: ARG002
-        self.recipes.append(recipe)
+    @property
+    def recipes(self) -> list[Recipe]:
+        """Tương thích ngược với tên cũ (`stub.recipes`) cho phần thân bài chưa cần đọc `question`."""
+        return [recipe for recipe, _ in self.calls]
+
+    async def run_agent_loop(self, recipe: Recipe, **kwargs: object) -> RunResult:
+        question = kwargs["question"]
+        assert isinstance(question, str)
+        self.calls.append((recipe, question))
         return RunResult(run_id="r-test", events=[], final_state={"n2": {"answer": "x"}})
 
 
 def _patched(monkeypatch: pytest.MonkeyPatch, *, recipe: Recipe | None = None) -> tuple[EngineAgentRunner, Any]:
-    stub = _RecipeRecordingInterpreter()
-    monkeypatch.setattr(eval_adapter, "interpreter", stub)
+    stub = _RecipeRecordingAgentLoop()
+    monkeypatch.setattr(eval_adapter, "agent_loop", stub)
     runner = EngineAgentRunner(
         kb_search=_StubKbSearch(),
         llm=_StubLLM(),
@@ -139,24 +159,23 @@ async def test_hai_case_khac_query_dung_chung_mot_recipe_goc(monkeypatch: pytest
     assert a == b
 
 
-async def test_query_duoc_bom_dung_vao_kb_retrieve(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Biến thể per-case khác recipe gốc **đúng một khoá** `params["query"]`.
+async def test_query_di_qua_kwarg_question_recipe_khong_doi_1_byte(monkeypatch: pytest.MonkeyPatch) -> None:
+    """app#44 — `query` của case đi qua kwarg `question=` của `run_agent_loop`, KHÔNG còn bơm vào
+    recipe bằng `model_copy`/`with_query`.
 
-    Đo trên recipe **interpreter thật sự nhận**, không trên recipe adapter định dựng — hai cái chỉ
-    bằng nhau khi không ai `model_copy` ở giữa mà quên.
-
-    Vế thứ hai (`without_query(nhận) == gốc`) là vế thật sự khoá: nó nói *"khác ĐÚNG một khoá"*, chứ
-    không chỉ *"có khoá query"*. Một cài đặt tiện tay đổi thêm `top_k` hay `tenant_id` vẫn xanh nếu
-    chỉ assert vế đầu."""
+    Vế thứ hai (`nhan == goc`, bằng nhau TOÀN BỘ, không chỉ `without_query(nhan) == goc`) là vế thật
+    sự khoá — MẠNH HƠN phép đo cũ ("khác đúng 1 khoá"): giờ recipe không được đổi 1 byte nào cả. Một
+    cài đặt tiện tay quay lại `model_copy`/bơm `query` vào `node.params` sẽ làm `nhan != goc` và bài
+    này đỏ."""
     runner, stub = _patched(monkeypatch)
 
     await runner.run_case(agent_id="a1", query="câu hỏi A", tenant_id=TENANT_ID, section_roles=["public"])
 
-    nhan = stub.recipes[0]
-    assert _kb_params(nhan)["query"] == "câu hỏi A"
+    nhan, question = stub.calls[0]
+    assert question == "câu hỏi A"
 
     goc = runner.certified_recipe(agent_id="a1", tenant_id=TENANT_ID, section_roles=["public"])
-    assert without_query(nhan) == goc
+    assert nhan == goc, "recipe run_agent_loop nhận phải giống HỆT recipe gốc — không còn model_copy nào bơm query"
 
 
 async def test_ba_muoi_case_chi_sinh_MOT_recipe_goc(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -167,26 +186,32 @@ async def test_ba_muoi_case_chi_sinh_MOT_recipe_goc(monkeypatch: pytest.MonkeyPa
     `agent_id`/`tenant_id`/`scope` vốn đã không đổi. Bản nháp đầu của file gọi nó là *"bài trả lời
     🅐"* — sai, và giữ nguyên nhãn đó sẽ là một bài **tự khai mạnh hơn thực tế**.
 
-    Vai thật của nó: **lưới quy mô** cho `test_query_duoc_bom_dung_vao_kb_retrieve`. Bài kia đo trên
-    **một** case; bài này đo trên 30, nên nó bắt được thứ chỉ lộ ra khi lặp — ví dụ một cài đặt tương
-    lai bơm thêm cái gì đó **theo chỉ số case** (`top_k` tăng dần, `trace_id`, timestamp), vốn xanh
-    trên một case và hỏng trên 30.
+    Vai thật của nó: **lưới quy mô** cho `test_query_di_qua_kwarg_question_recipe_khong_doi_1_byte`.
+    Bài kia đo trên **một** case; bài này đo trên 30, nên nó bắt được thứ chỉ lộ ra khi lặp — ví dụ
+    một cài đặt tương lai bơm thêm cái gì đó **theo chỉ số case** (`top_k` tăng dần, `trace_id`,
+    timestamp) vào RECIPE, vốn xanh trên một case và hỏng trên 30.
 
-    Assert thứ hai (`len(queries) == 30`) là thứ giữ bài này khỏi **degenerate**: không có nó, một
-    cài đặt nuốt hết `query` (mọi biến thể giống hệt nhau) cũng cho `len(goc) == 1` và bài vẫn xanh —
-    lúc đó nó khẳng định *"đồng nhất"* trên một tập đã bị làm cho đồng nhất."""
+    app#44: "30 recipe" của bản mô tả cũ giờ là **30 lần gọi CÙNG một recipe** (recipe không còn bị
+    `model_copy` theo case) — assert đổi từ "gỡ `query` thì 30 biến thể trùng nhau" (đo trên object
+    ĐÃ bị sửa) sang "cả 30 lần recipe truyền đi giống hệt object gốc" (đo trên object CHƯA từng bị
+    sửa, mạnh hơn). Assert `len(questions) == 30` giữ nguyên vai chống-degenerate: không có nó, một
+    cài đặt nuốt hết `question` (mọi lần gọi giống hệt nhau) vẫn xanh."""
     runner, stub = _patched(monkeypatch)
 
     for i in range(30):
         await runner.run_case(agent_id="a1", query=f"câu hỏi {i}", tenant_id=TENANT_ID, section_roles=["public"])
 
-    assert len(stub.recipes) == 30
+    assert len(stub.calls) == 30
 
-    queries = {_kb_params(r)["query"] for r in stub.recipes}
-    assert len(queries) == 30, f"30 case phải mang 30 query khác nhau, đo được {len(queries)} — tập đã bị làm phẳng"
+    questions = {question for _, question in stub.calls}
+    assert len(questions) == 30, f"30 case phải mang 30 question khác nhau, đo được {len(questions)}"
 
-    goc_khac_nhau = {without_query(r).model_dump_json() for r in stub.recipes}
-    assert len(goc_khac_nhau) == 1, f"gỡ query ra thì 30 biến thể phải trùng nhau, đo được {len(goc_khac_nhau)}"
+    goc = runner.certified_recipe(agent_id="a1", tenant_id=TENANT_ID, section_roles=["public"])
+    recipes_khac_nhau = {recipe.model_dump_json() for recipe, _ in stub.calls}
+    assert recipes_khac_nhau == {goc.model_dump_json()}, (
+        f"cả 30 lần gọi phải truyền CÙNG recipe gốc (không model_copy theo case), đo được "
+        f"{len(recipes_khac_nhau)} biến thể khác nhau"
+    )
 
 
 async def test_recipe_caller_truyen_vao_duoc_dung_NGUYEN_TRANG(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -205,9 +230,10 @@ async def test_recipe_caller_truyen_vao_duoc_dung_NGUYEN_TRANG(monkeypatch: pyte
     assert base is ngoai
 
     await runner.run_case(agent_id="bị-bỏ-qua", query="q?", tenant_id=TENANT_ID, section_roles=["public"])
-    nhan = stub.recipes[0]
+    nhan, question = stub.calls[0]
 
+    assert nhan is ngoai, "app#44: recipe tiêm phải đi tới run_agent_loop NGUYÊN VẸN, không model_copy"
     assert nhan.agent_id == "agent-canvas"
     assert nhan.tenant_id == OTHER_TENANT
     assert nhan.kb_binding.scope == "borea/finance"
-    assert _kb_params(nhan)["query"] == "q?"
+    assert question == "q?"
