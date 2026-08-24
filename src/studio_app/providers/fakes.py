@@ -18,7 +18,10 @@ reproducible — no wall-clock, no `random` module anywhere in this file.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+
+from studio_engine.agent_protocol import KB_SEARCH_TOOL, TOOL_CALL_PREFIX
 
 
 class FakeLLM:
@@ -35,6 +38,34 @@ class ExtractiveFakeLLM:
 
     Ý gốc của **DE (@DongAnh2704)** trong `scripts/smoke_eval_d6.py` (`_NaiveExtractiveLLM`), đưa
     vào đây để cả test lẫn script e2e dùng chung một bản, thay vì mỗi chỗ chép một lần.
+
+    **app#44 — tool-calling awareness cho `run_agent_loop()` (engine#33).** Trước app#44, class này
+    chỉ đọc chunk ĐÃ CÓ SẴN trong prompt: kiến trúc DAG cũ (`interpreter.run()`) chạy `kb-retrieve`
+    TRƯỚC `llm-step` vô điều kiện nên `complete()` không bao giờ cần TỰ quyết định có tra cứu hay
+    không. Vòng lặp mới đòi chính LLM phát `TOOL_CALL: {"tool":"kb_search",...}` để trigger tra cứu
+    — không phát thì `kb_search` không bao giờ chạy. `complete()` giờ tự phân biệt 3 trạng thái bằng
+    CHÍNH prompt nhận được (không giữ state ngoài lời gọi — mỗi lượt của vòng lặp gọi lại với TOÀN
+    BỘ prompt tích luỹ, đúng hợp đồng `LLM.complete`):
+
+    1. **Chưa search** (block `[Kết quả kb_search]` — do `agent_protocol.build_agent_prompt` render
+       cho mỗi `Observation` — chưa xuất hiện trong prompt): phát `TOOL_CALL: {"tool": "kb_search",
+       "params": {"query": <câu hỏi>}}`, câu hỏi lấy từ dòng `"Câu hỏi: "` cuối prompt (marker
+       `_QUESTION_MARKER` đã có sẵn).
+    2. **Đã search, có chunk** (block đó hiện diện VÀ chứa ít nhất 1 dòng `[chunk_id]`): hành vi CŨ
+       nguyên vẹn — chép đoạn trích đầu tiên tìm thấy, trích đúng `chunk_id` của nó. Vẫn dùng đúng
+       `_EXCERPT_RE` hiện có: regex đó không khớp `[Kết quả kb_search]` (có khoảng trắng, ngoài lớp
+       `[\\w#-]+`) nên không lẫn header với chunk thật — xác nhận bằng test
+       `test_fakes_extractive_tool_calling.py`.
+    3. **Đã search, 0 chunk** (block hiện diện nhưng KHÔNG có dòng `[chunk_id]` nào — fence chặn
+       sạch, đúng ca MONEY-SHOT cross-tenant): trả lời từ chối NGAY (câu cũ, không đổi), KHÔNG phát
+       `TOOL_CALL:` lần 2 — nếu không phân biệt được (1) và (3), double sẽ search lại vô hạn cho tới
+       khi `run_agent_loop` hết `max_turns` (`AgentLoopExhausted`) thay vì trả lời/từ chối gọn.
+
+    An toàn cho MỌI caller hiện có: đã grep xác nhận toàn bộ nơi dùng class này trong `apps/studio`
+    (11 file, kể cả `scripts/e2e_smoke_eval.py`) đều đi qua `EngineAgentRunner.run_case()`
+    (`eval_adapter.py`, giờ gọi `run_agent_loop()`), KHÔNG nơi nào gọi `interpreter.run()` (DAG-walk
+    cũ) trực tiếp với double này — nên sửa hành vi ngay trong class thay vì tạo class song song
+    không phá đường DAG-walk cũ (đường đó không dùng `ExtractiveFakeLLM`).
 
     Vì sao nó cần tồn tại cạnh `FakeLLM` và cạnh câu trả lời recorded — cả hai đầu kia đều **không
     đo được chất lượng**, theo hai chiều ngược nhau:
@@ -74,19 +105,45 @@ class ExtractiveFakeLLM:
     # chỗ sẽ đỏ để báo.
     _EXCERPT_RE = re.compile(r"^\[([\w#-]+)\]\n", re.MULTILINE)
     _QUESTION_MARKER = "\n\nCâu hỏi:"
+    # app#44 — nhãn header block quan sát `agent_protocol.build_agent_prompt` render cho MỖI
+    # `Observation` (`f"[Kết quả {obs.tool}]\n{obs.result_text}"`). Có khoảng trắng nên KHÔNG khớp
+    # `_EXCERPT_RE` (`[\w#-]+` không chứa khoảng trắng) — dùng làm cờ phân biệt "đã search" (1) khỏi
+    # "chưa search" (2)/(3) trong module docstring của class này.
+    _KB_OBSERVATION_HEADER = "[Kết quả kb_search]"
 
     def __init__(self) -> None:
         self.prompts_seen: list[str] = []
+
+    def _question_from_prompt(self, prompt: str) -> str:
+        """Lấy lại câu hỏi từ dòng `"Câu hỏi: "` cuối prompt (marker đã có sẵn cho việc cắt đoạn
+        trích ở dưới) — dùng làm `params["query"]` khi phát `TOOL_CALL: kb_search`. Không tìm thấy
+        marker (prompt không đúng khuôn `build_agent_prompt`) → trả nguyên `prompt`, fail-soft: một
+        query rỗng/sai vẫn tốt hơn để `TOOL_CALL:` vỡ JSON."""
+        marker_start = prompt.rfind(self._QUESTION_MARKER)
+        if marker_start == -1:
+            return prompt
+        return prompt[marker_start + len(self._QUESTION_MARKER) :].strip()
 
     async def complete(self, prompt: str, **kwargs: object) -> str:
         del kwargs  # accepted for Protocol-shape parity
         self.prompts_seen.append(prompt)
 
+        already_searched = self._KB_OBSERVATION_HEADER in prompt
         marks = list(self._EXCERPT_RE.finditer(prompt))
         if not marks:
-            # Không đoạn trích nào (retrieval rỗng vì fence, hoặc prompt không phải khuôn
-            # `build_prompt`) → không có gì để chép và không có gì để trích. Không trích dẫn ⇒
-            # `LlmStepExecutor` đọc thành `refused=True`.
+            if not already_searched:
+                # app#44 (1) — vòng lặp mới (run_agent_loop) đòi LLM TỰ phát tín hiệu để trigger
+                # kb_search; kiến trúc DAG cũ chạy nó vô điều kiện nên trước app#44 chỗ này luôn là
+                # "0 đoạn trích ⇒ từ chối". Câu hỏi lấy lại từ chính prompt, không giữ state riêng.
+                # `json.dumps` (không f-string tay) — payload phải là JSON hợp lệ mà
+                # `agent_protocol.parse_agent_signal` parse được (P1/P3), không phải Python repr.
+                query = self._question_from_prompt(prompt)
+                payload = json.dumps({"tool": KB_SEARCH_TOOL, "params": {"query": query}})
+                return f"{TOOL_CALL_PREFIX} {payload}"
+            # app#44 (3) — đã search (block hiện diện) nhưng 0 chunk (fence chặn sạch, MONEY-SHOT) ⇒
+            # từ chối NGAY, KHÔNG phát TOOL_CALL lần 2 (sẽ lặp tới khi hết max_turns nếu không chặn
+            # ở đây). Không đoạn trích nào để chép/trích ⇒ `refused=True` phía `run_agent_loop`
+            # (A5, DEC-4: `not citations and not used_non_kb_tool`).
             return "Không có đoạn trích nào để trả lời."
 
         first = marks[0]
