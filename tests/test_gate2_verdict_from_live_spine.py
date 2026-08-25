@@ -123,28 +123,45 @@ def _golden() -> GoldenSet:
     return load_golden_set(_GOLDEN_30, expect_ref=_REF)
 
 
-def _trace_event(tenant_id: UUID, citations: list[str], *, chunks: list[dict[str, object]] | None = None) -> TraceEvent:
-    """Event `kb-retrieve` mang **hai** mặt quan sát — `citations` (tầng *cited*) và
-    `outputs["chunks"]` (tầng *retrieved*).
+def _trace_events(
+    tenant_id: UUID, citations: list[str], *, chunks: list[dict[str, object]] | None = None
+) -> list[TraceEvent]:
+    """**Hai** event, mỗi mặt quan sát ở đúng node của nó: `kb-retrieve` mang `outputs["chunks"]`
+    (tầng *retrieved*), `llm-step` mang `citations` (tầng *cited*).
+
+    Trước đây gộp cả hai vào MỘT event `kb-retrieve` — theo cách đọc của chú thích contract thời đó
+    (`TraceEvent.citations  # from kb-retrieve`). Clause **C-1** (engine `trace-citations.v0.md`,
+    chốt `DL-11.A1-10`) chốt ngược lại: **chỉ `llm-step` được mang `citations`**. Nên hình dạng cũ
+    là thứ engine **không sinh ra được nữa**, và một stub mô hình hoá trạng thái bất khả thi che
+    mất đúng lớp lỗi mà lưới C-1 phía tiêu thụ (evalhub) dựng lên để bắt.
+
+    Tách đôi chứ không chỉ đổi `node_type`: `chunks_from_trace` đọc chunk từ **đúng** event
+    `kb-retrieve`, dời cả sang `llm-step` là mất nguồn chunk và đổi luôn thứ bài này đang đo.
 
     Sau `F-6` (`DEC-D17-02`) nhánh từ-chối chấm `no_leak` trên **`chunks`**. Một stub chỉ mang
     `citations` là stub không mô hình được thứ bộ chấm đọc, và nó lặng lẽ biến runner-tốt thành
     **fixture thuận lợi**: `all(...)` trên tập rỗng luôn `True` nên luật `no_leak` sai kiểu gì cũng
     không lộ."""
-    return TraceEvent(
-        event_id="e1",
-        run_id="r1",
-        agent_id=_AGENT,
-        tenant_id=tenant_id,
-        node_id="n1",
-        node_type=NodeType.KB_RETRIEVE,
-        ts="2026-08-14T00:00:00+00:00",
-        inputs_hash="h",
-        outputs={"chunks": chunks if chunks is not None else []},
-        tokens=Tokens(prompt=0, completion=0),
-        cost=0.0,
-        citations=citations,
-    )
+    base: dict[str, object] = {
+        "event_id": "e1",
+        "run_id": "r1",
+        "agent_id": "agent-1",
+        "tenant_id": tenant_id,
+        "ts": "2026-08-10T00:00:00+00:00",
+        "inputs_hash": "h",
+        "tokens": Tokens(prompt=0, completion=0),
+        "cost": 0.0,
+    }
+    return [
+        TraceEvent(
+            node_id="n1",
+            node_type=NodeType.KB_RETRIEVE,
+            outputs={"chunks": chunks if chunks is not None else []},
+            citations=None,
+            **base,
+        ),
+        TraceEvent(node_id="n2", node_type=NodeType.LLM_STEP, outputs={}, citations=citations, **base),
+    ]
 
 
 def _runner_tot(golden: GoldenSet, tenant_map: Mapping[str, UUID]) -> StubAgentRunner:
@@ -171,14 +188,14 @@ def _runner_tot(golden: GoldenSet, tenant_map: Mapping[str, UUID]) -> StubAgentR
             chunks: list[dict[str, object]] = [
                 {"chunk_id": chunk_id, "tenant_id": str(tenant_id), "section_role": role, "score": 0.5, "text": "t"}
             ]
-            events = [_trace_event(tenant_id, [chunk_id], chunks=chunks)]
+            events = _trace_events(tenant_id, [chunk_id], chunks=chunks)
         else:
             answer = AgentAnswer(
                 answer=f"Theo tài liệu, {case.expected}.",
                 citations=list(case.expected_citation),
                 refused=False,
             )
-            events = [_trace_event(tenant_id, list(case.expected_citation))]
+            events = _trace_events(tenant_id, list(case.expected_citation))
         fixtures[(case.query, tenant_id, tuple(case.section_roles))] = CaseRun(answer=answer, events=events)
     return StubAgentRunner(fixtures)
 
