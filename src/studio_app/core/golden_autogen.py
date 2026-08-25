@@ -204,5 +204,5 @@ async def regenerate_for_section(
         n_ai=sum(1 for c in merged.cases if c.source == "ai"),
         n_human=sum(1 for c in merged.cases if c.source == "human"),
         n_chunks=len(chunks),
-        roles_below_minimum=tuple(report.vai_thieu_case),
+        roles_below_minimum=tuple(getattr(report, "roles_below_minimum", getattr(report, "vai_thieu_case", ()))),
     )

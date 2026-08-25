@@ -86,7 +86,7 @@ async def _make_tenant(admin_pool: Pool, name: str, *section_roles: str) -> UUID
 
 
 async def _upload(tenant_id: UUID, filename: str, content: bytes, section_role: str) -> Any:
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
             return await upload_document(
