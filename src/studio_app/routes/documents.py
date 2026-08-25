@@ -50,9 +50,11 @@ import dataclasses
 import hashlib
 import re
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from psycopg import sql
 from pydantic import BaseModel
 from studio_kb.chunk_window import cut_window
 from studio_kb.extract import SUPPORTED_SUFFIXES, UnsupportedFormatError, extract_text
@@ -60,6 +62,7 @@ from studio_kb.pipeline import KbPipeline
 
 from studio_app.authz import fetch_fresh_identity, fetch_tenant_section_names, require_admin
 from studio_app.core._db import get_pool
+from studio_app.core.golden_autogen import regenerate_for_section
 from studio_app.middleware import get_request_connection, get_request_session
 from studio_app.providers.factory import build_embedding
 
@@ -93,10 +96,32 @@ def _slugify(value: str) -> str:
     return slug or "doc"
 
 
+async def _tenant_slug(conn: Any, tenant_id: UUID) -> str:
+    """Slug của tenant từ `core.tenants.name` — thứ `GoldenCase.tenant` mang.
+
+    `GoldenCase.tenant` là **slug**, không phải UUID (xem `SourceChunk` ở `golden_from_kb`), và các
+    case bẫy chéo-tenant so sánh slug với slug. Đọc từ `core.tenants` chứ không suy từ
+    `studio_kb.doc_factory.TENANT_IDS`: bảng đó chỉ có 2 tenant demo, còn route này chạy cho mọi
+    tenant thật.
+    """
+    cur = await conn.execute("SELECT name FROM core.tenants WHERE id = %s", (tenant_id,))
+    row = await cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"tenant {tenant_id} không có trong core.tenants")
+    return str(row[0])
+
+
 class UploadDocumentResponse(BaseModel):
     doc_id: str
     section_role: str
     chunk_count: int
+    golden_set_ref: str
+    """Bộ golden của phòng ban này, vừa được sinh lại từ chunk đang có."""
+    golden_n_cases: int
+    golden_n_ai: int
+    golden_n_human: int
+    """Số case `source="human"` được GIỮ NGUYÊN qua lần sinh lại này — tách khỏi tổng vì đó là câu
+    người vừa sửa tay sẽ hỏi."""
 
 
 @router.post("", response_model=UploadDocumentResponse)
@@ -223,4 +248,35 @@ async def upload_document(
     await pipeline.delete_by_doc_id(tenant_uuid, doc_id)
     await pipeline.index(chunks, embeddings)
 
-    return UploadDocumentResponse(doc_id=doc_id, section_role=section_role, chunk_count=len(chunks))
+    # Golden set SINH RA Ở ĐÂY, không còn phải có sẵn. Sinh lại cho CẢ phòng ban (không chỉ tài
+    # liệu vừa nạp) và giữ nguyên mọi case `source="human"` — xem `core/golden_autogen.py`.
+    #
+    # Bind `app.tenant_id` tường minh trong đúng transaction ghi: `eval.golden_sets` bật RLS
+    # `FORCE`, và connection của middleware đã bind sẵn tenant của PHIÊN — nhưng route này cho
+    # superadmin nạp hộ tenant khác (`tenant_id=` tham số), nên phải bind về tenant ĐÍCH. Cùng
+    # khuôn `routes/golden_sets.py`.
+    #
+    # KHÔNG atomic với `index` ở trên (hai giao dịch riêng, đúng seam của `KbPipeline`): index
+    # xong mà sinh golden vỡ thì tài liệu đã nằm trong `kb.chunks` còn bộ case chưa cập nhật.
+    # Để lỗi NỔI LÊN chứ không nuốt: upload lại cùng file là idempotent (`delete_by_doc_id` +
+    # sinh lại toàn bộ), nên đường phục hồi là thử lại, và một 500 nói rõ hơn một 200 nửa vời.
+    conn = get_request_connection()
+    async with conn.transaction():
+        await conn.execute(sql.SQL("SET LOCAL app.tenant_id = {}").format(sql.Literal(str(tenant_uuid))))
+        golden = await regenerate_for_section(
+            conn,
+            pipeline,
+            tenant_id=tenant_uuid,
+            tenant_slug=await _tenant_slug(conn, tenant_uuid),
+            section_role=section_role,
+        )
+
+    return UploadDocumentResponse(
+        doc_id=doc_id,
+        section_role=section_role,
+        chunk_count=len(chunks),
+        golden_set_ref=golden.golden_set_ref,
+        golden_n_cases=golden.n_cases,
+        golden_n_ai=golden.n_ai,
+        golden_n_human=golden.n_human,
+    )
