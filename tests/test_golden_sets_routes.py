@@ -55,7 +55,8 @@ async def _seed_tenant(admin_pool: Pool, name: str) -> UUID:
 async def _seed_user(admin_pool: Pool, tenant_id: UUID, email: str, system_roles: list[str]) -> UUID:
     async with admin_pool.connection() as conn:
         cur = await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s) RETURNING id",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) "
+            "VALUES (%s, %s, %s, %s) RETURNING id",
             (str(tenant_id), email, "not-a-real-hash", system_roles),
         )
         row = await cur.fetchone()

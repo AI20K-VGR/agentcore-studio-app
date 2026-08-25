@@ -305,13 +305,18 @@ async def list_users() -> list[UserSummary]:
     require_admin(identity.system_roles)
 
     cur = await conn.execute(
-        "SELECT id, email, system_roles, is_active, created_at FROM core.users WHERE tenant_id = %s ORDER BY created_at DESC",
+        "SELECT id, email, system_roles, is_active, created_at FROM core.users "
+        "WHERE tenant_id = %s ORDER BY created_at DESC",
         (str(identity.tenant_id),),
     )
     rows = await cur.fetchall()
     return [
         UserSummary(
-            user_id=str(row[0]), email=row[1], system_roles=list(row[2]), is_active=row[3], created_at=row[4].isoformat()
+            user_id=str(row[0]),
+            email=row[1],
+            system_roles=list(row[2]),
+            is_active=row[3],
+            created_at=row[4].isoformat(),
         )
         for row in rows
     ]
@@ -373,7 +378,8 @@ async def update_user_roles(user_id: str, body: UpdateUserRolesRequest) -> UserS
         raise HTTPException(status_code=400, detail="roles không được rỗng.")
 
     cur = await conn.execute(
-        "UPDATE core.users SET system_roles = %s WHERE id = %s RETURNING id, email, system_roles, is_active, created_at",
+        "UPDATE core.users SET system_roles = %s WHERE id = %s "
+        "RETURNING id, email, system_roles, is_active, created_at",
         (body.system_roles, user_id),
     )
     row = await cur.fetchone()

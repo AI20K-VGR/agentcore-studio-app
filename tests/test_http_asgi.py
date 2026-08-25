@@ -410,7 +410,9 @@ async def test_demoted_admin_stale_jwt_cannot_create_user_through_real_http(
     # Demote NGOÀI luồng API — JWT vừa phát ở trên KHÔNG hề biết chuyện này xảy ra, vẫn mang
     # "admin" trong chữ ký của nó tới lúc hết hạn tự nhiên.
     async with admin_pool.connection() as conn:
-        await conn.execute("UPDATE core.users SET system_roles = %s WHERE email = %s", (["public"], "soon-demoted@acme.com"))
+        await conn.execute(
+            "UPDATE core.users SET system_roles = %s WHERE email = %s", (["public"], "soon-demoted@acme.com")
+        )
 
     res = await client.post(
         "/api/admin/users",
@@ -450,7 +452,8 @@ async def test_rehomed_admin_stale_jwt_creates_user_in_fresh_tenant_not_stale_on
         assert row is not None
         tenant_b = row[0]
         cur = await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s) RETURNING id",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) "
+            "VALUES (%s, %s, %s, %s) RETURNING id",
             (tenant_a, "soon-rehomed@acme.com", hash_password("rehomed-admin-password"), ["admin", "public"]),
         )
         row = await cur.fetchone()

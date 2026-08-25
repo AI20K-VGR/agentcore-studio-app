@@ -36,7 +36,8 @@ async def test_app_role_can_dml_core_users_after_grant(admin_pool: Pool, pool: P
 
     async with pool.connection() as conn:
         cur = await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s) RETURNING id",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) "
+            "VALUES (%s, %s, %s, %s) RETURNING id",
             (tenant_id, "dml-probe@example.com", hash_password("whatever"), ["admin"]),
         )
         inserted = await cur.fetchone()

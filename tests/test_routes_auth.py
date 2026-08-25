@@ -281,7 +281,8 @@ async def test_login_rejects_deactivated_user(admin_pool: Pool, monkeypatch: pyt
         assert row is not None
         tenant_id = row[0]
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles, is_active) VALUES (%s, %s, %s, %s, false)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles, is_active) "
+            "VALUES (%s, %s, %s, %s, false)",
             (tenant_id, "deactivated@acme.com", hash_password("correct-horse-battery-staple"), ["public"]),
         )
 
@@ -470,7 +471,8 @@ async def test_fetch_fresh_identity_rejects_deactivated_account(admin_pool: Pool
         assert row is not None
         tenant_id = row[0]
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles, is_active) VALUES (%s, %s, %s, %s, false)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles, is_active) "
+            "VALUES (%s, %s, %s, %s, false)",
             (tenant_id, "deactivated@acme.com", hash_password("whatever"), ["admin"]),
         )
 
@@ -510,7 +512,8 @@ async def test_change_own_password_rejects_deactivated_account(
         assert row is not None
         tenant_id = row[0]
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles, is_active) VALUES (%s, %s, %s, %s, false)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles, is_active) "
+            "VALUES (%s, %s, %s, %s, false)",
             (tenant_id, "deact-pw@acme.com", hash_password("old-password-123"), ["admin"]),
         )
 
@@ -543,7 +546,8 @@ async def test_login_does_not_leak_reserved_role_name_from_legacy_section(
         assert row is not None
         tenant_id = row[0]
         cur = await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s) RETURNING id",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) "
+            "VALUES (%s, %s, %s, %s) RETURNING id",
             (tenant_id, "admin-legacy-sa@acme.com", hash_password("password-123"), ["admin"]),
         )
         admin_row = await cur.fetchone()
