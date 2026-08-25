@@ -37,8 +37,20 @@ CREATE SCHEMA IF NOT EXISTS obs;
 CREATE TABLE IF NOT EXISTS core.tenants (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name TEXT NOT NULL UNIQUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    is_active BOOLEAN NOT NULL DEFAULT true
 );
+
+-- Đường thứ hai cho DB đã tồn tại từ trước cột này (app#75) — `CREATE TABLE IF NOT EXISTS` ở trên
+-- là no-op trên bảng đã có, y hệt lý do đã ghi cho `core.users.is_active` bên dưới. `DEFAULT true`
+-- an toàn trên bảng đã có dữ liệu: mọi công ty đang tồn tại coi như đang hoạt động.
+--
+-- CỐ Ý không có `DELETE /api/admin/companies` đối xứng: `core.users.created_by` và
+-- `core.sections.created_by` cùng `REFERENCES core.users(id)` KHÔNG `ON DELETE CASCADE`, nên xoá
+-- cứng 1 tenant sẽ vỡ FK y hệt ca đã gặp ở `routes/admin.py::deactivate_user`. Tạm khoá + đổi tên
+-- (`PATCH /api/admin/companies/{tenant_id}`) là đường duy nhất để dọn 1 công ty tạo nhầm — quyết
+-- định D3 ở app#75.
+ALTER TABLE core.tenants ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true;
 
 -- Auth thật (Kế hoạch 3, xem routes/auth.py) — đường đăng nhập DUY NHẤT (registry demo
 -- _DEMO_ACCOUNTS/demo-login đã bị xoá hẳn, không còn song song với đường này). Không RLS theo

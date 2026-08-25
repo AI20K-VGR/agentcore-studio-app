@@ -267,6 +267,13 @@ class CompanySummary(BaseModel):
     tenant_id: str
     name: str
     created_at: str
+    is_active: bool
+    user_count: int
+    section_count: int
+    """`user_count`/`section_count` trả KÈM ở đây thay vì tách endpoint thống kê riêng (quyết định
+    D4, app#75): danh sách công ty của UI superadmin cần đúng 2 con số này trên MỖI dòng, nên tách
+    ra sẽ thành N+1 round-trip cho đúng dữ liệu 1 màn hình. Hai subquery tương quan dưới đây chạy
+    trên `core.users.tenant_id`/`core.sections.tenant_id` (đều là FK có index)."""
 
 
 @router.get("/companies", response_model=list[CompanySummary])
@@ -279,10 +286,23 @@ async def list_companies() -> list[CompanySummary]:
     require_superadmin(identity.system_roles)
 
     cur = await conn.execute(
-        "SELECT id, name, created_at FROM core.tenants WHERE name != '__system__' ORDER BY created_at DESC"
+        "SELECT t.id, t.name, t.created_at, t.is_active, "
+        "(SELECT count(*) FROM core.users u WHERE u.tenant_id = t.id), "
+        "(SELECT count(*) FROM core.sections sec WHERE sec.tenant_id = t.id) "
+        "FROM core.tenants t WHERE t.name != '__system__' ORDER BY t.created_at DESC"
     )
     rows = await cur.fetchall()
-    return [CompanySummary(tenant_id=str(row[0]), name=row[1], created_at=row[2].isoformat()) for row in rows]
+    return [
+        CompanySummary(
+            tenant_id=str(row[0]),
+            name=row[1],
+            created_at=row[2].isoformat(),
+            is_active=row[3],
+            user_count=row[4],
+            section_count=row[5],
+        )
+        for row in rows
+    ]
 
 
 class UserSummary(BaseModel):
@@ -435,4 +455,239 @@ async def reactivate_user(user_id: str) -> UserSummary:
     assert row is not None
     return UserSummary(
         user_id=str(row[0]), email=row[1], system_roles=list(row[2]), is_active=row[3], created_at=row[4].isoformat()
+    )
+
+
+# ---------------------------------------------------------------------------
+# app#75 — 4 endpoint superadmin thao tác VÀO TRONG 1 công ty đã tạo.
+#
+# Trước bản này, superadmin chỉ có đường ĐI VÀO (`POST /companies`) mà không có đường ĐI RA: mọi
+# route quản user (`list_users`/`update_user_roles`/`deactivate_user`/`reactivate_user`) đều scope
+# theo `identity.tenant_id` của NGƯỜI GỌI, mà superadmin đứng ở tenant `__system__` — nên họ không
+# xem nổi danh sách tài khoản của công ty nào, `create_user` lại chặn thẳng họ bằng 400 ("Superadmin
+# không thuộc công ty nào"). Hệ quả: 1 công ty mất tài khoản admin (quên mật khẩu / nghỉ việc) là
+# hỏng vĩnh viễn, chỉ chữa được bằng SQL tay — `core.tenants.name` UNIQUE nên tạo lại cũng 409.
+#
+# 4 route dưới đây nhận `tenant_id` TRÊN URL. Đây là ngoại lệ CÓ CHỦ ĐÍCH với INV-1 ("không tin
+# tenant_id client tự khai", `routes/runs.py:49-52`), đúng cùng lý do đã ghi cho
+# `CreateSectionRequest.tenant_id` (`routes/sections.py`): người gọi là superadmin, họ KHÔNG có
+# "tenant của session" nào để mặc định. Chỉ hợp lệ vì cả 4 đều `require_superadmin`, không phải
+# "bất kỳ ai đã đăng nhập".
+# ---------------------------------------------------------------------------
+
+
+async def _resolve_company(conn: AsyncConnection[Any], tenant_id: str) -> UUID:
+    """Parse UUID rồi khẳng định tenant đó tồn tại VÀ không phải `__system__` — dùng chung cho cả 4
+    route dưới.
+
+    Parse UUID TRƯỚC khi query: chuỗi sai định dạng đi thẳng vào `WHERE id = %s` (cột UUID) làm
+    psycopg raise lỗi cú pháp CHƯA BẮT ⇒ 500 thay vì 400 rõ ràng (bug đã sửa 1 lần ở
+    `routes/documents.py`, review app#27 finding #2, và `routes/sections.py` đã theo khuôn này).
+
+    Loại `__system__` ở ĐÂY, không phải ở từng route: tenant hệ thống là chỗ superadmin tự đứng
+    (`scripts/seed_superadmin.py`), cho phép thao tác vào nó nghĩa là superadmin tự đổi tên/tự tạm
+    khoá chính tenant của mình — tạm khoá `__system__` sẽ khoá cứng MỌI superadmin ra khỏi hệ thống
+    ngay lập tức (`authz.fetch_fresh_identity` giờ kiểm cả `core.tenants.is_active`), không route
+    nào mở lại được."""
+    try:
+        UUID(tenant_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"tenant_id không phải UUID hợp lệ: {tenant_id!r}") from exc
+
+    cur = await conn.execute(
+        "SELECT id FROM core.tenants WHERE id = %s AND name != '__system__'",
+        (tenant_id,),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"công ty {tenant_id!r} không tồn tại")
+    return UUID(str(row[0]))
+
+
+async def _fetch_user_in_company(conn: AsyncConnection[Any], user_id: str, tenant_id: UUID) -> None:
+    """Bản superadmin của `_fetch_user_in_own_tenant` — cùng lý do trả 404 (không phải 403) khi
+    `user_id` không thuộc công ty đang thao tác: không xác nhận/phủ nhận id đó có tồn tại ở công ty
+    KHÁC hay không."""
+    try:
+        UUID(user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"user_id không phải UUID hợp lệ: {user_id!r}") from exc
+
+    cur = await conn.execute(
+        "SELECT 1 FROM core.users WHERE id = %s AND tenant_id = %s",
+        (user_id, str(tenant_id)),
+    )
+    if await cur.fetchone() is None:
+        raise HTTPException(status_code=404, detail=f"user_id {user_id!r} không thuộc công ty này")
+
+
+@router.get("/companies/{tenant_id}/users", response_model=list[UserSummary])
+async def list_company_users(tenant_id: str) -> list[UserSummary]:
+    """Superadmin xem danh sách tài khoản của MỘT công ty bất kỳ — song song với `list_users`
+    (company-admin xem công ty CHÍNH MÌNH). Cùng `UserSummary`, nên cùng đảm bảo không có
+    `password`/`password_hash` trong response."""
+    session = get_request_session()
+    conn = get_request_connection()
+    identity = await fetch_fresh_identity(conn, session.user)
+    require_superadmin(identity.system_roles)
+    target_tenant_id = await _resolve_company(conn, tenant_id)
+
+    cur = await conn.execute(
+        "SELECT id, email, system_roles, is_active, created_at FROM core.users "
+        "WHERE tenant_id = %s ORDER BY created_at DESC",
+        (str(target_tenant_id),),
+    )
+    rows = await cur.fetchall()
+    return [
+        UserSummary(
+            user_id=str(row[0]),
+            email=row[1],
+            system_roles=list(row[2]),
+            is_active=row[3],
+            created_at=row[4].isoformat(),
+        )
+        for row in rows
+    ]
+
+
+class AddCompanyAdminRequest(BaseModel):
+    email: str
+    password: str = Field(min_length=8)
+    # KHÔNG có `system_roles`: route này chỉ tạo ADMIN, cố định `["admin"]` — đúng hình dạng
+    # `create_company` seed admin đầu tiên. Gán role nội dung cho nhân viên vẫn là việc của
+    # company-admin qua `POST /api/admin/users` (superadmin không quản taxonomy người của 1 công
+    # ty, chỉ mở lại được cánh cửa admin khi công ty mất nó).
+
+    _validate_password = field_validator("password")(reject_oversized_password)
+    _normalize_email = field_validator("email")(normalize_email)
+
+
+@router.post("/companies/{tenant_id}/admins", response_model=CreateUserResponse)
+async def add_company_admin(tenant_id: str, body: AddCompanyAdminRequest) -> CreateUserResponse:
+    """Thêm 1 admin cho công ty ĐÃ CÓ — đường phục hồi cho ca "công ty còn đúng 1 admin và admin đó
+    nghỉ việc". Không có route nào khác làm được việc này: `create_company` 409 vì
+    `core.tenants.name` UNIQUE, `create_user` 400 vì superadmin không thuộc công ty nào."""
+    session = get_request_session()
+    conn = get_request_connection()
+    identity = await fetch_fresh_identity(conn, session.user)
+    require_superadmin(identity.system_roles)
+    target_tenant_id = await _resolve_company(conn, tenant_id)
+
+    # bcrypt (~200-370ms, CPU-bound đồng bộ) chạy SAU mọi kiểm tra quyền/tồn tại ở trên — fail-fast,
+    # không tốn băm cho request sẽ bị 403/404 dù sao (cùng thứ tự `create_user` đã chốt ở đợt 8).
+    password_hash = await run_in_threadpool(hash_password, body.password)
+
+    try:
+        async with conn.transaction():
+            cur = await conn.execute(
+                "INSERT INTO core.users (tenant_id, email, password_hash, system_roles, created_by) "
+                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                (str(target_tenant_id), body.email, password_hash, ["admin"], identity.id),
+            )
+    except psycopg.errors.UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail=f"email {body.email!r} đã tồn tại") from exc
+    row = await cur.fetchone()
+    assert row is not None
+
+    return CreateUserResponse(
+        user_id=str(row[0]), email=body.email, tenant_id=str(target_tenant_id), system_roles=["admin"]
+    )
+
+
+class ResetPasswordRequest(BaseModel):
+    new_password: str = Field(min_length=8)
+    # Superadmin GÕ TAY mật khẩu mới, hệ thống KHÔNG sinh mật khẩu tạm (quyết định D1, app#75):
+    # mật khẩu tạm chỉ an toàn khi có cờ "bắt đổi ở lần đăng nhập đầu", mà `core.users` chưa có cột
+    # đó — thêm cột cho 1 tính năng chưa dùng là phình phạm vi. Cờ đó tách thành việc riêng.
+
+    _validate_password = field_validator("new_password")(reject_oversized_password)
+
+
+@router.post("/companies/{tenant_id}/users/{user_id}/reset-password", status_code=204)
+async def reset_company_user_password(tenant_id: str, user_id: str, body: ResetPasswordRequest) -> None:
+    """Đặt lại mật khẩu cho 1 tài khoản trong công ty — đường phục hồi cho ca "admin công ty quên
+    mật khẩu" (`routes/auth.py::change_own_password` bắt buộc `old_password`, nên chính người quên
+    không dùng được nó).
+
+    Ghi `password_changed_at = now()` CÙNG lúc ghi hash mới, y hệt `change_own_password` — không
+    phải để tiện, mà vì `authz.fetch_fresh_identity` so cột này với `iat` của JWT đang gọi: thiếu
+    nó thì mọi JWT cấp TRƯỚC lần reset vẫn sống nguyên tới hết `jwt_expire_minutes` (mặc định 480
+    phút). Reset mật khẩu thường xảy ra ĐÚNG lúc nghi tài khoản bị chiếm — để hở nửa đó thì thao
+    tác này gần như vô nghĩa."""
+    session = get_request_session()
+    conn = get_request_connection()
+    identity = await fetch_fresh_identity(conn, session.user)
+    require_superadmin(identity.system_roles)
+    target_tenant_id = await _resolve_company(conn, tenant_id)
+    await _fetch_user_in_company(conn, user_id, target_tenant_id)
+
+    password_hash = await run_in_threadpool(hash_password, body.new_password)
+    await conn.execute(
+        "UPDATE core.users SET password_hash = %s, password_changed_at = now() WHERE id = %s",
+        (password_hash, user_id),
+    )
+
+
+class UpdateCompanyRequest(BaseModel):
+    name: str | None = None
+    is_active: bool | None = None
+
+    _validate_name = field_validator("name")(reject_blank)
+
+
+@router.patch("/companies/{tenant_id}", response_model=CompanySummary)
+async def update_company(tenant_id: str, body: UpdateCompanyRequest) -> CompanySummary:
+    """Đổi tên công ty và/hoặc tạm khoá — hai việc gộp 1 route vì cùng là "sửa 1 dòng
+    `core.tenants`" và UI làm chúng từ cùng 1 màn hình chi tiết.
+
+    KHÔNG có `DELETE` đối xứng (quyết định D3, app#75): `core.users.created_by` và
+    `core.sections.created_by` cùng `REFERENCES core.users(id)` không `ON DELETE CASCADE`, xoá cứng
+    1 tenant vỡ FK y ca đã gặp ở `deactivate_user`. Đổi tên + tạm khoá đủ để dọn 1 công ty tạo
+    nhầm — và giữ nguyên audit trail.
+
+    Tạm khoá chặn ĐƯỢC CẢ JWT CŨ, không chỉ đăng nhập mới (quyết định D2): `authz.
+    fetch_fresh_identity` JOIN sang `core.tenants` và 403 khi `is_active = false`, `routes/auth.py::
+    login` kiểm cùng cột. Chặn riêng ở `login` là lặp lại đúng lỗ đã trả giá 1 lần cho `is_active`
+    của user (xem docstring `deactivate_user`)."""
+    session = get_request_session()
+    conn = get_request_connection()
+    identity = await fetch_fresh_identity(conn, session.user)
+    require_superadmin(identity.system_roles)
+    target_tenant_id = await _resolve_company(conn, tenant_id)
+
+    if body.name is None and body.is_active is None:
+        # `PATCH {}` không phải no-op im lặng — client gửi body rỗng gần như luôn là bug phía client
+        # (quên map field), trả 400 để nó vỡ ra ngay thay vì "200 nhưng chẳng đổi gì".
+        raise HTTPException(status_code=400, detail="Cần ít nhất 1 trong 2 trường: name, is_active.")
+
+    try:
+        if body.name is not None:
+            await conn.execute(
+                "UPDATE core.tenants SET name = %s WHERE id = %s",
+                (body.name, str(target_tenant_id)),
+            )
+        if body.is_active is not None:
+            await conn.execute(
+                "UPDATE core.tenants SET is_active = %s WHERE id = %s",
+                (body.is_active, str(target_tenant_id)),
+            )
+    except psycopg.errors.UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail=f"công ty {body.name!r} đã tồn tại") from exc
+
+    cur = await conn.execute(
+        "SELECT t.id, t.name, t.created_at, t.is_active, "
+        "(SELECT count(*) FROM core.users u WHERE u.tenant_id = t.id), "
+        "(SELECT count(*) FROM core.sections sec WHERE sec.tenant_id = t.id) "
+        "FROM core.tenants t WHERE t.id = %s",
+        (str(target_tenant_id),),
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    return CompanySummary(
+        tenant_id=str(row[0]),
+        name=row[1],
+        created_at=row[2].isoformat(),
+        is_active=row[3],
+        user_count=row[4],
+        section_count=row[5],
     )

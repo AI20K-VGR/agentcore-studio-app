@@ -146,7 +146,7 @@ async def login(body: LoginRequest, request: Request) -> LoginResponse:
 
     conn = get_request_connection()
     cur = await conn.execute(
-        "SELECT u.tenant_id, u.password_hash, u.system_roles, u.is_active, t.name "
+        "SELECT u.tenant_id, u.password_hash, u.system_roles, u.is_active, t.name, t.is_active "
         "FROM core.users u JOIN core.tenants t ON t.id = u.tenant_id WHERE u.email = %s",
         (body.email,),
     )
@@ -156,12 +156,20 @@ async def login(body: LoginRequest, request: Request) -> LoginResponse:
     password_ok = await run_in_threadpool(verify_password, body.password, password_hash)
     # `is_active` kiểm SAU verify_password, không trước — cả 2 nhánh (active/inactive) đã tốn đúng
     # 1 lần bcrypt như nhau, không mở oracle mới (thời gian/status code) phân biệt "tài khoản bị vô
-    # hiệu hoá" với "sai mật khẩu"; cả 3 lý do thất bại (không tồn tại/sai mật khẩu/bị vô hiệu hoá)
-    # trả CÙNG 401, cùng thông điệp — đúng nguyên tắc chống oracle đã áp cho email/mật khẩu.
-    if row is None or not password_ok or not row[3]:
+    # hiệu hoá" với "sai mật khẩu"; cả 4 lý do thất bại (không tồn tại/sai mật khẩu/tài khoản bị vô
+    # hiệu hoá/CÔNG TY bị tạm khoá) trả CÙNG 401, cùng thông điệp — đúng nguyên tắc chống oracle đã
+    # áp cho email/mật khẩu.
+    #
+    # `row[5]` (`core.tenants.is_active`, app#75) là NỬA THỨ HAI của việc tạm khoá công ty, không
+    # phải nửa duy nhất: chặn ở đây chỉ chặn được lần đăng nhập TIẾP THEO, mọi JWT cấp TRƯỚC lúc
+    # tạm khoá vẫn sống tới hết `jwt_expire_minutes` (mặc định 480 phút). Nửa còn lại — và là nửa
+    # quan trọng hơn — nằm ở `authz.fetch_fresh_identity` (quyết định D2, app#75). Cùng cặp
+    # login/fetch_fresh_identity đã phải vá 2 lần cho `core.users.is_active`; đừng để nửa nào
+    # đứng một mình.
+    if row is None or not password_ok or not row[3] or not row[5]:
         raise HTTPException(status_code=401, detail="Email hoặc mật khẩu không đúng.")
 
-    tenant_id, _password_hash, roles, _is_active, tenant_name = row
+    tenant_id, _password_hash, roles, _is_active, tenant_name, _tenant_is_active = row
     effective_roles = list(roles)
     if "admin" in effective_roles:
         # Admin công ty = quyền cao nhất TRONG tenant đó — mặc định thấy MỌI nội dung KB, không
