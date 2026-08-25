@@ -360,7 +360,7 @@ def test_overlay_bo_cu_rong_thi_ra_dung_bo_vua_nap() -> None:
     assert n_kept == 0
 
 
-async def test_regenerate_dung_lai_bo_ma_khong_can_nap_tai_lieu(admin_pool: Pool) -> None:
+async def test_regenerate_rebuilds_without_uploading_a_document(admin_pool: Pool) -> None:
     """`POST /regenerate` — dựng lại bộ của một phòng ban từ tài liệu ĐANG CÓ.
 
     Trước route này, đường sinh máy chỉ chạy như tác dụng phụ của việc nạp tài liệu. Một tenant đã
@@ -385,7 +385,7 @@ async def test_regenerate_dung_lai_bo_ma_khong_can_nap_tai_lieu(admin_pool: Pool
     assert result.n_ai == result.n_cases and result.n_human == 0
 
 
-async def test_regenerate_GIU_case_nguoi_dung_tu_viet(admin_pool: Pool) -> None:
+async def test_regenerate_KEEPS_user_written_cases(admin_pool: Pool) -> None:
     """Vế đắt, và là hợp đồng mà cả form nhập tay lẫn file mẫu đứng lên trên.
 
     `golden_autogen` sinh lại phần máy và **chỉ giữ** case `source="human"`. Nếu vế này hỏng thì mọi
@@ -432,7 +432,7 @@ async def test_regenerate_GIU_case_nguoi_dung_tu_viet(admin_pool: Pool) -> None:
     assert after.n_human == 1, "case người dùng tự viết bị xoá khi dựng lại"
 
 
-async def test_regenerate_tu_choi_phong_ban_khong_co_that(admin_pool: Pool) -> None:
+async def test_regenerate_rejects_unknown_section(admin_pool: Pool) -> None:
     """400 kèm danh sách phòng ban hợp lệ, không phải 500 — người gõ sai tên phòng ban tự sửa được."""
     tenant_id = await _seed_tenant(admin_pool, f"regen-x-{uuid4().hex[:8]}")
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@regenx.test", ["admin"])
@@ -448,3 +448,106 @@ async def test_regenerate_tu_choi_phong_ban_khong_co_that(admin_pool: Pool) -> N
 
     assert raised.value.status_code == 400
     assert "hr" in str(raised.value.detail)
+
+
+async def test_regenerate_superadmin_without_tenant_id_returns_400(admin_pool: Pool) -> None:
+    """Superadmin không có tenant mặc định — JWT của họ trỏ `__system__`, không phải một công ty
+    thật. Thiếu `tenant_id` phải là 400 chứ không phải im lặng dựng lại cho tenant hệ thống."""
+    tenant_id = await _seed_tenant(admin_pool, f"regen-sa-{uuid4().hex[:8]}")
+    await _seed_user(admin_pool, tenant_id, "root@sys.test", ["superadmin"])
+
+    token = _set_session(tenant_id=tenant_id, user="root@sys.test", system_roles=["superadmin"])
+    try:
+        async with _simulate_request_connection():
+            with pytest.raises(HTTPException) as raised:
+                await regenerate_golden_set(RegenerateRequest(section_role="hr"))
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert raised.value.status_code == 400
+    assert "tenant_id" in str(raised.value.detail)
+
+
+async def test_regenerate_company_admin_declaring_other_tenant_returns_403(admin_pool: Pool) -> None:
+    """Hàng rào tenant trên đường DỰNG LẠI. Route này ghi đè cả bộ golden của một phòng ban, nên
+    một company-admin dựng lại hộ tenant khác là xoá dữ liệu chấm điểm của công ty đó."""
+    tenant_a = await _seed_tenant(admin_pool, f"regen-a-{uuid4().hex[:8]}")
+    tenant_b = await _seed_tenant(admin_pool, f"regen-b-{uuid4().hex[:8]}")
+    admin_a = await _seed_user(admin_pool, tenant_a, "admin@a.test", ["admin"])
+    await _seed_section(admin_pool, tenant_a, "hr", admin_a)
+
+    token = _set_session(tenant_id=tenant_a, user="admin@a.test", system_roles=["admin"])
+    try:
+        async with _simulate_request_connection():
+            with pytest.raises(HTTPException) as raised:
+                await regenerate_golden_set(RegenerateRequest(section_role="hr", tenant_id=str(tenant_b)))
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert raised.value.status_code == 403
+
+
+async def test_regenerate_unknown_tenant_returns_404_not_400_about_section(admin_pool: Pool) -> None:
+    """Review app#71: thứ tự hai phép kiểm quyết định người đọc lỗi đi sửa chỗ nào.
+
+    Tenant không tồn tại thì MỌI phòng ban đều "không hợp lệ", nên kiểm phòng ban trước sẽ trả một
+    câu 400 chỉ sai chỗ — người dùng đi sửa tên phòng ban trong khi lỗi nằm ở `tenant_id`."""
+    tenant_id = await _seed_tenant(admin_pool, f"regen-404-{uuid4().hex[:8]}")
+    await _seed_user(admin_pool, tenant_id, "root404@sys.test", ["superadmin"])
+
+    token = _set_session(tenant_id=tenant_id, user="root404@sys.test", system_roles=["superadmin"])
+    try:
+        async with _simulate_request_connection():
+            with pytest.raises(HTTPException) as raised:
+                await regenerate_golden_set(
+                    RegenerateRequest(section_role="hr", tenant_id="00000000-0000-0000-0000-000000000000")
+                )
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert raised.value.status_code == 404, f"phải 404 về tenant, thấy {raised.value.status_code}"
+
+
+async def test_read_only_paths_still_work_when_embedding_provider_is_BROKEN(
+    admin_pool: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Đường dựng-lại/liệt-kê/xoá phải sống được khi provider embedding hỏng hoặc thiếu key.
+
+    Đây là bài **còn thiếu** khiến defect tái phát: `documents.py` đã đổi sang `ReadOnlyEmbedding`
+    từ app#68, nhưng không bài nào phủ đường đó, nên route `regenerate` viết sau đó dùng lại
+    `build_embedding` mà mọi thứ vẫn xanh (review app#71, Dozyboy). Tôi gieo mutant để chắc: đổi
+    ngược về `build_embedding` → 17 bài **vẫn xanh**.
+
+    Phát biểu bằng HÀNH VI, không bằng "route phải dùng class X": *nếu `build_embedding` ném thì ba
+    đường này vẫn phải chạy*. Đó mới là điều người vận hành cần — và nó đúng vào lúc cần nhất, khi
+    provider đang hỏng thì dựng lại bộ hoặc xoá tài liệu là đường thoát hiểm."""
+    from studio_app.providers import factory as factory_module
+    from studio_app.routes import documents as documents_module
+    from studio_app.routes import golden_sets as golden_sets_module
+
+    def _boom() -> object:
+        raise HTTPException(status_code=503, detail="STUDIO_OPENROUTER_API_KEY thiếu (mô phỏng)")
+
+    # Vá ở CẢ ba chỗ tên có thể được tra: module gốc và hai route đã `from … import` vào namespace
+    # riêng. Chỉ vá module gốc thì một route đã bind sẵn tên sẽ lọt qua bài này.
+    for mod in (factory_module, documents_module, golden_sets_module):
+        monkeypatch.setattr(mod, "build_embedding", _boom, raising=False)
+
+    tenant_id = await _seed_tenant(admin_pool, f"noembed-{uuid4().hex[:8]}")
+    admin_id = await _seed_user(admin_pool, tenant_id, "admin@noembed.test", ["admin"])
+    await _seed_section(admin_pool, tenant_id, "hr", admin_id)
+
+    token = _set_session(tenant_id=tenant_id, user="admin@noembed.test", system_roles=["admin"])
+    try:
+        async with _simulate_request_connection():
+            listed = await documents_module.list_documents(tenant_id=None)
+            regenerated = await golden_sets_module.regenerate_golden_set(RegenerateRequest(section_role="hr"))
+            deleted = await documents_module.delete_documents(
+                documents_module.DeleteDocumentsRequest(ids=["khong-co-that"]), tenant_id=None
+            )
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert listed.documents == []
+    assert regenerated.n_cases == 0, "tenant chưa có tài liệu nên bộ rỗng — điều cần đo là KHÔNG ném 503"
+    assert deleted.not_found == ["khong-co-that"]

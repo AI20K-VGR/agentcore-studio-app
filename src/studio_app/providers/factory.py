@@ -132,3 +132,30 @@ def build_tool_dispatch(whitelist: list[str]) -> ToolDispatch:
     qua constructor-DI, không tự gọi bên trong (bắt buộc để CI/golden-set reproducible, `kit#67`
     Z4/D03)."""
     return RealToolDispatch(whitelist, clock=lambda: datetime.now(UTC))
+
+
+class ReadOnlyEmbedding:
+    """`EmbeddingService` giả cho MỌI đường chỉ đọc/xoá cần một `KbPipeline`.
+
+    Ở cạnh `build_embedding` chứ không nằm trong một route: nó là **lựa chọn thay thế** cho hàm
+    đó, và để nó riêng trong `routes/documents.py` đã khiến route `regenerate` ở
+    `routes/golden_sets.py` tái phát đúng defect này (review app#71, Dozyboy) — người viết route
+    mới không có đường nào thấy nó tồn tại.
+
+    `KbPipeline` đòi một embedding ở constructor, nhưng `chunks_for_tenant`/`delete_by_doc_id`
+    không hề gọi tới nó. Dùng ``build_embedding`` thật ở đây là một defect có thật, không phải
+    chuyện thẩm mỹ: nó ném **503** khi `STUDIO_USE_FAKE_PROVIDERS=false` mà thiếu
+    `STUDIO_OPENROUTER_API_KEY` (`providers/factory.py`) — tức người quản trị sẽ không **xem** nổi
+    KB của mình, và không **xoá** nổi tài liệu nào, chỉ vì một provider chẳng liên quan chưa cấu
+    hình. Đường xoá là đường người ta cần nhất đúng lúc có sự cố.
+
+    Ném thay vì trả vector rỗng: nếu sau này ai thêm một lời gọi có embed vào hai route này, nó phải
+    đỏ ngay và chỉ thẳng chỗ, chứ không âm thầm ghi vector rác vào `kb.chunks`.
+    """
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        raise AssertionError(
+            f"_ReadOnlyEmbedding.embed() bị gọi với {len(texts)} chuỗi — đường đọc/xoá tài liệu "
+            "không được embed gì. Nếu route này giờ CẦN embed thật, dùng `build_embedding` và "
+            "cập nhật test_routes_embedding_wiring.py cho đúng số lời gọi."
+        )

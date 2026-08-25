@@ -69,7 +69,7 @@ from studio_app.authz import fetch_fresh_identity, fetch_tenant_section_names, r
 from studio_app.core._db import get_pool
 from studio_app.core.golden_autogen import regenerate_for_section
 from studio_app.middleware import get_request_connection, get_request_session
-from studio_app.providers.factory import build_embedding
+from studio_app.providers.factory import ReadOnlyEmbedding, build_embedding
 
 router = APIRouter(prefix="/api/admin/documents", tags=["documents"])
 
@@ -352,28 +352,6 @@ async def upload_document(
     )
 
 
-class _ReadOnlyEmbedding:
-    """`EmbeddingService` giả cho các đường **chỉ đọc/xoá** của tab Tài liệu.
-
-    `KbPipeline` đòi một embedding ở constructor, nhưng `chunks_for_tenant`/`delete_by_doc_id`
-    không hề gọi tới nó. Dùng ``build_embedding`` thật ở đây là một defect có thật, không phải
-    chuyện thẩm mỹ: nó ném **503** khi `STUDIO_USE_FAKE_PROVIDERS=false` mà thiếu
-    `STUDIO_OPENROUTER_API_KEY` (`providers/factory.py`) — tức người quản trị sẽ không **xem** nổi
-    KB của mình, và không **xoá** nổi tài liệu nào, chỉ vì một provider chẳng liên quan chưa cấu
-    hình. Đường xoá là đường người ta cần nhất đúng lúc có sự cố.
-
-    Ném thay vì trả vector rỗng: nếu sau này ai thêm một lời gọi có embed vào hai route này, nó phải
-    đỏ ngay và chỉ thẳng chỗ, chứ không âm thầm ghi vector rác vào `kb.chunks`.
-    """
-
-    async def embed(self, texts: list[str]) -> list[list[float]]:
-        raise AssertionError(
-            f"_ReadOnlyEmbedding.embed() bị gọi với {len(texts)} chuỗi — đường đọc/xoá tài liệu "
-            "không được embed gì. Nếu route này giờ CẦN embed thật, dùng `build_embedding` và "
-            "cập nhật test_routes_embedding_wiring.py cho đúng số lời gọi."
-        )
-
-
 def _display_name(doc_id: str, section_role: str) -> str:
     """Bỏ tiền tố phòng ban khỏi `doc_id` để ra tên tài liệu hiển thị.
 
@@ -399,7 +377,7 @@ async def list_documents(tenant_id: str | None = None) -> DocumentListResponse:
     require_admin(identity.system_roles)
     _, tenant_uuid = await _resolve_target_tenant(conn, identity, tenant_id, "xem tài liệu")
 
-    pipeline = KbPipeline(await get_pool(), _ReadOnlyEmbedding())
+    pipeline = KbPipeline(await get_pool(), ReadOnlyEmbedding())
     chunks = await pipeline.chunks_for_tenant(tenant_uuid)
 
     # Gom kèm `doc_name`: cột hiển thị kb#64 vừa thêm, giữ nguyên hoa/thường/dấu tiếng Việt. Lấy
@@ -449,7 +427,7 @@ async def delete_documents(body: DeleteDocumentsRequest, tenant_id: str | None =
     if not body.ids:
         raise HTTPException(status_code=400, detail="chưa chọn tài liệu nào để xoá")
 
-    pipeline = KbPipeline(await get_pool(), _ReadOnlyEmbedding())
+    pipeline = KbPipeline(await get_pool(), ReadOnlyEmbedding())
     deleted_chunks = 0
     deleted_documents: list[str] = []
     not_found: list[str] = []

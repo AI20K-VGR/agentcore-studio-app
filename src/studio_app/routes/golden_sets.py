@@ -37,7 +37,7 @@ from studio_app.authz import fetch_fresh_identity, fetch_tenant_section_names, r
 from studio_app.core._db import get_pool
 from studio_app.core.golden_autogen import regenerate_for_section
 from studio_app.middleware import get_request_connection, get_request_session
-from studio_app.providers.factory import build_embedding
+from studio_app.providers.factory import ReadOnlyEmbedding
 
 router = APIRouter(prefix="/api/admin/golden-sets", tags=["golden-sets"])
 
@@ -235,6 +235,16 @@ async def regenerate_golden_set(body: RegenerateRequest) -> RegenerateResponse:
             raise HTTPException(status_code=403, detail="company-admin chỉ dựng lại được cho tenant mình")
         tenant_uuid = identity.tenant_id
 
+    # Kiểm tenant TỒN TẠI trước, phòng ban sau — review app#71: superadmin gõ nhầm `tenant_id` mà
+    # nhận `400 "phòng ban không hợp lệ"` thì thông báo chỉ sai chỗ, và họ sẽ đi sửa tên phòng ban
+    # trong khi lỗi nằm ở tenant. Một tenant không tồn tại thì mọi phòng ban đều "không hợp lệ",
+    # nên thứ tự cũ biến 404 thành một nhánh gần như không bao giờ tới được.
+    cur = await conn.execute("SELECT name FROM core.tenants WHERE id = %s", (tenant_uuid,))
+    row = await cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"tenant {tenant_uuid} không tồn tại")
+    tenant_slug = str(row[0])
+
     valid = await fetch_tenant_section_names(conn, str(tenant_uuid))
     if body.section_role not in valid:
         raise HTTPException(
@@ -242,15 +252,17 @@ async def regenerate_golden_set(body: RegenerateRequest) -> RegenerateResponse:
             detail=f"phòng ban {body.section_role!r} không hợp lệ — chỉ chấp nhận {sorted(valid)}",
         )
 
-    pipeline = KbPipeline(await get_pool(), build_embedding())
+    # `ReadOnlyEmbedding`, KHÔNG `build_embedding` — review app#71 (Dozyboy) bắt đúng chỗ tôi tái
+    # phát defect đã tự vá ở `documents.py`. `regenerate_for_section` chỉ gọi `chunks_for_tenant`,
+    # không embed gì; còn `build_embedding` ném **503** khi thiếu `STUDIO_OPENROUTER_API_KEY`.
+    #
+    # Ở route này nó sai gấp đôi: "dựng lại bộ mà không cần nạp lại tài liệu" đúng là thứ người ta
+    # cần **lúc provider đang hỏng** — chặn nó bằng chính lỗi provider là chặn đường thoát hiểm.
+    pipeline = KbPipeline(await get_pool(), ReadOnlyEmbedding())
     async with conn.transaction():
         await conn.execute(sql.SQL("SET LOCAL app.tenant_id = {}").format(sql.Literal(str(tenant_uuid))))
-        cur = await conn.execute("SELECT name FROM core.tenants WHERE id = %s", (tenant_uuid,))
-        row = await cur.fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail=f"tenant {tenant_uuid} không có trong core.tenants")
         report = await regenerate_for_section(
-            conn, pipeline, tenant_id=tenant_uuid, tenant_slug=str(row[0]), section_role=body.section_role
+            conn, pipeline, tenant_id=tenant_uuid, tenant_slug=tenant_slug, section_role=body.section_role
         )
 
     return RegenerateResponse(
