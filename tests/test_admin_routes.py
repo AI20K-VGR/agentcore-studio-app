@@ -111,7 +111,8 @@ async def _seed_user_with_roles(admin_pool: Pool, tenant_id: UUID, email: str, s
     PATCH/DELETE `/api/admin/users/{id}`) — caller cũ không đọc giá trị trả về vẫn chạy đúng."""
     async with admin_pool.connection() as conn:
         cur = await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s) RETURNING id",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) "
+            "VALUES (%s, %s, %s, %s) RETURNING id",
             (str(tenant_id), email, "not-a-real-hash", system_roles),
         )
         row = await cur.fetchone()
@@ -217,7 +218,9 @@ async def test_create_user_rejects_role_outside_vocab(admin_pool: Pool) -> None:
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
-                await create_user(CreateUserRequest(email="typo@acme.com", password="password123", system_roles=["hrr"]))
+                await create_user(
+                    CreateUserRequest(email="typo@acme.com", password="password123", system_roles=["hrr"])
+                )
         assert exc_info.value.status_code == 400
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
@@ -232,7 +235,9 @@ async def test_non_admin_cannot_create_user(admin_pool: Pool) -> None:
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
-                await create_user(CreateUserRequest(email="another@acme.com", password="password123", system_roles=["public"]))
+                await create_user(
+                    CreateUserRequest(email="another@acme.com", password="password123", system_roles=["public"])
+                )
         assert exc_info.value.status_code == 403
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
@@ -360,7 +365,9 @@ async def test_superadmin_without_company_cannot_create_user(admin_pool: Pool) -
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
-                await create_user(CreateUserRequest(email="orphan@sys", password="password123", system_roles=["public"]))
+                await create_user(
+                    CreateUserRequest(email="orphan@sys", password="password123", system_roles=["public"])
+                )
         assert exc_info.value.status_code == 400
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
@@ -468,7 +475,9 @@ async def test_create_user_rejects_empty_roles(admin_pool: Pool) -> None:
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
-                await create_user(CreateUserRequest(email="no-system_roles@acme.com", password="password123", system_roles=[]))
+                await create_user(
+                    CreateUserRequest(email="no-system_roles@acme.com", password="password123", system_roles=[])
+                )
         assert exc_info.value.status_code == 400
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]

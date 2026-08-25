@@ -157,7 +157,8 @@ async def rename_section(section_id: str, body: RenameSectionRequest) -> Section
         assert updated is not None
 
         await conn.execute(
-            "UPDATE core.users SET system_roles = array_replace(system_roles, %s, %s) WHERE tenant_id = %s AND %s = ANY(system_roles)",
+            "UPDATE core.users SET system_roles = array_replace(system_roles, %s, %s) "
+            "WHERE tenant_id = %s AND %s = ANY(system_roles)",
             (old_name, body.name, tenant_id, old_name),
         )
 
