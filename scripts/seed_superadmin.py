@@ -86,7 +86,7 @@ async def seed_superadmin() -> None:
 
     async with admin.connection() as conn:
         cur = await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles, created_by) "
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles, created_by) "
             "VALUES (%s, %s, %s, %s, NULL) "
             "ON CONFLICT (email) DO NOTHING "
             "RETURNING id",
