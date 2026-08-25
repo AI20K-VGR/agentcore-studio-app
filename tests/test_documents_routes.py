@@ -128,6 +128,39 @@ async def test_upload_doc_id_la_slug_ten_file(admin_pool: Pool) -> None:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
 
     assert result.doc_id == "hr-bao-cao-q1"
+    # `doc_name` KHÔNG qua `_slugify` — giữ nguyên hoa/thường/khoảng trắng của tên file gốc, khác
+    # hẳn `doc_id`. Đây là điểm luật hiển thị đòi hỏi: `doc_id` mất thông tin (chữ hoa, khoảng
+    # trắng) nên không dùng được để hiện lên UI.
+    assert result.doc_name == "Bao Cao Q1"
+
+
+async def test_upload_luu_doc_name_vao_kb_chunks(admin_pool: Pool) -> None:
+    """`doc_name` phải lên CẢ cột `kb.chunks.doc_name`, không chỉ nằm trong response — nếu không
+    thì mọi đường đọc lại sau (list tài liệu, `chunks_for_tenant`) mất nhãn hiển thị, chỉ còn
+    `doc_id` (slug, cấm hiển thị thẳng lên UI). Giữ dấu tiếng Việt nguyên vẹn — đúng test chống
+    rỗng-nghĩa cho luật hiển thị."""
+    tenant_id = await _seed_tenant(admin_pool, "documents-probe-p")
+    admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+    await _seed_section(admin_pool, tenant_id, "hr", admin_id)
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
+    try:
+        async with _simulate_request_connection():
+            result = await upload_document(
+                file=_md_upload_file("Chế độ nghỉ phép.md", _VALID_MD),
+                section_role="hr",
+                tenant_id=None,
+            )
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert result.doc_name == "Chế độ nghỉ phép"
+
+    async with admin_pool.connection() as conn:
+        await conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(tenant_id),))
+        cur = await conn.execute("SELECT DISTINCT doc_name FROM kb.chunks WHERE tenant_id = %s", (str(tenant_id),))
+        rows = await cur.fetchall()
+    assert rows == [("Chế độ nghỉ phép",)]
 
 
 async def test_reupload_ten_trung_khac_phong_ban_khong_xoa_nham(admin_pool: Pool) -> None:
