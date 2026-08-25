@@ -21,13 +21,14 @@ from studio_app.routes import documents as documents_module
 from studio_app.routes.documents import upload_document
 from studio_workbench.tenant_wall import ResolvedContext
 
-_ROUTE_FILES = ("runs.py", "publish.py", "chat.py", "documents.py")
-# app#44: `runs.py` (`POST /api/runs`, đổi hẳn thành connectivity-check tĩnh, mục D
-# `PROJECT-SCOPE-DEMO-DAY30.md`) không còn chạm KB/LLM/embedding nào cả — `build_embedding()` rơi
-# khỏi wiring của nó, chỉ còn ĐÚNG cho việc kiểm "không nhắc CallistoStubEmbedding"/"không đọc env"
-# (2 test dưới, vẫn hợp lệ trên cả 4 file kể cả khi 1 file không dùng build_embedding). DoD 2 gốc
-# (app#30) chỉ còn thật cho 3 route sau.
-_EMBEDDING_WIRED_ROUTE_FILES = ("publish.py", "chat.py", "documents.py")
+_ROUTE_FILES = ("runs.py", "publish.py", "chat.py", "documents.py", "test_chat.py")
+# app#44: `runs.py` (`GET /api/runs/{run_id}`, chỉ đọc trace qua `PgTraceReader`) không còn chạm
+# KB/LLM/embedding nào cả — `build_embedding()` rơi khỏi wiring của nó, chỉ còn ĐÚNG cho việc kiểm
+# "không nhắc CallistoStubEmbedding"/"không đọc env" (2 test dưới, vẫn hợp lệ trên cả 5 file kể cả
+# khi 1 file không dùng build_embedding). `test_chat.py` (nút Test — chat thật trên draft) MỚI
+# thêm, cùng khuôn `publish.py`/`chat.py`: gọi `build_embedding()` đúng 1 lần để chạy
+# `run_agent_loop()` thật.
+_EMBEDDING_WIRED_ROUTE_FILES = ("publish.py", "chat.py", "documents.py", "test_chat.py")
 _ROUTES_DIR = Path(__file__).resolve().parents[1] / "src" / "studio_app" / "routes"
 
 
