@@ -116,6 +116,84 @@ async def _tenant_slug(conn: Any, tenant_id: UUID) -> str:
     return str(row[0])
 
 
+class DocumentSummary(BaseModel):
+    """Một tài liệu đã nạp, **theo góc nhìn người dùng**.
+
+    `id` cố ý không tên là `doc_id`: nó là khoá để gọi xoá, không phải thứ để hiển thị. Giao diện
+    vẽ `name`/`section_role`/`chunk_count` và **không bao giờ vẽ `id`** — người quản trị công ty
+    không có lý do gì phải đọc một giá trị cột trong `kb.chunks`, còn mỗi giá trị kỹ thuật lọt ra
+    màn hình là một thứ họ sẽ chép vào ticket rồi hỏi nó nghĩa là gì.
+
+    `name` là phần tên tài liệu đã slug hoá (bỏ tiền tố phòng ban khỏi `doc_id`). **Không phải tên
+    file gốc** — tên gốc hiện không được lưu ở đâu (`kb.chunks` chỉ có `doc_id`), nên đây là thứ
+    trung thực nhất server biết. Muốn hiện đúng `"Báo Cáo Q1.docx"` phải thêm cột ở `packages/kb`;
+    đã ghi issue riêng, không nhét vào đây.
+    """
+
+    id: str
+    name: str
+    section_role: str
+    chunk_count: int
+
+
+class DocumentListResponse(BaseModel):
+    documents: list[DocumentSummary]
+    total_chunks: int
+    """Tổng số đoạn của CẢ tenant. Khai riêng thay vì để giao diện tự cộng `documents`: dòng ghi
+    trước khi `kb.chunks` có cột `doc_id` không gom được vào tài liệu nào, nên hai số có thể lệch —
+    và một giao diện tự cộng ra số khác số thật là cách làm người dùng tưởng mất dữ liệu."""
+
+
+class DeleteDocumentsRequest(BaseModel):
+    ids: list[str]
+    """`DocumentSummary.id` của các tài liệu cần xoá. Nhận nhiều id một lần vì giao diện cho tích
+    chọn nhiều dòng — để client gọi tuần tự thì một lần lỗi giữa chừng sẽ để lại trạng thái nửa vời
+    mà người dùng không nhìn thấy được."""
+
+
+class DeleteDocumentsResponse(BaseModel):
+    deleted_chunks: int
+    deleted_documents: list[str]
+    not_found: list[str]
+    """Id gửi lên mà xoá được 0 đoạn. Khai riêng thay vì im lặng bỏ qua: dòng ghi TRƯỚC khi cột
+    `doc_id` tồn tại mang `NULL`, và `delete_by_doc_id` không đụng tới được (xem `schema.py` — chú
+    thích ở đó nói `re_index` phục hồi được, thực tế nó đọc lại `doc_id` từ DB rồi ghi y nguyên,
+    nên không phục hồi gì). Không có ô này thì người dùng bấm xoá, thấy báo thành công, tài liệu
+    vẫn còn nguyên."""
+
+
+_UNGROUPED_NAME = "(chưa gắn tài liệu)"
+"""Nhãn cho chunk có `doc_id` rỗng. Gom thành MỘT mục thay vì giấu đi: chúng chiếm chỗ thật trong
+`kb.chunks`, và một bảng đếm thiếu chúng sẽ khiến người dùng tưởng hệ thống làm mất dữ liệu."""
+
+
+async def _resolve_target_tenant(conn: Any, identity: Any, tenant_id: str | None, action: str) -> tuple[str, UUID]:
+    """Dual-gate tenant dùng chung cho cả ba route của tab Tài liệu — trước đây nằm riêng trong
+    `upload_document`. Tách ra vì `list_documents`/`delete_documents` phải áp **đúng** luật đó: một
+    route đọc hoặc xoá lỏng tay hơn route ghi là cách rò dữ liệu chéo tenant kinh điển.
+
+    Parse UUID TRƯỚC khi query giữ nguyên từ bản cũ (review app#27): parse sau thì chuỗi thô đi
+    thẳng vào `WHERE id = %s` trên cột UUID, psycopg raise lỗi cú pháp chưa bắt ⇒ 500 thay vì 400.
+    """
+    if "superadmin" in identity.system_roles:
+        if tenant_id is None:
+            raise HTTPException(status_code=400, detail=f"superadmin phải khai tenant_id để {action} cho công ty nào")
+        try:
+            tenant_uuid = UUID(tenant_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"tenant_id không phải UUID hợp lệ: {tenant_id!r}") from exc
+        cur = await conn.execute(
+            "SELECT 1 FROM core.tenants WHERE id = %s AND name != '__system__'",
+            (tenant_id,),
+        )
+        if await cur.fetchone() is None:
+            raise HTTPException(status_code=404, detail=f"tenant_id {tenant_id!r} không tồn tại")
+        return tenant_id, tenant_uuid
+    if tenant_id is not None and tenant_id != str(identity.tenant_id):
+        raise HTTPException(status_code=403, detail=f"company-admin chỉ {action} được cho tenant mình")
+    return str(identity.tenant_id), identity.tenant_id
+
+
 class UploadDocumentResponse(BaseModel):
     doc_id: str
     doc_name: str
@@ -147,30 +225,7 @@ async def upload_document(
     identity = await fetch_fresh_identity(conn, session.user)
     require_admin(identity.system_roles)
 
-    if "superadmin" in identity.system_roles:
-        if tenant_id is None:
-            raise HTTPException(
-                status_code=400, detail="superadmin phải khai tenant_id để upload tài liệu cho công ty nào"
-            )
-        # Parse UUID TRƯỚC khi query — review app#27 (dholmes0207): parse SAU query để chuỗi thô
-        # (vd "abc") đi thẳng vào `WHERE id = %s` trên cột UUID, psycopg raise lỗi cú pháp CHƯA BẮT
-        # ⇒ 500 thay vì 400 mà nhánh except bên dưới chuẩn bị sẵn.
-        try:
-            tenant_uuid = UUID(tenant_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=f"tenant_id không phải UUID hợp lệ: {tenant_id!r}") from exc
-        target_tenant_id = tenant_id
-        cur = await conn.execute(
-            "SELECT 1 FROM core.tenants WHERE id = %s AND name != '__system__'",
-            (target_tenant_id,),
-        )
-        if await cur.fetchone() is None:
-            raise HTTPException(status_code=404, detail=f"tenant_id {target_tenant_id!r} không tồn tại")
-    else:
-        if tenant_id is not None and tenant_id != str(identity.tenant_id):
-            raise HTTPException(status_code=403, detail="company-admin chỉ upload được cho tenant mình")
-        target_tenant_id = str(identity.tenant_id)
-        tenant_uuid = identity.tenant_id
+    target_tenant_id, tenant_uuid = await _resolve_target_tenant(conn, identity, tenant_id, "upload tài liệu")
 
     valid_section_names = await fetch_tenant_section_names(conn, target_tenant_id)
     if section_role not in valid_section_names:
@@ -294,4 +349,121 @@ async def upload_document(
         golden_n_cases=golden.n_cases,
         golden_n_ai=golden.n_ai,
         golden_n_human=golden.n_human,
+    )
+
+
+class _ReadOnlyEmbedding:
+    """`EmbeddingService` giả cho các đường **chỉ đọc/xoá** của tab Tài liệu.
+
+    `KbPipeline` đòi một embedding ở constructor, nhưng `chunks_for_tenant`/`delete_by_doc_id`
+    không hề gọi tới nó. Dùng ``build_embedding`` thật ở đây là một defect có thật, không phải
+    chuyện thẩm mỹ: nó ném **503** khi `STUDIO_USE_FAKE_PROVIDERS=false` mà thiếu
+    `STUDIO_OPENROUTER_API_KEY` (`providers/factory.py`) — tức người quản trị sẽ không **xem** nổi
+    KB của mình, và không **xoá** nổi tài liệu nào, chỉ vì một provider chẳng liên quan chưa cấu
+    hình. Đường xoá là đường người ta cần nhất đúng lúc có sự cố.
+
+    Ném thay vì trả vector rỗng: nếu sau này ai thêm một lời gọi có embed vào hai route này, nó phải
+    đỏ ngay và chỉ thẳng chỗ, chứ không âm thầm ghi vector rác vào `kb.chunks`.
+    """
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        raise AssertionError(
+            f"_ReadOnlyEmbedding.embed() bị gọi với {len(texts)} chuỗi — đường đọc/xoá tài liệu "
+            "không được embed gì. Nếu route này giờ CẦN embed thật, dùng `build_embedding` và "
+            "cập nhật test_routes_embedding_wiring.py cho đúng số lời gọi."
+        )
+
+
+def _display_name(doc_id: str, section_role: str) -> str:
+    """Bỏ tiền tố phòng ban khỏi `doc_id` để ra tên tài liệu hiển thị.
+
+    `doc_id = f"{slug(section_role)}-{slug(stem)}"` (xem chỗ dựng ở `upload_document`), nên cắt
+    đúng tiền tố đó là ra phần tên. Dùng `removeprefix` chứ không `split("-", 1)`: tên phòng ban
+    có thể chứa dấu gạch sau khi slug hoá (`"nhan-su"`), và `split` sẽ cắt nhầm giữa tên phòng ban.
+    """
+    return doc_id.removeprefix(f"{_slugify(section_role)}-") or doc_id
+
+
+@router.get("", response_model=DocumentListResponse)
+async def list_documents(tenant_id: str | None = None) -> DocumentListResponse:
+    """Tài liệu đang có trong KB của tenant, kèm số đoạn mỗi tài liệu.
+
+    Gom trong Python từ `KbPipeline.chunks_for_tenant` thay vì viết `GROUP BY` thẳng vào
+    `kb.chunks`: bảng đó thuộc `packages/kb`, và một câu SQL của `apps/studio` đọc chéo vào schema
+    quadrant khác là chỗ mà lần đổi cấu trúc kế tiếp bên đó sẽ làm vỡ mà không ai thấy trước. Cùng
+    lý do (và cùng seam) `golden_autogen.regenerate_for_section` đang dùng.
+    """
+    session = get_request_session()
+    conn = get_request_connection()
+    identity = await fetch_fresh_identity(conn, session.user)
+    require_admin(identity.system_roles)
+    _, tenant_uuid = await _resolve_target_tenant(conn, identity, tenant_id, "xem tài liệu")
+
+    pipeline = KbPipeline(await get_pool(), _ReadOnlyEmbedding())
+    chunks = await pipeline.chunks_for_tenant(tenant_uuid)
+
+    # Gom kèm `doc_name`: cột hiển thị kb#64 vừa thêm, giữ nguyên hoa/thường/dấu tiếng Việt. Lấy
+    # tên của chunk ĐẦU TIÊN trong nhóm — mọi chunk cùng `doc_id` đến từ cùng một lần upload nên
+    # mang cùng tên; nếu lệch thì đó là dấu hiệu hai tài liệu đụng `doc_id` (xem issue app#70), và
+    # chọn cái đầu là chọn tất định thay vì chọn ngẫu nhiên theo thứ tự trả về.
+    grouped: dict[tuple[str, str], int] = {}
+    names: dict[tuple[str, str], str] = {}
+    for chunk in chunks:
+        key = (chunk.doc_id, chunk.section_role)
+        grouped[key] = grouped.get(key, 0) + 1
+        if chunk.doc_name and key not in names:
+            names[key] = chunk.doc_name
+
+    documents = [
+        DocumentSummary(
+            id=doc_id,
+            # Ba nấc, tụt dần theo mức trung thực: tên gốc từ DB → tên đã slug hoá suy từ `doc_id`
+            # → nhãn gộp cho dòng chưa gắn tài liệu. Nấc giữa tồn tại vì dòng ghi TRƯỚC kb#64 có
+            # `doc_name` rỗng — hiện ô trống ở đó thì người dùng không hành động được với nó.
+            name=names.get((doc_id, section_role))
+            or (_display_name(doc_id, section_role) if doc_id else _UNGROUPED_NAME),
+            section_role=section_role,
+            chunk_count=count,
+        )
+        for (doc_id, section_role), count in sorted(grouped.items())
+    ]
+    return DocumentListResponse(documents=documents, total_chunks=len(chunks))
+
+
+@router.post("/delete", response_model=DeleteDocumentsResponse)
+async def delete_documents(body: DeleteDocumentsRequest, tenant_id: str | None = None) -> DeleteDocumentsResponse:
+    """Xoá các tài liệu được tích chọn (theo `DocumentSummary.id`), không phải xoá cả tenant.
+
+    `POST /delete` chứ không `DELETE` mang body: xoá NHIỀU id trong một lượt cần một danh sách, mà
+    body trên `DELETE` là chỗ proxy/CDN được phép bỏ đi theo spec — một lệnh xoá tới nơi với danh
+    sách rỗng là kiểu hỏng không được phép có ở đây.
+
+    Trả `not_found` cho id xoá được 0 đoạn thay vì im lặng — xem docstring `DeleteDocumentsResponse`.
+    """
+    session = get_request_session()
+    conn = get_request_connection()
+    identity = await fetch_fresh_identity(conn, session.user)
+    require_admin(identity.system_roles)
+    _, tenant_uuid = await _resolve_target_tenant(conn, identity, tenant_id, "xoá tài liệu")
+
+    if not body.ids:
+        raise HTTPException(status_code=400, detail="chưa chọn tài liệu nào để xoá")
+
+    pipeline = KbPipeline(await get_pool(), _ReadOnlyEmbedding())
+    deleted_chunks = 0
+    deleted_documents: list[str] = []
+    not_found: list[str] = []
+    # Lặp tuần tự, không gom một câu `IN (...)`: `delete_by_doc_id` là seam của `packages/kb` và nó
+    # tự bind `app.tenant_id` cho từng giao dịch (RLS). Tự viết câu gộp ở đây là dựng lại đường ghi
+    # thứ hai vào `kb.chunks` nằm ngoài seam đó — đúng thứ hàng rào quadrant tồn tại để chặn.
+    for doc_id in dict.fromkeys(body.ids):  # giữ thứ tự, bỏ trùng
+        removed = await pipeline.delete_by_doc_id(tenant_uuid, doc_id)
+        if removed:
+            deleted_chunks += removed
+            deleted_documents.append(doc_id)
+        else:
+            not_found.append(doc_id)
+
+    return DeleteDocumentsResponse(
+        deleted_chunks=deleted_chunks, deleted_documents=deleted_documents, not_found=not_found
     )

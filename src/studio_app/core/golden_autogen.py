@@ -21,7 +21,7 @@ UUID để lấp cho đủ là dựng một tham chiếu trỏ vào hư không. 
 
 ## Vì sao sinh trên CẢ TENANT rồi mới lọc theo phòng ban
 
-`build_cases` dựng case **bẫy** bằng cách **ghép chéo vai** (`_chon_nguon_bay`): hỏi dưới vai A
+`build_cases` dựng case **bẫy** bằng cách **ghép chéo vai** (`_pick_trap_source`): hỏi dưới vai A
 trong khi đáp án nằm ở vai B, kỳ vọng agent **từ chối**. Đưa nó chunk của đúng một phòng ban thì
 không còn gì để ghép chéo — đo được:
 
@@ -81,7 +81,7 @@ from uuid import UUID
 
 from studio_evalhub.golden_case import GoldenCase as RuntimeCase
 from studio_evalhub.golden_case import GoldenSet
-from studio_evalhub.golden_merge import merge_golden_sets
+from studio_evalhub.golden_merge import case_key, merge_golden_sets
 from studio_evalhub.golden_store import GoldenSetNotFound, read_golden_set, write_golden_set
 from studio_kb.golden_from_kb import SourceChunk, build_cases, sample_report
 from studio_kb.golden_set_core import GoldenCase as AuthoringCase
@@ -143,6 +143,42 @@ class AutogenReport:
     roles_below_minimum: tuple[str, ...]
 
 
+def _drop_key_collisions(cases: tuple[AuthoringCase, ...]) -> tuple[AuthoringCase, ...]:
+    """Bỏ case trùng **khoá hợp nhất** với một case đứng trước nó, giữ bản đầu.
+
+    Không phải dọn dẹp phòng xa — đây là bug đã tái lập được, và nó làm **hỏng cả lượt upload**:
+    `merge_golden_sets` ném `GoldenSetMergeConflict` khi hai case cùng khoá mà luật `source` không
+    phân xử được, mà hai case ở đây đều `source="ai"` ⇒ route trả **500**.
+
+    Ca dựng lại được: hai phòng ban nạp tài liệu **cùng nội dung** (một biểu mẫu chung — chuyện
+    thường). `ExtractiveQuestionWriter` trích câu hỏi từ chính chunk, nên chunk giống nhau ra **câu
+    hỏi giống nhau**; và case bẫy mượn câu hỏi của chunk phòng ban KHÁC. Kết quả là một case
+    trả-lời và một case bẫy cùng `(tenant, câu hỏi chuẩn hoá, phòng ban)`.
+
+    **Giữ bản đầu là đúng nghĩa, không chỉ tiện.** `build_cases` phát case trả-lời trước, bẫy sau.
+    Ở đúng ca này, cặp đó **mâu thuẫn thật**: bẫy nói *"hỏi dưới vai này thì phải từ chối"*, trong
+    khi case trả-lời nói *"vai này CÓ đoạn văn ấy"*. Vế thứ hai đúng — nội dung nằm ngay trong
+    phòng ban đang hỏi — nên hành vi đúng là **trả lời**, và cái phải bỏ là cái bẫy.
+
+    Dùng `case_key` của evalhub chứ không tự chuẩn hoá: nó là **chính** hàm mà `merge_golden_sets`
+    dùng để phát hiện va chạm. Viết lại một phép chuẩn hoá thứ hai ở đây là dựng sẵn chỗ cho hai
+    cách hiểu "cùng câu hỏi" lệch nhau — lúc đó bộ lọc này bỏ sót đúng những ca nó sinh ra để chặn.
+
+    Phải làm ở tầng này chứ không ở `golden_from_kb`: `packages/kb` và `packages/evalhub` là hai
+    quadrant **cấm import lẫn nhau** (`.importlinter`), nên bên kb không với tới `case_key`.
+    `apps/studio` là composition root — chỗ duy nhất nhìn được cả hai.
+    """
+    seen: set[object] = set()
+    kept: list[AuthoringCase] = []
+    for case in cases:
+        key = case_key(_to_runtime_case(case))
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(case)
+    return tuple(kept)
+
+
 async def regenerate_for_section(
     conn: Any,
     pipeline: KbPipeline,
@@ -176,6 +212,7 @@ async def regenerate_for_section(
     # Case bẫy của phòng ban này là case HỎI dưới vai này mà đáp án nằm ở vai khác — đúng thứ bộ
     # golden của phòng ban này cần để đo hàng rào.
     generated = tuple(c for c in sinh_ca_tenant if tuple(c.section_roles) == (section_role,))
+    generated = _drop_key_collisions(generated)
     # Đo mẫu trên phần MÁY SINH của CHÍNH phòng ban này, sau khi lọc — `sample_report` nhận
     # `GoldenCase` của `kb`. Đo trên `sinh_ca_tenant` sẽ báo tỷ lệ bẫy của cả tenant, không phải
     # của bộ thật sự được ghi.
