@@ -14,11 +14,15 @@ from fastapi import HTTPException
 from studio_app import middleware
 from studio_app.core._db import Pool, close_pools, get_pool
 from studio_app.routes.agents import (
+    CreateAgentRequest,
     RollbackRequest,
+    UpdateAgentRequest,
+    create_agent,
     get_agent_recipe,
     list_agent_versions,
     list_agents,
     rollback_agent,
+    update_agent,
 )
 from studio_contracts import Edge, Node, NodeType, Recipe
 from studio_workbench import create_recipe
@@ -372,3 +376,136 @@ async def test_get_agent_recipe_rejects_row_invalid_under_current_contract(admin
         "N1 (review app#37 round 2): detail KHÔNG được echo input_value trần — dùng "
         "exc.errors(include_input=False, ...), không phải str(exc)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phần E — `wb.agents` (entity Agent thật): create_agent/update_agent/display_name
+# ---------------------------------------------------------------------------
+
+
+async def test_create_agent_requires_admin(admin_pool: Pool) -> None:
+    tenant_id = await _seed_tenant(admin_pool, "agents-probe-m")
+    await _seed_user(admin_pool, tenant_id, "user@acme.com", ["public"])
+
+    token = _set_session(tenant_id=tenant_id, user="user@acme.com", roles=["public"])
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            async with _simulate_request_connection(tenant_id):
+                await create_agent(CreateAgentRequest(agent_id="agent-m1", display_name="Agent M1"))
+        assert exc_info.value.status_code == 403
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+
+async def test_create_agent_rejects_blank_fields(admin_pool: Pool) -> None:
+    tenant_id = await _seed_tenant(admin_pool, "agents-probe-n")
+    await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            async with _simulate_request_connection(tenant_id):
+                await create_agent(CreateAgentRequest(agent_id="  ", display_name="Agent N1"))
+        assert exc_info.value.status_code == 400
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+
+async def test_create_agent_then_duplicate_id_returns_409_not_500(admin_pool: Pool) -> None:
+    """Xác nhận `conn.transaction()` (SAVEPOINT) bọc INSERT — `UniqueViolation` phải map 409 SẠCH,
+    và connection dùng chung của request KHÔNG bị bỏ ở trạng thái aborted (nếu bị, lời gọi thứ 2
+    dưới đây sẽ vỡ trần thay vì trả đúng 409)."""
+    tenant_id = await _seed_tenant(admin_pool, "agents-probe-o")
+    await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        async with _simulate_request_connection(tenant_id):
+            first = await create_agent(CreateAgentRequest(agent_id="agent-o1", display_name="Agent O1"))
+            assert first.agent_id == "agent-o1"
+            assert first.display_name == "Agent O1"
+
+            with pytest.raises(HTTPException) as exc_info:
+                await create_agent(CreateAgentRequest(agent_id="agent-o1", display_name="Agent O1 (2)"))
+            assert exc_info.value.status_code == 409
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+
+async def test_update_agent_renames_display_name(admin_pool: Pool) -> None:
+    tenant_id = await _seed_tenant(admin_pool, "agents-probe-p")
+    await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        async with _simulate_request_connection(tenant_id):
+            await create_agent(CreateAgentRequest(agent_id="agent-p1", display_name="Tên cũ"))
+            result = await update_agent("agent-p1", UpdateAgentRequest(display_name="Tên mới"))
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert result.display_name == "Tên mới"
+
+
+async def test_update_agent_missing_returns_404(admin_pool: Pool) -> None:
+    tenant_id = await _seed_tenant(admin_pool, "agents-probe-q")
+    await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            async with _simulate_request_connection(tenant_id):
+                await update_agent("agent-never-created", UpdateAgentRequest(display_name="X"))
+        assert exc_info.value.status_code == 404
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+
+async def test_update_agent_requires_admin(admin_pool: Pool) -> None:
+    tenant_id = await _seed_tenant(admin_pool, "agents-probe-r")
+    await _seed_user(admin_pool, tenant_id, "user@acme.com", ["public"])
+
+    token = _set_session(tenant_id=tenant_id, user="user@acme.com", roles=["public"])
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            async with _simulate_request_connection(tenant_id):
+                await update_agent("agent-r1", UpdateAgentRequest(display_name="X"))
+        assert exc_info.value.status_code == 403
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+
+async def test_list_agents_includes_display_name_from_wb_agents(admin_pool: Pool) -> None:
+    tenant_id = await _seed_tenant(admin_pool, "agents-probe-s")
+    await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+    await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-s1", version=1)
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        async with _simulate_request_connection(tenant_id):
+            await create_agent(CreateAgentRequest(agent_id="agent-s1", display_name="Trợ lý Nhân sự"))
+            result = await list_agents()
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert len(result) == 1
+    assert result[0].display_name == "Trợ lý Nhân sự"
+
+
+async def test_list_agents_falls_back_to_agent_id_when_no_wb_agents_row(admin_pool: Pool) -> None:
+    """Agent publish TRƯỚC Phần E (chưa có row `wb.agents`, chưa chạy `backfill_agents.py`) — vẫn
+    phải liệt kê được, `display_name` rơi về đúng `agent_id`."""
+    tenant_id = await _seed_tenant(admin_pool, "agents-probe-t")
+    await _seed_user(admin_pool, tenant_id, "user@acme.com", ["public"])
+    await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-legacy", version=1)
+
+    token = _set_session(tenant_id=tenant_id, user="user@acme.com", roles=["public"])
+    try:
+        async with _simulate_request_connection(tenant_id):
+            result = await list_agents()
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert len(result) == 1
+    assert result[0].agent_id == "agent-legacy"
+    assert result[0].display_name == "agent-legacy"

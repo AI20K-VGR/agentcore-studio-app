@@ -1,16 +1,23 @@
-"""`GET /api/agents` + `POST /api/agents/{agent_id}/rollback` — cùng `prefix="/api/agents"` với
-`routes/chat.py`/`routes/publish.py` (FastAPI cho nhiều `APIRouter` chung prefix, mỗi router 1
+"""`GET/POST /api/agents` + `PATCH/POST rollback /api/agents/{agent_id}` — cùng `prefix="/api/agents"`
+với `routes/chat.py`/`routes/publish.py` (FastAPI cho nhiều `APIRouter` chung prefix, mỗi router 1
 concern riêng — đúng convention module-per-concern đã dùng xuyên suốt `routes/`).
 
 `GET ""` phục vụ UI chọn agent (dropdown chat của employee, dropdown rollback của admin) — quyết
 định "nhiều agent/công ty" (không phải 1 agent/công ty) đã chốt: mỗi tenant có thể có nhiều
 `agent_id` khác nhau, mỗi cái published độc lập.
 
-`rollback()` (`studio_workbench.publish`) đã implement đầy đủ từ trước — route này chỉ NỐI DÂY,
-không viết lại logic rollback."""
+`POST ""`/`PATCH "/{agent_id}"` (Phần E) — CRUD tối thiểu cho entity Agent thật (`wb.agents`, xem
+`studio_workbench.schema`). Trước bản vá này "agent" chỉ là 1 chuỗi `agent_id` suy ra từ
+`wb.recipes` đã publish — agent mới tạo trên canvas, CHƯA từng publish, không tồn tại ở backend
+dưới hình thức nào, không có chỗ lưu `display_name` (đổi tên, tách khỏi `agent_id` kỹ thuật —
+không đổi được sau khi tạo, dùng làm khoá xuyên suốt `wb.recipes`/trace/scorecards).
+
+`rollback()` (`studio_workbench.publish`) đã implement đầy đủ từ trước — route rollback chỉ NỐI
+DÂY, không viết lại logic rollback."""
 
 from __future__ import annotations
 
+import psycopg
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ValidationError
 from studio_contracts import Recipe
@@ -25,27 +32,109 @@ router = APIRouter(prefix="/api/agents", tags=["agents"])
 class AgentSummary(BaseModel):
     agent_id: str
     latest_published_version: int
+    # Fallback = `agent_id` (agent publish TRƯỚC bản vá này chưa có row `wb.agents` — xem script
+    # migrate một-lần `scripts/backfill_agents.py`).
+    display_name: str
 
 
 @router.get("", response_model=list[AgentSummary])
 async def list_agents() -> list[AgentSummary]:
-    """Bất kỳ ai đã đăng nhập (KHÔNG cần role admin) — RLS trên `wb.recipes` đã tự lọc theo
-    `app.tenant_id` của connection (`tenant_context_middleware`), đúng lý do `_load_published_recipe`
-    (`routes/chat.py`) cũng không tự thêm `WHERE tenant_id` tay: RLS là hàng rào, không phải lớp
-    phụ. `get_request_session()` chỉ để 401 nếu chưa đăng nhập — không dùng giá trị trả về."""
+    """Bất kỳ ai đã đăng nhập (KHÔNG cần role admin) — RLS trên `wb.recipes`/`wb.agents` đã tự lọc
+    theo `app.tenant_id` của connection (`tenant_context_middleware`), đúng lý do
+    `_load_published_recipe` (`routes/chat.py`) cũng không tự thêm `WHERE tenant_id` tay: RLS là
+    hàng rào, không phải lớp phụ. `get_request_session()` chỉ để 401 nếu chưa đăng nhập — không
+    dùng giá trị trả về.
+
+    Phân quyền theo phòng ban (`wb.agent_sections`) CHƯA áp dụng ở đây — xem TODO Phần F cùng
+    plan: nhân viên hiện vẫn thấy TOÀN BỘ agent đã publish của tenant, giống hành vi cũ."""
     get_request_session()
     conn = get_request_connection()
 
     cur = await conn.execute(
         """
-        SELECT DISTINCT ON (agent_id) agent_id, version
-        FROM wb.recipes
-        WHERE status = 'published'
-        ORDER BY agent_id, version DESC
+        SELECT DISTINCT ON (r.agent_id) r.agent_id, r.version, COALESCE(a.display_name, r.agent_id)
+        FROM wb.recipes r
+        LEFT JOIN wb.agents a ON a.agent_id = r.agent_id AND a.tenant_id = r.tenant_id
+        WHERE r.status = 'published'
+        ORDER BY r.agent_id, r.version DESC
         """
     )
     rows = await cur.fetchall()
-    return [AgentSummary(agent_id=row[0], latest_published_version=row[1]) for row in rows]
+    return [
+        AgentSummary(agent_id=row[0], latest_published_version=row[1], display_name=row[2]) for row in rows
+    ]
+
+
+class CreateAgentRequest(BaseModel):
+    agent_id: str
+    display_name: str
+
+
+class AgentResponse(BaseModel):
+    agent_id: str
+    display_name: str
+
+
+@router.post("", response_model=AgentResponse, status_code=201)
+async def create_agent(body: CreateAgentRequest) -> AgentResponse:
+    """Tạo entity Agent — gọi lúc submit "Tạo agent" trên canvas (`CreateAgentModal`), TRƯỚC khi
+    admin vẽ gì/publish gì. Không có row này thì `agent_id` chỉ là 1 chuỗi client tự gõ, không tồn
+    tại ở backend dưới hình thức nào (xem docstring module + Phần E, plan) — không có chỗ lưu
+    `display_name`/phân quyền phòng ban trước lần publish đầu tiên."""
+    session = get_request_session()
+    conn = get_request_connection()
+    identity = await fetch_fresh_identity(conn, session.user)
+    require_admin(identity.roles)
+
+    if not body.agent_id.strip() or not body.display_name.strip():
+        raise HTTPException(status_code=400, detail="agent_id và display_name không được rỗng.")
+
+    # `conn.transaction()` (SAVEPOINT) bọc riêng INSERT có thể lỗi — KHÔNG bare `execute()` (cùng
+    # lý do `routes/admin.py::create_company` đã đóng ở review app#17 đợt 6): thiếu savepoint,
+    # `UniqueViolation` bắt được bằng `except` vẫn để nguyên transaction NGOÀI (connection dùng
+    # chung suốt request, giữ bởi `tenant_context_middleware`) ở trạng thái aborted — mọi query
+    # sau đó trên connection này trong CÙNG request sẽ vỡ với "current transaction is aborted".
+    try:
+        async with conn.transaction():
+            await conn.execute(
+                "INSERT INTO wb.agents (agent_id, tenant_id, display_name) VALUES (%s, %s, %s)",
+                (body.agent_id, str(session.tenant_id), body.display_name.strip()),
+            )
+    except psycopg.errors.UniqueViolation as exc:
+        raise HTTPException(
+            status_code=409, detail=f"agent_id {body.agent_id!r} đã tồn tại cho tenant hiện tại."
+        ) from exc
+
+    return AgentResponse(agent_id=body.agent_id, display_name=body.display_name.strip())
+
+
+class UpdateAgentRequest(BaseModel):
+    display_name: str
+
+
+@router.patch("/{agent_id}", response_model=AgentResponse)
+async def update_agent(agent_id: str, body: UpdateAgentRequest) -> AgentResponse:
+    """Đổi tên hiển thị — `agent_id` (khoá kỹ thuật, dùng xuyên suốt `wb.recipes`/trace/scorecards)
+    KHÔNG đổi được qua route này, cố ý không có field đó trong `UpdateAgentRequest`."""
+    session = get_request_session()
+    conn = get_request_connection()
+    identity = await fetch_fresh_identity(conn, session.user)
+    require_admin(identity.roles)
+
+    if not body.display_name.strip():
+        raise HTTPException(status_code=400, detail="display_name không được rỗng.")
+
+    cur = await conn.execute(
+        "UPDATE wb.agents SET display_name = %s, updated_at = now() WHERE agent_id = %s AND tenant_id = %s",
+        (body.display_name.strip(), agent_id, str(session.tenant_id)),
+    )
+    if cur.rowcount == 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"agent_id {agent_id!r} chưa có entity Agent (chưa từng gọi POST /api/agents) cho tenant hiện tại.",
+        )
+
+    return AgentResponse(agent_id=agent_id, display_name=body.display_name.strip())
 
 
 class VersionSummary(BaseModel):
