@@ -2,7 +2,7 @@
 mật khẩu (bcrypt, `jwt_auth.verify_password`), phát JWT ký thật (`jwt_auth.issue_token`).
 
 **Lịch sử — `POST /api/auth/demo-login` (Kế hoạch 2, A2) đã bị XOÁ** (không phải deprecate song
-song): route đó tra 1 registry cứng `_DEMO_ACCOUNTS` (email -> tenant/roles gán sẵn), đăng nhập
+song): route đó tra 1 registry cứng `_DEMO_ACCOUNTS` (email -> tenant/system_roles gán sẵn), đăng nhập
 được chỉ bằng cách gõ ĐÚNG 1 email trong danh sách, không cần mật khẩu. Bản thiết kế ban đầu định
 giữ 2 đường song song ("demo tiện cho dev-stack, login là đường thật cho production") — huỷ quyết
 định đó: hệ thống giờ CHỈ còn 1 đường đăng nhập, mọi tài khoản (kể cả tài khoản dùng để dev/test)
@@ -11,7 +11,7 @@ giữ 2 đường song song ("demo tiện cho dev-stack, login là đường th�
 `_DEMO_ACCOUNTS`) coi như đóng theo hướng "registry không còn tồn tại" thay vì "đã vá đúng registry
 đó" — xem comment đóng issue kèm SHA.
 
-`tenant`/`roles` không còn field nào cho client tự khai trong request — luôn tra từ `core.users`
+`tenant`/`system_roles` không còn field nào cho client tự khai trong request — luôn tra từ `core.users`
 theo email đã xác thực mật khẩu, đúng tinh thần "role được quy định sẵn lúc tạo tài khoản".
 """
 
@@ -90,7 +90,7 @@ class LoginResponse(BaseModel):
     đây là `"__system__"` — UI tầng superadmin không hiện field này ở đâu cả nên không thành vấn
     đề."""
     user: str
-    roles: list[str]
+    system_roles: list[str]
     """CỐ Ý không có `password`/`password_hash` ở bất kỳ đâu trong response — xem
     `test_admin_routes.py::test_password_hash_never_leaks_in_any_admin_response`."""
 
@@ -146,7 +146,7 @@ async def login(body: LoginRequest, request: Request) -> LoginResponse:
 
     conn = get_request_connection()
     cur = await conn.execute(
-        "SELECT u.tenant_id, u.password_hash, u.roles, u.is_active, t.name "
+        "SELECT u.tenant_id, u.password_hash, u.system_roles, u.is_active, t.name "
         "FROM core.users u JOIN core.tenants t ON t.id = u.tenant_id WHERE u.email = %s",
         (body.email,),
     )
@@ -167,21 +167,21 @@ async def login(body: LoginRequest, request: Request) -> LoginResponse:
         # Admin công ty = quyền cao nhất TRONG tenant đó — mặc định thấy MỌI nội dung KB, không
         # phải tự tick từng phòng ban như nhân viên (quyết định qua AskUserQuestion). Filter nội
         # dung lúc chat nằm ở `packages/engine::interpreter.run()` (ngoài `apps/studio`, team
-        # khác sở hữu), đọc thẳng `session.roles` của JWT đã verify — nên mở rộng NGAY TẠI ĐÂY,
+        # khác sở hữu), đọc thẳng `session.system_roles` của JWT đã verify — nên mở rộng NGAY TẠI ĐÂY,
         # lúc phát JWT, là chỗ đúng phạm vi apps/studio, không cần sửa package khác. `core.users.
-        # roles` trong DB VẪN chỉ lưu đúng `["admin"]` (không ghi đè) — đây chỉ là ảnh chụp trong
+        # system_roles` trong DB VẪN chỉ lưu đúng `["admin"]` (không ghi đè) — đây chỉ là ảnh chụp trong
         # JWT của phiên đăng nhập này, tự làm mới ở lần đăng nhập kế tiếp nếu công ty có thêm
         # section mới (cùng bản chất "role là ảnh chụp lúc login" đã áp dụng xuyên suốt).
         # `fetch_tenant_section_names` tự trừ `RESERVED_ROLE_NAMES` (review app#21 — tầng 2 lặp
         # lại, xem docstring hàm đó): 1 dòng `core.sections` cũ tên "superadmin" không còn lọt
-        # được vào JWT roles của company-admin qua đường này nữa.
+        # được vào JWT system_roles của company-admin qua đường này nữa.
         section_names = await fetch_tenant_section_names(conn, tenant_id)
         # `dict.fromkeys` giữ ĐÚNG thứ tự chèn (khác `set`, thứ tự không xác định) — roles gốc từ
         # DB đứng trước, section mới bổ sung nối sau, không xáo trộn thứ tự đã seed/lưu. `sorted()`
         # trên `section_names` (giờ là `set`, thứ tự không xác định) để thứ tự PHẦN NỐI THÊM ít
         # nhất còn xác định/lặp lại được giữa các lần login, dù không mang ý nghĩa gì đặc biệt.
         effective_roles = list(dict.fromkeys([*effective_roles, *sorted(section_names)]))
-    session: dict[str, Any] = {"tenant_id": str(tenant_id), "user": body.email, "roles": effective_roles}
+    session: dict[str, Any] = {"tenant_id": str(tenant_id), "user": body.email, "system_roles": effective_roles}
     try:
         resolved = resolve_session(session)
     except PermissionError as exc:
@@ -193,7 +193,7 @@ async def login(body: LoginRequest, request: Request) -> LoginResponse:
         tenant_id=str(resolved.tenant_id),
         tenant_name=tenant_name,
         user=resolved.user,
-        roles=resolved.roles,
+        system_roles=resolved.system_roles,
     )
 
 

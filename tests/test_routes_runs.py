@@ -99,7 +99,7 @@ async def _seed_tenant(admin_pool: Pool, name: str) -> UUID:
 async def _seed_admin_user(admin_pool: Pool, tenant_id: UUID, email: str) -> None:
     async with admin_pool.connection() as conn:
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s)",
             (str(tenant_id), email, "not-a-real-hash", ["admin"]),
         )
 
@@ -107,7 +107,7 @@ async def _seed_admin_user(admin_pool: Pool, tenant_id: UUID, email: str) -> Non
 async def _seed_employee_user(admin_pool: Pool, tenant_id: UUID, email: str) -> None:
     async with admin_pool.connection() as conn:
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s)",
             (str(tenant_id), email, "not-a-real-hash", ["public"]),
         )
 
@@ -124,7 +124,7 @@ async def _simulate_request_connection() -> AsyncIterator[None]:
 
 
 def _set_session(tenant_id: UUID, user: str = "victim@ankor.vn") -> Token[ResolvedContext | None]:
-    session = ResolvedContext(tenant_id=tenant_id, user=user, roles=["admin", "public"])
+    session = ResolvedContext(tenant_id=tenant_id, user=user, system_roles=["admin", "public"])
     return middleware._request_session.set(session)
 
 
@@ -156,7 +156,7 @@ async def test_create_run_requires_admin(admin_pool: Pool) -> None:
 
     tenant = await _seed_tenant(admin_pool, "runs-requires-admin")
     await _seed_employee_user(admin_pool, tenant, "employee@acme.com")
-    session = ResolvedContext(tenant_id=tenant, user="employee@acme.com", roles=["public"])
+    session = ResolvedContext(tenant_id=tenant, user="employee@acme.com", system_roles=["public"])
     token = middleware._request_session.set(session)
 
     try:

@@ -138,7 +138,7 @@ async def test_evaluate_injects_the_canvas_recipe_it_returns_into_the_runner(
         nodes=nodes,
         edges=edges,
     )
-    session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@acme.com", roles=["admin"])
+    session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@acme.com", system_roles=["admin"])
 
     recipe, _scorecard = await _evaluate("agent-inject-check", body, session)
 

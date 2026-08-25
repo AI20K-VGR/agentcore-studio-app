@@ -91,7 +91,7 @@ async def _fake_load_recipe(agent_id: str) -> tuple[Recipe, int]:  # noqa: ARG00
 
 
 def _set_session() -> object:
-    session = ResolvedContext(tenant_id=TENANT_ID, user="victim@ankor.vn", roles=["public"])
+    session = ResolvedContext(tenant_id=TENANT_ID, user="victim@ankor.vn", system_roles=["public"])
     return middleware._request_session.set(session)
 
 

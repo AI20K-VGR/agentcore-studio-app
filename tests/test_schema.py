@@ -1,4 +1,4 @@
-"""Phase 3 gate tests — schema idempotency, pool-split roles, centralized grant (F1/F2/F6) +
+"""Phase 3 gate tests — schema idempotency, pool-split system_roles, centralized grant (F1/F2/F6) +
 app-boot smoke. Needs a live DB: `docker compose -f docker-compose.test.yml up -d` (port 5433,
 db `studio_test`) with `STUDIO_DATABASE_URL`/`STUDIO_DATABASE_URL_ADMIN` pointed at it — the
 `admin_pool`/`pool` fixtures (root conftest.py) skip individually when those env vars are unset.

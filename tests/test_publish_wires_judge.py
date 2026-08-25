@@ -195,7 +195,7 @@ async def _bat_judge_ma_evaluate_dung(monkeypatch: pytest.MonkeyPatch, tmp_path:
         nodes=nodes,
         edges=edges,
     )
-    session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@acme.com", roles=["admin"])
+    session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@acme.com", system_roles=["admin"])
     await _evaluate("agent-judge-wiring", body, session)
 
     judge = _StubEvalHarness.last_kwargs.get("judge")

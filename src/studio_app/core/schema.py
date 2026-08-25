@@ -60,11 +60,25 @@ CREATE TABLE IF NOT EXISTS core.users (
     tenant_id UUID NOT NULL REFERENCES core.tenants(id),
     email TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
-    roles TEXT[] NOT NULL DEFAULT '{}',
+    system_roles TEXT[] NOT NULL DEFAULT '{}',
     created_by UUID NULL REFERENCES core.users(id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     is_active BOOLEAN NOT NULL DEFAULT true
 );
+
+-- Đường thứ hai cho DB đã tồn tại từ trước (team ERD gap-2): cột này ban đầu tên `roles`, đổi
+-- thành `system_roles` cho khớp thiết kế. Không có `RENAME COLUMN IF EXISTS` trong Postgres, nên
+-- tự kiểm information_schema trước khi đổi — trên DB mới (CREATE TABLE ở trên tạo thẳng cột
+-- `system_roles`), điều kiện IF EXISTS này false, khối DO $$ là no-op.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'core' AND table_name = 'users' AND column_name = 'roles'
+    ) THEN
+        ALTER TABLE core.users RENAME COLUMN roles TO system_roles;
+    END IF;
+END $$;
 
 -- Đường thứ hai cho DB đã tồn tại từ trước cột `is_active` (`routes/admin.py::delete_user` —
 -- vô hiệu hoá thay vì DELETE cứng, xem docstring route đó) — `CREATE TABLE IF NOT EXISTS` ở trên
