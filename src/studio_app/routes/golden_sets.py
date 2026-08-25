@@ -26,14 +26,17 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException
-from psycopg import sql
 from pydantic import BaseModel, Field, ValidationError
 from studio_evalhub.golden_case import GoldenCase, GoldenSet
 from studio_evalhub.golden_merge import case_key
 from studio_evalhub.golden_store import GoldenSetNotFound, GoldenSetScopeError, read_golden_set, write_golden_set
+from studio_kb.pipeline import KbPipeline
 
-from studio_app.authz import fetch_fresh_identity, require_admin
-from studio_app.middleware import get_request_connection, get_request_session
+from studio_app.authz import fetch_fresh_identity, fetch_tenant_section_names, require_admin
+from studio_app.core._db import get_pool
+from studio_app.core.golden_autogen import regenerate_for_section
+from studio_app.middleware import borrowed_tenant_scope, get_request_connection, get_request_session
+from studio_app.providers.factory import ReadOnlyEmbedding
 
 router = APIRouter(prefix="/api/admin/golden-sets", tags=["golden-sets"])
 
@@ -134,14 +137,14 @@ async def upload_golden_set(body: UploadGoldenSetRequest) -> UploadGoldenSetResp
         # field gõ sai, và nuốt nó thành một câu chung chung là vứt đi phần giá trị nhất.
         raise HTTPException(status_code=422, detail=f"case không hợp lệ: {exc.errors()!r}") from exc
 
-    async with conn.transaction():
-        # Superadmin nạp hộ tenant khác: `app.tenant_id` của phiên đang trỏ `__system__`, nên
-        # `write_golden_set` sẽ từ chối (`GoldenSetScopeError`) — đúng thiết kế của nó. Bind lại
-        # TƯỜNG MINH ở đây là cách **thoả** cổng đó, không phải vượt qua nó: connection thật sự được
-        # scope về tenant đích trong đúng transaction này. `SET LOCAL` hết hiệu lực khi transaction
-        # đóng, nên phần còn lại của request không thừa hưởng quyền này.
-        await conn.execute(sql.SQL("SET LOCAL app.tenant_id = {}").format(sql.Literal(str(tenant_uuid))))
-
+    # Superadmin nạp hộ tenant khác: `app.tenant_id` của phiên đang trỏ `__system__`, nên
+    # `write_golden_set` sẽ từ chối (`GoldenSetScopeError`) — đúng thiết kế của nó. `borrowed_tenant_scope`
+    # bind lại TƯỜNG MINH về tenant đích rồi **trả lại** scope của phiên gọi lúc thoát khối.
+    #
+    # Bản trước tự `SET LOCAL` tại chỗ kèm lời khẳng định "hết hiệu lực khi transaction đóng, nên
+    # phần còn lại của request không thừa hưởng quyền này" — sai (review app#71 đợt 2, mục 2), xem
+    # docstring `borrowed_tenant_scope`: khối này là SAVEPOINT lồng, RELEASE không revert `SET LOCAL`.
+    async with borrowed_tenant_scope(conn, tenant_uuid):
         # PHỦ LÊN bộ đang có, không ghi đè cả bộ và cũng không `merge_golden_sets`.
         #
         # Bản trước gọi thẳng `write_golden_set`, nên nạp một bộ trùng `golden_set_ref` sẽ XOÁ SẠCH
@@ -182,4 +185,98 @@ async def upload_golden_set(body: UploadGoldenSetRequest) -> UploadGoldenSetResp
         n_traps=sum(1 for c in merged.cases if c.expects_refusal),
         n_uploaded=len(golden.cases),
         n_kept_from_existing=max(n_kept, 0),
+    )
+
+
+class RegenerateRequest(BaseModel):
+    section_role: str = Field(min_length=1)
+    tenant_id: str | None = None
+
+
+class RegenerateResponse(BaseModel):
+    golden_set_ref: str
+    n_cases: int
+    n_ai: int
+    n_human: int
+    """Case người dùng tự viết (`source="human"`) được GIỮ NGUYÊN qua lần sinh lại. Khai riêng vì
+    đó đúng là câu người bấm nút lo: *"bấm cái này có mất phần tôi gõ tay không?"*"""
+
+    written: bool
+    """Bộ trong DB có được thay bằng kết quả lượt này không.
+
+    `written=False` nghĩa là lượt dựng lại không ra case nào nên bộ CŨ được giữ nguyên (guard
+    rỗng-thì-không-ghi ở `regenerate_for_section`, có lý do riêng: bộ 0 case đi tiếp vào
+    `EvalHarness.run()` cho `success_rate` trên mẫu số 0). Trước bản vá này route trả `n_cases=0`
+    cho ca đó y như ca bộ thật sự rỗng (review app#71, Dozyboy, đợt 2, mục 1) — người bấm nút tin
+    bộ cũ đã biến mất, trong khi cổng publish vẫn chấm bằng đúng bộ cũ đó. Cờ này là thứ DUY NHẤT
+    phân biệt được hai ca."""
+
+
+@router.post("/regenerate", response_model=RegenerateResponse)
+async def regenerate_golden_set(body: RegenerateRequest) -> RegenerateResponse:
+    """Dựng lại bộ câu hỏi kiểm thử của MỘT phòng ban từ tài liệu đang có, không cần upload gì.
+
+    Trước route này, đường sinh máy chỉ chạy như **tác dụng phụ của việc nạp tài liệu**
+    (`routes/documents.py`). Nên một tenant đã nạp đủ tài liệu mà muốn dựng lại bộ — vì vừa xoá vài
+    tài liệu, vì bộ cũ sinh ra khi KB còn thiếu, hay đơn giản vì muốn bắt đầu lại — **không có cách
+    nào** ngoài việc upload lại một tài liệu bất kỳ. Đó là bắt người dùng làm một việc không liên
+    quan để đạt được việc họ cần.
+
+    Case `source="human"` **được giữ**: `regenerate_for_section` đọc bộ cũ và mang chúng sang. Đây
+    là lý do form nhập tay bắt buộc gắn nhãn đó — không có nhãn, lần sinh lại kế tiếp xoá sạch.
+    """
+    session = get_request_session()
+    conn = get_request_connection()
+    identity = await fetch_fresh_identity(conn, session.user)
+    require_admin(identity.system_roles)
+
+    if "superadmin" in identity.system_roles:
+        if body.tenant_id is None:
+            raise HTTPException(status_code=400, detail="superadmin phải khai tenant_id")
+        try:
+            tenant_uuid = UUID(body.tenant_id)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"tenant_id không phải UUID hợp lệ: {body.tenant_id!r}"
+            ) from exc
+    else:
+        if body.tenant_id is not None and body.tenant_id != str(identity.tenant_id):
+            raise HTTPException(status_code=403, detail="company-admin chỉ dựng lại được cho tenant mình")
+        tenant_uuid = identity.tenant_id
+
+    # Kiểm tenant TỒN TẠI trước, phòng ban sau — review app#71: superadmin gõ nhầm `tenant_id` mà
+    # nhận `400 "phòng ban không hợp lệ"` thì thông báo chỉ sai chỗ, và họ sẽ đi sửa tên phòng ban
+    # trong khi lỗi nằm ở tenant. Một tenant không tồn tại thì mọi phòng ban đều "không hợp lệ",
+    # nên thứ tự cũ biến 404 thành một nhánh gần như không bao giờ tới được.
+    cur = await conn.execute("SELECT name FROM core.tenants WHERE id = %s", (tenant_uuid,))
+    row = await cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"tenant {tenant_uuid} không tồn tại")
+    tenant_slug = str(row[0])
+
+    valid = await fetch_tenant_section_names(conn, str(tenant_uuid))
+    if body.section_role not in valid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"phòng ban {body.section_role!r} không hợp lệ — chỉ chấp nhận {sorted(valid)}",
+        )
+
+    # `ReadOnlyEmbedding`, KHÔNG `build_embedding` — review app#71 (Dozyboy) bắt đúng chỗ tôi tái
+    # phát defect đã tự vá ở `documents.py`. `regenerate_for_section` chỉ gọi `chunks_for_tenant`,
+    # không embed gì; còn `build_embedding` ném **503** khi thiếu `STUDIO_OPENROUTER_API_KEY`.
+    #
+    # Ở route này nó sai gấp đôi: "dựng lại bộ mà không cần nạp lại tài liệu" đúng là thứ người ta
+    # cần **lúc provider đang hỏng** — chặn nó bằng chính lỗi provider là chặn đường thoát hiểm.
+    pipeline = KbPipeline(await get_pool(), ReadOnlyEmbedding())
+    async with borrowed_tenant_scope(conn, tenant_uuid):
+        report = await regenerate_for_section(
+            conn, pipeline, tenant_id=tenant_uuid, tenant_slug=tenant_slug, section_role=body.section_role
+        )
+
+    return RegenerateResponse(
+        golden_set_ref=report.golden_set_ref,
+        n_cases=report.n_cases,
+        n_ai=report.n_ai,
+        n_human=report.n_human,
+        written=report.written,
     )

@@ -141,6 +141,15 @@ class AutogenReport:
     n_human: int
     n_chunks: int
     roles_below_minimum: tuple[str, ...]
+    written: bool
+    """Bộ có thật sự được ghi xuống DB trong lượt này không.
+
+    `n_cases=0` một mình là hai trạng thái khác hẳn nhau mà không phân biệt được: bộ vừa được ghi
+    và đúng là rỗng, so với **giữ nguyên bộ cũ** vì lượt sinh không ra case nào (guard rỗng-thì-
+    không-ghi, xem `regenerate_for_section`). Trước bản vá này cả hai đều trả `0`, nên ca sau đọc
+    như *"bộ giờ rỗng"* trong khi DB còn nguyên bộ cũ (review app#71, Dozyboy, đợt 2, mục 1) —
+    người quản trị xoá hết tài liệu HR rồi dựng lại sẽ tin bộ cũ đã biến mất, còn cổng publish thì
+    vẫn chấm bằng đúng bộ cũ đó."""
 
 
 def _drop_key_collisions(cases: tuple[AuthoringCase, ...]) -> tuple[AuthoringCase, ...]:
@@ -232,7 +241,15 @@ async def regenerate_for_section(
         golden_set_ref=ref,
     )
 
-    if merged.cases:
+    # Guard "rỗng thì không ghi" GIỮ NGUYÊN — xem `test_empty_result_does_not_overwrite_the_existing_set`:
+    # một bộ 0 case đi tiếp vào `EvalHarness.run()` cho `success_rate` trên mẫu số 0.
+    #
+    # Cái được sửa ở review app#71 đợt 2 (mục 1) không phải guard, mà là sự IM LẶNG của nó: route
+    # vẫn trả `n_cases=0` trong khi DB còn nguyên bộ cũ, nên người quản trị xoá hết tài liệu HR rồi
+    # dựng lại sẽ tin bộ cũ đã biến mất — còn cổng publish thì vẫn chấm bằng đúng bộ cũ đó. `written`
+    # là thứ nói ra khác biệt giữa "đã ghi bộ rỗng" và "giữ nguyên bộ cũ".
+    written = bool(merged.cases)
+    if written:
         await write_golden_set(conn, merged, tenant_id)
 
     return AutogenReport(
@@ -242,4 +259,5 @@ async def regenerate_for_section(
         n_human=sum(1 for c in merged.cases if c.source == "human"),
         n_chunks=len(chunks),
         roles_below_minimum=tuple(getattr(report, "roles_below_minimum", getattr(report, "vai_thieu_case", ()))),
+        written=written,
     )

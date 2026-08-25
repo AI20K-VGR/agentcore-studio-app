@@ -9,7 +9,8 @@ chặn embedding trên đường chỉ-đọc. Phần route đi qua DB theo đú
 from __future__ import annotations
 
 import pytest
-from studio_app.routes.documents import _display_name, _ReadOnlyEmbedding
+from studio_app.providers.factory import ReadOnlyEmbedding
+from studio_app.routes.documents import _display_name
 
 
 def test_display_name_bo_dung_tien_to_phong_ban() -> None:
@@ -35,7 +36,7 @@ async def test_read_only_embedding_nem_neu_bi_goi() -> None:
     đường đọc/xoá không embed gì. Nếu sau này ai thêm một lời gọi có embed vào hai route đó, bài
     này (và chính lần chạy thật) phải đỏ ngay, thay vì âm thầm ghi vector rác vào `kb.chunks`."""
     with pytest.raises(AssertionError, match="không được embed"):
-        await _ReadOnlyEmbedding().embed(["a", "b"])
+        await ReadOnlyEmbedding().embed(["a", "b"])
 
 
 # ── Route đi qua DB thật (khuôn `test_documents_routes.py`) ──────────────────────────────────

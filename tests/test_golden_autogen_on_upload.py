@@ -266,6 +266,10 @@ async def test_empty_result_does_not_overwrite_the_existing_set(admin_pool: Pool
 
     assert report.n_chunks == 0, "fixture hỏng: phòng ban này phải THẬT SỰ chưa có chunk nào"
     assert report.n_cases == 0
+    # `written=False` là nửa còn lại của guard (review app#71 đợt 2, mục 1). Bản trước chỉ trả
+    # `n_cases=0`, không phân biệt được với ca "bộ vừa ghi và đúng là rỗng" — người bấm nút tin bộ
+    # cũ đã biến mất, trong khi cổng publish vẫn chấm bằng đúng bộ cũ đang nằm dưới kia.
+    assert report.written is False
     after = await _read_set(admin_pool, tenant_id, ref)
     assert [c.case_id for c in after.cases] == ["AI-OLD-01"], "bộ cũ bị ghi đè bằng một bộ rỗng"
 
