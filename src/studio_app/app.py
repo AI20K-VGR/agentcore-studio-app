@@ -40,6 +40,7 @@ from studio_app.routes import golden_sets as golden_sets_routes
 from studio_app.routes import publish as publish_routes
 from studio_app.routes import runs as runs_routes
 from studio_app.routes import sections as sections_routes
+from studio_app.routes import test_chat as test_chat_routes
 
 
 # Windows mặc định `ProactorEventLoop`; psycopg async từ chối thẳng ("Psycopg cannot use the
@@ -241,4 +242,5 @@ def create_app() -> FastAPI:
     app.include_router(runs_routes.router)
     app.include_router(publish_routes.router)
     app.include_router(chat_routes.router)
+    app.include_router(test_chat_routes.router)
     return app
