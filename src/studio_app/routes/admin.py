@@ -8,7 +8,7 @@ DUY NHẤT để có tài khoản đăng nhập được (mọi tài khoản, k�
   có cách nào tạo cho tenant khác (`tenant_id` CỐ Ý KHÔNG có field trong `CreateUserRequest`, copy
   nguyên văn pattern `RunRequest`/INV-1, `routes/runs.py:49-52`).
 
-`roles` client gửi lên LUÔN bị validate server-side `<= (core.sections của đúng tenant) ∪ {"admin"}`
+`system_roles` client gửi lên LUÔN bị validate server-side `<= (core.sections của đúng tenant) ∪ {"admin"}`
 — không tin riêng UI chặn (đúng bài học ngưỡng `[0,1]`, `kit#129` §3.1). `"superadmin"` KHÔNG nằm
 trong tập cho phép ở `/users` — company-admin không tự phong được superadmin cho ai. Từ vựng
 `SECTION_VOCAB` toàn cục cứng (`studio_kb.doc_factory`) đã bị thay bằng `core.sections` theo-tenant
@@ -58,7 +58,7 @@ class CreateCompanyResponse(BaseModel):
 @router.post("/companies", response_model=CreateCompanyResponse)
 async def create_company(body: CreateCompanyRequest) -> CreateCompanyResponse:
     # `get_request_session()` ở đây CHỈ để lấy identity (`session.user`, tức email đã qua verify
-    # chữ ký JWT) — KHÔNG dùng `session.roles` để phân quyền (xem SELECT ngay dưới). 401 (chưa
+    # chữ ký JWT) — KHÔNG dùng `session.system_roles` để phân quyền (xem SELECT ngay dưới). 401 (chưa
     # chứng minh được là ai) vẫn xử lý ở đây như cũ.
     session = get_request_session()
 
@@ -68,11 +68,11 @@ async def create_company(body: CreateCompanyRequest) -> CreateCompanyResponse:
     # `routes/auth.py::login` đã sửa ở đợt 3 (review `app#17` đợt 5, Chặn B).
     conn = get_request_connection()
 
-    # Tra `id` + `roles` TƯƠI từ `core.users`, KHÔNG dùng `session.roles` (claim JWT) để phân
+    # Tra `id` + `system_roles` TƯƠI từ `core.users`, KHÔNG dùng `session.system_roles` (claim JWT) để phân
     # quyền — JWT là ảnh chụp lúc đăng nhập, sống tới `jwt_expire_minutes` (mặc định 480 phút).
-    # 1 superadmin bị thu hồi quyền giữa chừng (sửa `roles` trong `core.users`) vẫn còn quyền cũ
-    # trong JWT tới lúc hết hạn nếu route tin thẳng `session.roles` (review `app#17`, Important #1,
-    # đợt 8) — route này ĐÃ SẴN 1 lượt round-trip để lấy `created_by`, nên tra thêm cột `roles`
+    # 1 superadmin bị thu hồi quyền giữa chừng (sửa `system_roles` trong `core.users`) vẫn còn quyền cũ
+    # trong JWT tới lúc hết hạn nếu route tin thẳng `session.system_roles` (review `app#17`, Important #1,
+    # đợt 8) — route này ĐÃ SẴN 1 lượt round-trip để lấy `created_by`, nên tra thêm cột `system_roles`
     # ở CÙNG query không tốn thêm round-trip nào. Đặt TRƯỚC bcrypt (khác thứ tự cũ) — không còn lý
     # do giữ hash trước connection nữa: `get_request_connection()` không phải 1 lượt checkout pool
     # mới (khác `get_pool()` cũ), connection đã được middleware giữ suốt đời request bất kể gọi lúc
@@ -82,7 +82,7 @@ async def create_company(body: CreateCompanyRequest) -> CreateCompanyResponse:
     # JWT cũ còn hạn" (Chặn 1, review `app#17`) — xem docstring `authz.py`.
     identity = await fetch_fresh_identity(conn, session.user)
     created_by = identity.id
-    require_superadmin(identity.roles)
+    require_superadmin(identity.system_roles)
 
     # bcrypt là CPU-bound đồng bộ (~200-370ms) — chạy qua threadpool để không chặn event loop.
     admin_password_hash = await run_in_threadpool(hash_password, body.admin_password)
@@ -118,7 +118,7 @@ async def create_company(body: CreateCompanyRequest) -> CreateCompanyResponse:
             assert row is not None
             tenant_id = row[0]
             await conn.execute(
-                "INSERT INTO core.users (tenant_id, email, password_hash, roles, created_by) "
+                "INSERT INTO core.users (tenant_id, email, password_hash, system_roles, created_by) "
                 "VALUES (%s, %s, %s, %s, %s)",
                 (tenant_id, body.admin_email, admin_password_hash, admin_roles, created_by),
             )
@@ -138,7 +138,7 @@ async def create_company(body: CreateCompanyRequest) -> CreateCompanyResponse:
 class CreateUserRequest(BaseModel):
     email: str
     password: str = Field(min_length=8)
-    roles: list[str]
+    system_roles: list[str]
     # `tenant_id` CỐ Ý KHÔNG có field ở đây — client không có chỗ nào để tự khai tenant, server
     # LUÔN dùng tenant_id TƯƠI (tra lại từ `core.users` ngay trong request, xem `create_user`)
     # của người gọi (company-admin đang đăng nhập), KHÔNG phải claim JWT. Copy nguyên văn lý do
@@ -153,13 +153,13 @@ class CreateUserResponse(BaseModel):
     user_id: str
     email: str
     tenant_id: str
-    roles: list[str]
+    system_roles: list[str]
 
 
 @router.post("/users", response_model=CreateUserResponse)
 async def create_user(body: CreateUserRequest) -> CreateUserResponse:
     # `get_request_session()` ở đây CHỈ để lấy identity (`session.user`) — KHÔNG dùng
-    # `session.roles`/`session.tenant_id` (claim JWT) để phân quyền/gán tenant, xem SELECT dưới.
+    # `session.system_roles`/`session.tenant_id` (claim JWT) để phân quyền/gán tenant, xem SELECT dưới.
     session = get_request_session()
 
     # Dùng connection của middleware (`get_request_connection()`) + SAVEPOINT qua `conn.transaction()`
@@ -167,11 +167,11 @@ async def create_user(body: CreateUserRequest) -> CreateUserResponse:
     # `create_company` ở trên (comment đầy đủ tại đó, review `app#17` đợt 5, Chặn B).
     conn = get_request_connection()
 
-    # Tra `id`/`roles`/`tenant_id` TƯƠI từ `core.users`, KHÔNG dùng `session.roles`/
+    # Tra `id`/`system_roles`/`tenant_id` TƯƠI từ `core.users`, KHÔNG dùng `session.system_roles`/
     # `session.tenant_id` (claim JWT) — JWT là ảnh chụp lúc đăng nhập, sống tới
     # `jwt_expire_minutes` (mặc định 480 phút). 2 hệ quả nếu tin thẳng JWT (review `app#17`,
     # Important #1, đợt 8):
-    # 1. Admin bị thu hồi quyền (`roles` đổi trong DB) vẫn còn "admin" trong JWT cũ tới lúc hết
+    # 1. Admin bị thu hồi quyền (`system_roles` đổi trong DB) vẫn còn "admin" trong JWT cũ tới lúc hết
     #    hạn — leo quyền tạm thời, không cần làm gì thêm ngoài chờ JWT hết hạn tự nhiên.
     # 2. Admin bị CHUYỂN CÔNG TY (`tenant_id` đổi trong DB, vd tách/sáp nhập tenant) vẫn ghi user
     #    mới vào tenant CŨ (từ JWT) thay vì tenant HIỆN TẠI — user mới lạc sang company sai.
@@ -188,8 +188,8 @@ async def create_user(body: CreateUserRequest) -> CreateUserResponse:
     # định #2), nhưng `wb.recipes`/`kb.chunks`/mọi bảng CÓ RLS mà route khác trên CÙNG request này
     # lỡ đọc/ghi sẽ vẫn lọc theo tenant CŨ. Đây là 1 THỂ HIỆN của lỗ hổng rộng hơn: `routes/runs.py`,
     # `routes/chat.py`, `routes/publish.py`, content-section role fence ở `packages/engine` đều còn
-    # phân quyền bằng `session.roles`/`session.tenant_id` (claim JWT) — vá trọn vẹn đòi middleware
-    # tự tra lại `roles`/`tenant_id` MỖI request (round-trip DB thêm cho MỌI route, không riêng
+    # phân quyền bằng `session.system_roles`/`session.tenant_id` (claim JWT) — vá trọn vẹn đòi middleware
+    # tự tra lại `system_roles`/`tenant_id` MỖI request (round-trip DB thêm cho MỌI route, không riêng
     # route admin), ngoài phạm vi 1 PR sửa 2 route admin.
     # `fetch_fresh_identity` gom round-trip SELECT + lưới an toàn "tài khoản bị offboard nhưng JWT
     # cũ còn hạn" (Chặn 1, review `app#17`) — xem docstring `authz.py`. Cùng 2 hệ quả nếu tin thẳng
@@ -199,7 +199,7 @@ async def create_user(body: CreateUserRequest) -> CreateUserResponse:
     identity = await fetch_fresh_identity(conn, session.user)
     created_by = identity.id
     creator_tenant_id = identity.tenant_id
-    creator_roles = identity.roles
+    creator_roles = identity.system_roles
     require_admin(creator_roles)
 
     if "admin" not in creator_roles:
@@ -228,14 +228,14 @@ async def create_user(body: CreateUserRequest) -> CreateUserResponse:
     # superadmin cho mọi company-admin của tenant đó, bất kể validator mới đã chặn được record MỚI.
     valid_role_vocab = (section_names - RESERVED_ROLE_NAMES) | {"admin"}
 
-    invalid_roles = set(body.roles) - valid_role_vocab
+    invalid_roles = set(body.system_roles) - valid_role_vocab
     if invalid_roles:
         raise HTTPException(
             status_code=400,
             detail=f"role {sorted(invalid_roles)} không hợp lệ — chỉ chấp nhận {sorted(valid_role_vocab)}",
         )
-    if not body.roles:
-        # `roles: []` tạo được và đăng nhập được — không phải lỗ hổng (fence trả 0 chunk cho tập
+    if not body.system_roles:
+        # `system_roles: []` tạo được và đăng nhập được — không phải lỗ hổng (fence trả 0 chunk cho tập
         # role rỗng), nhưng không có lý do hợp lệ nào cho phép tài khoản không role nào tồn tại
         # (review `app#17`, "nên sửa" #5).
         raise HTTPException(status_code=400, detail="roles không được rỗng.")
@@ -248,9 +248,9 @@ async def create_user(body: CreateUserRequest) -> CreateUserResponse:
     try:
         async with conn.transaction():
             cur = await conn.execute(
-                "INSERT INTO core.users (tenant_id, email, password_hash, roles, created_by) "
+                "INSERT INTO core.users (tenant_id, email, password_hash, system_roles, created_by) "
                 "VALUES (%s, %s, %s, %s, %s) RETURNING id",
-                (str(creator_tenant_id), body.email, password_hash, body.roles, created_by),
+                (str(creator_tenant_id), body.email, password_hash, body.system_roles, created_by),
             )
     except psycopg.errors.UniqueViolation as exc:  # email đã tồn tại — 409, không 500
         raise HTTPException(status_code=409, detail=f"email {body.email!r} đã tồn tại") from exc
@@ -259,7 +259,7 @@ async def create_user(body: CreateUserRequest) -> CreateUserResponse:
     user_id = row[0]
 
     return CreateUserResponse(
-        user_id=str(user_id), email=body.email, tenant_id=str(creator_tenant_id), roles=body.roles
+        user_id=str(user_id), email=body.email, tenant_id=str(creator_tenant_id), system_roles=body.system_roles
     )
 
 
@@ -276,7 +276,7 @@ async def list_companies() -> list[CompanySummary]:
     session = get_request_session()
     conn = get_request_connection()
     identity = await fetch_fresh_identity(conn, session.user)
-    require_superadmin(identity.roles)
+    require_superadmin(identity.system_roles)
 
     cur = await conn.execute(
         "SELECT id, name, created_at FROM core.tenants WHERE name != '__system__' ORDER BY created_at DESC"
@@ -288,7 +288,7 @@ async def list_companies() -> list[CompanySummary]:
 class UserSummary(BaseModel):
     user_id: str
     email: str
-    roles: list[str]
+    system_roles: list[str]
     is_active: bool
     created_at: str
     """CỐ Ý không có `password`/`password_hash` — xem `test_admin_routes.py`."""
@@ -302,16 +302,16 @@ async def list_users() -> list[UserSummary]:
     session = get_request_session()
     conn = get_request_connection()
     identity = await fetch_fresh_identity(conn, session.user)
-    require_admin(identity.roles)
+    require_admin(identity.system_roles)
 
     cur = await conn.execute(
-        "SELECT id, email, roles, is_active, created_at FROM core.users WHERE tenant_id = %s ORDER BY created_at DESC",
+        "SELECT id, email, system_roles, is_active, created_at FROM core.users WHERE tenant_id = %s ORDER BY created_at DESC",
         (str(identity.tenant_id),),
     )
     rows = await cur.fetchall()
     return [
         UserSummary(
-            user_id=str(row[0]), email=row[1], roles=list(row[2]), is_active=row[3], created_at=row[4].isoformat()
+            user_id=str(row[0]), email=row[1], system_roles=list(row[2]), is_active=row[3], created_at=row[4].isoformat()
         )
         for row in rows
     ]
@@ -330,12 +330,12 @@ async def _fetch_user_in_own_tenant(conn: AsyncConnection[Any], user_id: str, te
 
 
 class UpdateUserRolesRequest(BaseModel):
-    roles: list[str]
+    system_roles: list[str]
 
 
 @router.patch("/users/{user_id}", response_model=UserSummary)
 async def update_user_roles(user_id: str, body: UpdateUserRolesRequest) -> UserSummary:
-    """Admin-only, đổi `roles` của 1 nhân viên TRONG CHÍNH tenant mình — cùng validate vocab động
+    """Admin-only, đổi `system_roles` của 1 nhân viên TRONG CHÍNH tenant mình — cùng validate vocab động
     theo `core.sections` như `create_user` (không tin riêng UI chặn).
 
     KHÔNG cho tự sửa role của CHÍNH tài khoản đang đăng nhập (cùng lý do `deactivate_user` chặn tự
@@ -345,7 +345,7 @@ async def update_user_roles(user_id: str, body: UpdateUserRolesRequest) -> UserS
     session = get_request_session()
     conn = get_request_connection()
     identity = await fetch_fresh_identity(conn, session.user)
-    require_admin(identity.roles)
+    require_admin(identity.system_roles)
     await _fetch_user_in_own_tenant(conn, user_id, identity.tenant_id)
 
     if user_id == str(identity.id):
@@ -363,23 +363,23 @@ async def update_user_roles(user_id: str, body: UpdateUserRolesRequest) -> UserS
     # superadmin cho mọi company-admin của tenant đó, bất kể validator mới đã chặn được record MỚI.
     valid_role_vocab = (section_names - RESERVED_ROLE_NAMES) | {"admin"}
 
-    invalid_roles = set(body.roles) - valid_role_vocab
+    invalid_roles = set(body.system_roles) - valid_role_vocab
     if invalid_roles:
         raise HTTPException(
             status_code=400,
             detail=f"role {sorted(invalid_roles)} không hợp lệ — chỉ chấp nhận {sorted(valid_role_vocab)}",
         )
-    if not body.roles:
+    if not body.system_roles:
         raise HTTPException(status_code=400, detail="roles không được rỗng.")
 
     cur = await conn.execute(
-        "UPDATE core.users SET roles = %s WHERE id = %s RETURNING id, email, roles, is_active, created_at",
-        (body.roles, user_id),
+        "UPDATE core.users SET system_roles = %s WHERE id = %s RETURNING id, email, system_roles, is_active, created_at",
+        (body.system_roles, user_id),
     )
     row = await cur.fetchone()
     assert row is not None
     return UserSummary(
-        user_id=str(row[0]), email=row[1], roles=list(row[2]), is_active=row[3], created_at=row[4].isoformat()
+        user_id=str(row[0]), email=row[1], system_roles=list(row[2]), is_active=row[3], created_at=row[4].isoformat()
     )
 
 
@@ -400,7 +400,7 @@ async def deactivate_user(user_id: str) -> None:
     session = get_request_session()
     conn = get_request_connection()
     identity = await fetch_fresh_identity(conn, session.user)
-    require_admin(identity.roles)
+    require_admin(identity.system_roles)
     await _fetch_user_in_own_tenant(conn, user_id, identity.tenant_id)
 
     if user_id == str(identity.id):
@@ -418,15 +418,15 @@ async def reactivate_user(user_id: str) -> UserSummary:
     session = get_request_session()
     conn = get_request_connection()
     identity = await fetch_fresh_identity(conn, session.user)
-    require_admin(identity.roles)
+    require_admin(identity.system_roles)
     await _fetch_user_in_own_tenant(conn, user_id, identity.tenant_id)
 
     cur = await conn.execute(
-        "UPDATE core.users SET is_active = true WHERE id = %s RETURNING id, email, roles, is_active, created_at",
+        "UPDATE core.users SET is_active = true WHERE id = %s RETURNING id, email, system_roles, is_active, created_at",
         (user_id,),
     )
     row = await cur.fetchone()
     assert row is not None
     return UserSummary(
-        user_id=str(row[0]), email=row[1], roles=list(row[2]), is_active=row[3], created_at=row[4].isoformat()
+        user_id=str(row[0]), email=row[1], system_roles=list(row[2]), is_active=row[3], created_at=row[4].isoformat()
     )

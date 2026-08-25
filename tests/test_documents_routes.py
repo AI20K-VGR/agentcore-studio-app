@@ -24,8 +24,8 @@ async def _close_singleton_pools_after_test() -> AsyncIterator[None]:
     await close_pools()
 
 
-def _set_session(*, tenant_id: UUID, user: str, roles: list[str]) -> object:
-    session = ResolvedContext(tenant_id=tenant_id, user=user, roles=roles)
+def _set_session(*, tenant_id: UUID, user: str, system_roles: list[str]) -> object:
+    session = ResolvedContext(tenant_id=tenant_id, user=user, system_roles=system_roles)
     return middleware._request_session.set(session)
 
 
@@ -48,11 +48,11 @@ async def _seed_tenant(admin_pool: Pool, name: str) -> UUID:
     return UUID(str(row[0]))
 
 
-async def _seed_user(admin_pool: Pool, tenant_id: UUID, email: str, roles: list[str]) -> UUID:
+async def _seed_user(admin_pool: Pool, tenant_id: UUID, email: str, system_roles: list[str]) -> UUID:
     async with admin_pool.connection() as conn:
         cur = await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s) RETURNING id",
-            (str(tenant_id), email, "not-a-real-hash", roles),
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s) RETURNING id",
+            (str(tenant_id), email, "not-a-real-hash", system_roles),
         )
         row = await cur.fetchone()
     assert row is not None
@@ -79,7 +79,7 @@ async def test_company_admin_uploads_document(admin_pool: Pool) -> None:
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
             result = await upload_document(
@@ -108,7 +108,7 @@ async def test_upload_rejects_unknown_section_role(admin_pool: Pool) -> None:
     tenant_id = await _seed_tenant(admin_pool, "documents-probe-b")
     await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
@@ -129,7 +129,7 @@ async def test_upload_rejects_unsupported_extension(admin_pool: Pool) -> None:
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
@@ -150,7 +150,7 @@ async def test_upload_accepts_txt_file(admin_pool: Pool) -> None:
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
             result = await upload_document(
@@ -172,7 +172,7 @@ async def test_upload_accepts_md_without_heading(admin_pool: Pool) -> None:
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
             result = await upload_document(
@@ -203,7 +203,7 @@ async def test_upload_accepts_docx_file(admin_pool: Pool) -> None:
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
             result = await upload_document(
@@ -230,7 +230,7 @@ async def test_company_admin_cannot_upload_for_other_tenant(admin_pool: Pool) ->
     admin_a_id = await _seed_user(admin_pool, tenant_a, "admin-a@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_a, "hr", admin_a_id)
 
-    token = _set_session(tenant_id=tenant_a, user="admin-a@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_a, user="admin-a@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
@@ -248,7 +248,7 @@ async def test_superadmin_must_declare_tenant_id(admin_pool: Pool) -> None:
     tenant_id = await _seed_tenant(admin_pool, "documents-probe-f")
     await _seed_user(admin_pool, tenant_id, "su@sys", ["superadmin"])
 
-    token = _set_session(tenant_id=tenant_id, user="su@sys", roles=["superadmin"])
+    token = _set_session(tenant_id=tenant_id, user="su@sys", system_roles=["superadmin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
@@ -266,7 +266,7 @@ async def test_upload_rejects_unknown_tenant_for_superadmin(admin_pool: Pool) ->
     tenant_id = await _seed_tenant(admin_pool, "documents-probe-g")
     await _seed_user(admin_pool, tenant_id, "su@sys", ["superadmin"])
 
-    token = _set_session(tenant_id=tenant_id, user="su@sys", roles=["superadmin"])
+    token = _set_session(tenant_id=tenant_id, user="su@sys", system_roles=["superadmin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
@@ -296,7 +296,7 @@ async def test_upload_rejects_document_over_word_cap(admin_pool: Pool, monkeypat
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
@@ -318,7 +318,7 @@ async def test_upload_accepts_document_dung_bang_word_cap(admin_pool: Pool, monk
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
             result = await upload_document(
@@ -355,7 +355,7 @@ async def test_upload_rejects_corrupt_docx_bang_422_khong_phai_500(admin_pool: P
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():

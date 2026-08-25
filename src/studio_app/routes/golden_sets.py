@@ -66,7 +66,7 @@ def _phan_giai_tenant(identity: Any, khai: str | None) -> UUID:
     """Dual-gate y hệt `routes/documents.py`: superadmin **bắt buộc** khai `tenant_id` (JWT của họ
     trỏ `__system__`, không có tenant mặc định); company-admin dùng tenant mình, 403 nếu khai tenant
     khác."""
-    if "superadmin" in identity.roles:
+    if "superadmin" in identity.system_roles:
         if khai is None:
             raise HTTPException(
                 status_code=400, detail="superadmin phải khai tenant_id để nạp golden set cho công ty nào"
@@ -85,7 +85,7 @@ async def upload_golden_set(body: UploadGoldenSetRequest) -> UploadGoldenSetResp
     session = get_request_session()
     conn = get_request_connection()
     identity = await fetch_fresh_identity(conn, session.user)
-    require_admin(identity.roles)
+    require_admin(identity.system_roles)
 
     tenant_uuid = _phan_giai_tenant(identity, body.tenant_id)
 
