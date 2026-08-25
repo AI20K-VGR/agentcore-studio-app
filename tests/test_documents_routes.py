@@ -116,7 +116,7 @@ async def test_upload_doc_id_la_slug_ten_file(admin_pool: Pool) -> None:
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
             result = await upload_document(
@@ -141,7 +141,7 @@ async def test_reupload_ten_trung_khac_phong_ban_khong_xoa_nham(admin_pool: Pool
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
     await _seed_section(admin_pool, tenant_id, "finance", admin_id)
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
             hr_result = await upload_document(
@@ -181,7 +181,7 @@ async def test_reupload_cung_doc_id_xoa_orphan_chunk(admin_pool: Pool) -> None:
     long_text = " ".join(f"tu{i}" for i in range(1000)).encode()
     short_text = b"noi dung rat ngan sau khi sua lai file."
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
             first = await upload_document(
