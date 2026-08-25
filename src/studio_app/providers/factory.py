@@ -155,7 +155,7 @@ class ReadOnlyEmbedding:
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         raise AssertionError(
-            f"_ReadOnlyEmbedding.embed() bị gọi với {len(texts)} chuỗi — đường đọc/xoá tài liệu "
+            f"ReadOnlyEmbedding.embed() bị gọi với {len(texts)} chuỗi — đường đọc/xoá tài liệu "
             "không được embed gì. Nếu route này giờ CẦN embed thật, dùng `build_embedding` và "
             "cập nhật test_routes_embedding_wiring.py cho đúng số lời gọi."
         )

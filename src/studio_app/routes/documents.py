@@ -59,7 +59,6 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from psycopg import sql
 from pydantic import BaseModel
 from studio_kb.chunk_window import cut_window
 from studio_kb.extract import SUPPORTED_SUFFIXES, UnsupportedFormatError, extract_text
@@ -68,7 +67,7 @@ from studio_kb.pipeline import KbPipeline
 from studio_app.authz import fetch_fresh_identity, fetch_tenant_section_names, require_admin
 from studio_app.core._db import get_pool
 from studio_app.core.golden_autogen import regenerate_for_section
-from studio_app.middleware import get_request_connection, get_request_session
+from studio_app.middleware import borrowed_tenant_scope, get_request_connection, get_request_session
 from studio_app.providers.factory import ReadOnlyEmbedding, build_embedding
 
 router = APIRouter(prefix="/api/admin/documents", tags=["documents"])
@@ -330,8 +329,11 @@ async def upload_document(
     # Để lỗi NỔI LÊN chứ không nuốt: upload lại cùng file là idempotent (`delete_by_doc_id` +
     # sinh lại toàn bộ), nên đường phục hồi là thử lại, và một 500 nói rõ hơn một 200 nửa vời.
     conn = get_request_connection()
-    async with conn.transaction():
-        await conn.execute(sql.SQL("SET LOCAL app.tenant_id = {}").format(sql.Literal(str(tenant_uuid))))
+    # `borrowed_tenant_scope` chứ không tự `SET LOCAL` tại chỗ: khối này là SAVEPOINT lồng trong
+    # transaction của middleware, và RELEASE SAVEPOINT **không** revert `SET LOCAL` — không trả lại
+    # thì phần còn lại của request chạy dưới RLS context của công ty khác (review app#71 đợt 2,
+    # mục 2; đo thật, xem docstring hàm đó).
+    async with borrowed_tenant_scope(conn, tenant_uuid):
         golden = await regenerate_for_section(
             conn,
             pipeline,

@@ -26,7 +26,6 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException
-from psycopg import sql
 from pydantic import BaseModel, Field, ValidationError
 from studio_evalhub.golden_case import GoldenCase, GoldenSet
 from studio_evalhub.golden_merge import case_key
@@ -36,7 +35,7 @@ from studio_kb.pipeline import KbPipeline
 from studio_app.authz import fetch_fresh_identity, fetch_tenant_section_names, require_admin
 from studio_app.core._db import get_pool
 from studio_app.core.golden_autogen import regenerate_for_section
-from studio_app.middleware import get_request_connection, get_request_session
+from studio_app.middleware import borrowed_tenant_scope, get_request_connection, get_request_session
 from studio_app.providers.factory import ReadOnlyEmbedding
 
 router = APIRouter(prefix="/api/admin/golden-sets", tags=["golden-sets"])
@@ -138,14 +137,14 @@ async def upload_golden_set(body: UploadGoldenSetRequest) -> UploadGoldenSetResp
         # field gõ sai, và nuốt nó thành một câu chung chung là vứt đi phần giá trị nhất.
         raise HTTPException(status_code=422, detail=f"case không hợp lệ: {exc.errors()!r}") from exc
 
-    async with conn.transaction():
-        # Superadmin nạp hộ tenant khác: `app.tenant_id` của phiên đang trỏ `__system__`, nên
-        # `write_golden_set` sẽ từ chối (`GoldenSetScopeError`) — đúng thiết kế của nó. Bind lại
-        # TƯỜNG MINH ở đây là cách **thoả** cổng đó, không phải vượt qua nó: connection thật sự được
-        # scope về tenant đích trong đúng transaction này. `SET LOCAL` hết hiệu lực khi transaction
-        # đóng, nên phần còn lại của request không thừa hưởng quyền này.
-        await conn.execute(sql.SQL("SET LOCAL app.tenant_id = {}").format(sql.Literal(str(tenant_uuid))))
-
+    # Superadmin nạp hộ tenant khác: `app.tenant_id` của phiên đang trỏ `__system__`, nên
+    # `write_golden_set` sẽ từ chối (`GoldenSetScopeError`) — đúng thiết kế của nó. `borrowed_tenant_scope`
+    # bind lại TƯỜNG MINH về tenant đích rồi **trả lại** scope của phiên gọi lúc thoát khối.
+    #
+    # Bản trước tự `SET LOCAL` tại chỗ kèm lời khẳng định "hết hiệu lực khi transaction đóng, nên
+    # phần còn lại của request không thừa hưởng quyền này" — sai (review app#71 đợt 2, mục 2), xem
+    # docstring `borrowed_tenant_scope`: khối này là SAVEPOINT lồng, RELEASE không revert `SET LOCAL`.
+    async with borrowed_tenant_scope(conn, tenant_uuid):
         # PHỦ LÊN bộ đang có, không ghi đè cả bộ và cũng không `merge_golden_sets`.
         #
         # Bản trước gọi thẳng `write_golden_set`, nên nạp một bộ trùng `golden_set_ref` sẽ XOÁ SẠCH
@@ -201,6 +200,16 @@ class RegenerateResponse(BaseModel):
     n_human: int
     """Case người dùng tự viết (`source="human"`) được GIỮ NGUYÊN qua lần sinh lại. Khai riêng vì
     đó đúng là câu người bấm nút lo: *"bấm cái này có mất phần tôi gõ tay không?"*"""
+
+    written: bool
+    """Bộ trong DB có được thay bằng kết quả lượt này không.
+
+    `written=False` nghĩa là lượt dựng lại không ra case nào nên bộ CŨ được giữ nguyên (guard
+    rỗng-thì-không-ghi ở `regenerate_for_section`, có lý do riêng: bộ 0 case đi tiếp vào
+    `EvalHarness.run()` cho `success_rate` trên mẫu số 0). Trước bản vá này route trả `n_cases=0`
+    cho ca đó y như ca bộ thật sự rỗng (review app#71, Dozyboy, đợt 2, mục 1) — người bấm nút tin
+    bộ cũ đã biến mất, trong khi cổng publish vẫn chấm bằng đúng bộ cũ đó. Cờ này là thứ DUY NHẤT
+    phân biệt được hai ca."""
 
 
 @router.post("/regenerate", response_model=RegenerateResponse)
@@ -259,12 +268,15 @@ async def regenerate_golden_set(body: RegenerateRequest) -> RegenerateResponse:
     # Ở route này nó sai gấp đôi: "dựng lại bộ mà không cần nạp lại tài liệu" đúng là thứ người ta
     # cần **lúc provider đang hỏng** — chặn nó bằng chính lỗi provider là chặn đường thoát hiểm.
     pipeline = KbPipeline(await get_pool(), ReadOnlyEmbedding())
-    async with conn.transaction():
-        await conn.execute(sql.SQL("SET LOCAL app.tenant_id = {}").format(sql.Literal(str(tenant_uuid))))
+    async with borrowed_tenant_scope(conn, tenant_uuid):
         report = await regenerate_for_section(
             conn, pipeline, tenant_id=tenant_uuid, tenant_slug=tenant_slug, section_role=body.section_role
         )
 
     return RegenerateResponse(
-        golden_set_ref=report.golden_set_ref, n_cases=report.n_cases, n_ai=report.n_ai, n_human=report.n_human
+        golden_set_ref=report.golden_set_ref,
+        n_cases=report.n_cases,
+        n_ai=report.n_ai,
+        n_human=report.n_human,
+        written=report.written,
     )

@@ -551,3 +551,40 @@ async def test_read_only_paths_still_work_when_embedding_provider_is_BROKEN(
     assert listed.documents == []
     assert regenerated.n_cases == 0, "tenant chưa có tài liệu nên bộ rỗng — điều cần đo là KHÔNG ném 503"
     assert deleted.not_found == ["khong-co-that"]
+
+
+async def test_borrowed_tenant_scope_is_returned_after_the_route_finishes(admin_pool: Pool) -> None:
+    """Review app#71 đợt 2, mục 2 — superadmin mượn RLS context của một công ty, và phải TRẢ LẠI.
+
+    `conn.transaction()` trong route là một SAVEPOINT lồng bên trong transaction do
+    `tenant_context_middleware` mở. `SET LOCAL` chỉ hết hiệu lực khi **transaction** đóng; RELEASE
+    SAVEPOINT thì không. Đo thật trên Postgres 17 (trong savepoint: tenant đích · sau RELEASE:
+    **vẫn** tenant đích · sau COMMIT ngoài: rỗng) — nên bản trước để phần còn lại của request chạy
+    dưới RLS context của công ty khác. Hôm nay chưa hỏng vì không route nào chạy tiếp trên `conn`
+    sau handler; bài này tồn tại để giả định đó không âm thầm mất đi khi có route thêm sau.
+
+    Đọc `current_setting` trên ĐÚNG connection của request (không phải `admin_pool`) — hai
+    connection khác nhau thì `SET LOCAL` của bên này vô hình với bên kia, và bài sẽ xanh giả.
+    """
+    system_tenant = await _seed_tenant(admin_pool, f"regen-scope-sys-{uuid4().hex[:8]}")
+    await _seed_user(admin_pool, system_tenant, "root-scope@sys.test", ["superadmin"])
+    company = await _seed_tenant(admin_pool, f"regen-scope-co-{uuid4().hex[:8]}")
+    company_admin = await _seed_user(admin_pool, company, "admin@scope.test", ["admin"])
+    await _seed_section(admin_pool, company, "hr", company_admin)
+
+    token = _set_session(tenant_id=system_tenant, user="root-scope@sys.test", system_roles=["superadmin"])
+    try:
+        async with _simulate_request_connection():
+            conn = middleware.get_request_connection()
+            await regenerate_golden_set(RegenerateRequest(section_role="hr", tenant_id=str(company)))
+            after = await (await conn.execute("SELECT current_setting('app.tenant_id', true)")).fetchone()
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert after is not None
+    assert after[0] != str(company), f"request vẫn đứng ở RLS context của công ty khác sau khi route xong: {after[0]}"
+    # So với tenant của CHÍNH phiên gọi, không so với giá trị đọc được trước lời gọi: bộ khung test
+    # gọi thẳng hàm route nên `_simulate_request_connection` không chạy `tenant_context_middleware`,
+    # và `app.tenant_id` lúc vào là chuỗi rỗng chứ không phải giá trị middleware sẽ đặt trong một
+    # request thật. Bất biến cần ghim là "trả về ĐÚNG tenant của phiên gọi", và đó là thứ so ở đây.
+    assert after[0] == str(system_tenant), f"phải trả về tenant của phiên gọi, thấy {after[0]!r}"

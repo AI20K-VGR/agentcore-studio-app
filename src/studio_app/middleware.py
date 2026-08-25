@@ -15,7 +15,8 @@ mechanism the policy will later rely on).
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import datetime
 from typing import Any
@@ -107,6 +108,33 @@ def _resolve_jwt_session(request: Request) -> tuple[ResolvedContext, datetime] |
         return None
     token = raw[len("bearer ") :].strip()
     return verify_token(token), issued_at(token)
+
+
+@asynccontextmanager
+async def borrowed_tenant_scope(conn: Any, tenant_id: object) -> AsyncIterator[None]:
+    """Mượn RLS context của một tenant KHÁC trong đúng một khối, rồi trả lại scope của phiên gọi.
+
+    Chỉ dành cho route superadmin thao tác hộ một công ty (`routes/golden_sets.py`,
+    `routes/documents.py`): JWT của superadmin trỏ `__system__`, nên `write_golden_set` và mọi bảng
+    có RLS sẽ từ chối họ — bind lại tường minh ở đây là cách **thoả** cổng đó, không phải vượt qua
+    nó.
+
+    Bước trả lại scope KHÔNG thừa (review app#71, Dozyboy, đợt 2, mục 2). `conn.transaction()` ở
+    đây là một SAVEPOINT lồng bên trong transaction do `tenant_context_middleware` đã mở, và
+    `SET LOCAL` chỉ hết hiệu lực khi **transaction** đóng — RELEASE SAVEPOINT thì không. Đo thật
+    trên Postgres 17: trong savepoint đọc ra tenant đích, **sau RELEASE vẫn là tenant đích**, chỉ
+    tới COMMIT ngoài mới mất. Nghĩa là nếu không trả lại, phần còn lại của request chạy dưới RLS
+    context của công ty khác — hôm nay chưa hỏng vì không route nào chạy tiếp trên `conn` sau
+    handler, nhưng đó là loại giả định mà route thêm sau sẽ phá mà không ai nhận ra.
+
+    Nhánh lỗi không cần trả lại tay: exception thoát khỏi khối làm SAVEPOINT ROLLBACK, và rollback
+    thì **có** revert `SET LOCAL`.
+    """
+    session = get_request_session()
+    async with conn.transaction():
+        await conn.execute(sql.SQL("SET LOCAL app.tenant_id = {}").format(sql.Literal(str(tenant_id))))
+        yield
+        await conn.execute(sql.SQL("SET LOCAL app.tenant_id = {}").format(sql.Literal(str(session.tenant_id))))
 
 
 async def tenant_context_middleware(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
