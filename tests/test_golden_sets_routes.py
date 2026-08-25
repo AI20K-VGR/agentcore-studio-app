@@ -9,15 +9,23 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from io import BytesIO
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
-from fastapi import HTTPException
+from fastapi import HTTPException, UploadFile
 from studio_app import middleware
 from studio_app.core._db import Pool, close_pools, get_pool
-from studio_app.routes.golden_sets import UploadGoldenSetRequest, overlay_golden_set, upload_golden_set
+from studio_app.routes.documents import upload_document
+from studio_app.routes.golden_sets import (
+    RegenerateRequest,
+    UploadGoldenSetRequest,
+    overlay_golden_set,
+    regenerate_golden_set,
+    upload_golden_set,
+)
 from studio_evalhub.golden_case import GoldenCase, GoldenSet
 from studio_evalhub.golden_store import read_golden_set
 from studio_workbench.tenant_wall import ResolvedContext
@@ -51,6 +59,21 @@ async def _seed_tenant(admin_pool: Pool, name: str) -> UUID:
         row = await cur.fetchone()
     assert row is not None
     return UUID(str(row[0]))
+
+
+_VALID_MD = b"# Chinh sach\n\n## Nghi phep\nNhan vien chinh thuc duoc 12 ngay phep nam moi nam.\n"
+
+
+async def _seed_section(admin_pool: Pool, tenant_id: UUID, name: str, created_by: UUID) -> None:
+    async with admin_pool.connection() as conn:
+        await conn.execute(
+            "INSERT INTO core.sections (tenant_id, name, created_by) VALUES (%s, %s, %s)",
+            (str(tenant_id), name, str(created_by)),
+        )
+
+
+def _md_upload_file(filename: str, content: bytes) -> UploadFile:
+    return UploadFile(filename=filename, file=BytesIO(content))
 
 
 async def _seed_user(admin_pool: Pool, tenant_id: UUID, email: str, system_roles: list[str]) -> UUID:
@@ -335,3 +358,93 @@ def test_overlay_bo_cu_rong_thi_ra_dung_bo_vua_nap() -> None:
     )
     assert [c.case_id for c in merged.cases] == ["U-01"]
     assert n_kept == 0
+
+
+async def test_regenerate_dung_lai_bo_ma_khong_can_nap_tai_lieu(admin_pool: Pool) -> None:
+    """`POST /regenerate` — dựng lại bộ của một phòng ban từ tài liệu ĐANG CÓ.
+
+    Trước route này, đường sinh máy chỉ chạy như tác dụng phụ của việc nạp tài liệu. Một tenant đã
+    nạp đủ tài liệu mà muốn dựng lại bộ không có cách nào ngoài upload lại một file bất kỳ — bắt
+    người dùng làm một việc không liên quan để đạt việc họ cần.
+    """
+    tenant_id = await _seed_tenant(admin_pool, f"regen-{uuid4().hex[:8]}")
+    admin_id = await _seed_user(admin_pool, tenant_id, "admin@regen.test", ["admin"])
+    await _seed_section(admin_pool, tenant_id, "hr", admin_id)
+
+    token = _set_session(tenant_id=tenant_id, user="admin@regen.test", system_roles=["admin"])
+    try:
+        async with _simulate_request_connection():
+            await upload_document(file=_md_upload_file("Chinh sach.md", _VALID_MD), section_role="hr", tenant_id=None)
+        async with _simulate_request_connection():
+            result = await regenerate_golden_set(RegenerateRequest(section_role="hr"))
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert result.golden_set_ref == "kb-hr-auto-v1"
+    assert result.n_cases > 0, "dựng lại từ tài liệu đang có mà ra bộ rỗng"
+    assert result.n_ai == result.n_cases and result.n_human == 0
+
+
+async def test_regenerate_GIU_case_nguoi_dung_tu_viet(admin_pool: Pool) -> None:
+    """Vế đắt, và là hợp đồng mà cả form nhập tay lẫn file mẫu đứng lên trên.
+
+    `golden_autogen` sinh lại phần máy và **chỉ giữ** case `source="human"`. Nếu vế này hỏng thì mọi
+    câu người dùng gõ tay biến mất ở lần dựng lại kế tiếp — im lặng, không cảnh báo, và họ chỉ phát
+    hiện khi mở bộ ra xem."""
+    tenant_id = await _seed_tenant(admin_pool, f"regen-h-{uuid4().hex[:8]}")
+    admin_id = await _seed_user(admin_pool, tenant_id, "admin@regenh.test", ["admin"])
+    await _seed_section(admin_pool, tenant_id, "hr", admin_id)
+    tenant_slug = ""
+
+    token = _set_session(tenant_id=tenant_id, user="admin@regenh.test", system_roles=["admin"])
+    try:
+        async with _simulate_request_connection():
+            await upload_document(file=_md_upload_file("Chinh sach.md", _VALID_MD), section_role="hr", tenant_id=None)
+        async with _simulate_request_connection():
+            conn = middleware.get_request_connection()
+            cur = await conn.execute("SELECT name FROM core.tenants WHERE id = %s", (tenant_id,))
+            row = await cur.fetchone()
+            assert row is not None
+            tenant_slug = str(row[0])
+            await upload_golden_set(
+                UploadGoldenSetRequest(
+                    golden_set_ref="kb-hr-auto-v1",
+                    cases=[
+                        {
+                            "case_id": "HUMAN-001",
+                            "query": "Câu người dùng tự viết, không trùng câu máy sinh",
+                            "tenant": tenant_slug,
+                            "section_roles": ["hr"],
+                            "expected_tenant": tenant_slug,
+                            "expected_section_role": "hr",
+                            "expected": "đáp án tay",
+                            "expected_citation": [],
+                            "source": "human",
+                        }
+                    ],
+                )
+            )
+        async with _simulate_request_connection():
+            after = await regenerate_golden_set(RegenerateRequest(section_role="hr"))
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert after.n_human == 1, "case người dùng tự viết bị xoá khi dựng lại"
+
+
+async def test_regenerate_tu_choi_phong_ban_khong_co_that(admin_pool: Pool) -> None:
+    """400 kèm danh sách phòng ban hợp lệ, không phải 500 — người gõ sai tên phòng ban tự sửa được."""
+    tenant_id = await _seed_tenant(admin_pool, f"regen-x-{uuid4().hex[:8]}")
+    admin_id = await _seed_user(admin_pool, tenant_id, "admin@regenx.test", ["admin"])
+    await _seed_section(admin_pool, tenant_id, "hr", admin_id)
+
+    token = _set_session(tenant_id=tenant_id, user="admin@regenx.test", system_roles=["admin"])
+    try:
+        async with _simulate_request_connection():
+            with pytest.raises(HTTPException) as raised:
+                await regenerate_golden_set(RegenerateRequest(section_role="khong-co-that"))
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert raised.value.status_code == 400
+    assert "hr" in str(raised.value.detail)

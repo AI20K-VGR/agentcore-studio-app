@@ -31,9 +31,13 @@ from pydantic import BaseModel, Field, ValidationError
 from studio_evalhub.golden_case import GoldenCase, GoldenSet
 from studio_evalhub.golden_merge import case_key
 from studio_evalhub.golden_store import GoldenSetNotFound, GoldenSetScopeError, read_golden_set, write_golden_set
+from studio_kb.pipeline import KbPipeline
 
-from studio_app.authz import fetch_fresh_identity, require_admin
+from studio_app.authz import fetch_fresh_identity, fetch_tenant_section_names, require_admin
+from studio_app.core._db import get_pool
+from studio_app.core.golden_autogen import regenerate_for_section
 from studio_app.middleware import get_request_connection, get_request_session
+from studio_app.providers.factory import build_embedding
 
 router = APIRouter(prefix="/api/admin/golden-sets", tags=["golden-sets"])
 
@@ -182,4 +186,73 @@ async def upload_golden_set(body: UploadGoldenSetRequest) -> UploadGoldenSetResp
         n_traps=sum(1 for c in merged.cases if c.expects_refusal),
         n_uploaded=len(golden.cases),
         n_kept_from_existing=max(n_kept, 0),
+    )
+
+
+class RegenerateRequest(BaseModel):
+    section_role: str = Field(min_length=1)
+    tenant_id: str | None = None
+
+
+class RegenerateResponse(BaseModel):
+    golden_set_ref: str
+    n_cases: int
+    n_ai: int
+    n_human: int
+    """Case người dùng tự viết (`source="human"`) được GIỮ NGUYÊN qua lần sinh lại. Khai riêng vì
+    đó đúng là câu người bấm nút lo: *"bấm cái này có mất phần tôi gõ tay không?"*"""
+
+
+@router.post("/regenerate", response_model=RegenerateResponse)
+async def regenerate_golden_set(body: RegenerateRequest) -> RegenerateResponse:
+    """Dựng lại bộ câu hỏi kiểm thử của MỘT phòng ban từ tài liệu đang có, không cần upload gì.
+
+    Trước route này, đường sinh máy chỉ chạy như **tác dụng phụ của việc nạp tài liệu**
+    (`routes/documents.py`). Nên một tenant đã nạp đủ tài liệu mà muốn dựng lại bộ — vì vừa xoá vài
+    tài liệu, vì bộ cũ sinh ra khi KB còn thiếu, hay đơn giản vì muốn bắt đầu lại — **không có cách
+    nào** ngoài việc upload lại một tài liệu bất kỳ. Đó là bắt người dùng làm một việc không liên
+    quan để đạt được việc họ cần.
+
+    Case `source="human"` **được giữ**: `regenerate_for_section` đọc bộ cũ và mang chúng sang. Đây
+    là lý do form nhập tay bắt buộc gắn nhãn đó — không có nhãn, lần sinh lại kế tiếp xoá sạch.
+    """
+    session = get_request_session()
+    conn = get_request_connection()
+    identity = await fetch_fresh_identity(conn, session.user)
+    require_admin(identity.system_roles)
+
+    if "superadmin" in identity.system_roles:
+        if body.tenant_id is None:
+            raise HTTPException(status_code=400, detail="superadmin phải khai tenant_id")
+        try:
+            tenant_uuid = UUID(body.tenant_id)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"tenant_id không phải UUID hợp lệ: {body.tenant_id!r}"
+            ) from exc
+    else:
+        if body.tenant_id is not None and body.tenant_id != str(identity.tenant_id):
+            raise HTTPException(status_code=403, detail="company-admin chỉ dựng lại được cho tenant mình")
+        tenant_uuid = identity.tenant_id
+
+    valid = await fetch_tenant_section_names(conn, str(tenant_uuid))
+    if body.section_role not in valid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"phòng ban {body.section_role!r} không hợp lệ — chỉ chấp nhận {sorted(valid)}",
+        )
+
+    pipeline = KbPipeline(await get_pool(), build_embedding())
+    async with conn.transaction():
+        await conn.execute(sql.SQL("SET LOCAL app.tenant_id = {}").format(sql.Literal(str(tenant_uuid))))
+        cur = await conn.execute("SELECT name FROM core.tenants WHERE id = %s", (tenant_uuid,))
+        row = await cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"tenant {tenant_uuid} không có trong core.tenants")
+        report = await regenerate_for_section(
+            conn, pipeline, tenant_id=tenant_uuid, tenant_slug=str(row[0]), section_role=body.section_role
+        )
+
+    return RegenerateResponse(
+        golden_set_ref=report.golden_set_ref, n_cases=report.n_cases, n_ai=report.n_ai, n_human=report.n_human
     )
