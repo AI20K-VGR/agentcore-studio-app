@@ -99,7 +99,7 @@ async def seed_demo_tenants() -> None:
             )
             email = _DEMO_ADMIN_EMAILS[name]
             cur = await conn.execute(
-                "INSERT INTO core.users (tenant_id, email, password_hash, roles) "
+                "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) "
                 "VALUES (%s, %s, %s, %s) ON CONFLICT (email) DO NOTHING RETURNING id",
                 (tenant_id, email, password_hash, _DEMO_ADMIN_ROLES),
             )
