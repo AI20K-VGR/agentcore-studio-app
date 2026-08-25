@@ -1,5 +1,5 @@
-"""`POST /api/agents/{agent_id}/publish` (Kế hoạch 2, A4) — chạy đủ `golden_set_ref` qua
-`EvalHarness.run()` (evalhub, đã implement xong) ra `Scorecard`, rồi gọi `publish()`
+"""`POST /api/agents/{agent_id}/publish` (Kế hoạch 2, A4) — chạy `golden_set_ref` qua
+`EvalHarness.run(core_only=True)` (evalhub, đã implement xong) ra `Scorecard`, rồi gọi `publish()`
 (`studio_workbench.publish`, đã implement xong PR#22/D18) để gate + ghi `wb.recipes`.
 
 **Bộ golden đọc từ `eval.golden_sets`, không còn từ đĩa** (cutover, `evalhub#47`/`#48`). Trước bản
@@ -119,7 +119,8 @@ async def _load_golden_set(ref: str, tenant_id: UUID) -> GoldenSet:
 
 
 async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContext) -> tuple[Recipe, Scorecard]:
-    """Dựng recipe từ canvas + chạy NGUYÊN golden_set_ref qua `EvalHarness.run()` thật — dùng chung
+    """Dựng recipe từ canvas + chạy `golden_set_ref` qua `EvalHarness.run(core_only=True)` thật —
+    tập **Core**, không phải cả bộ (xem chú thích tại lời gọi bên dưới). Dùng chung
     cho cả `/evaluate` (chỉ xem điểm, KHÔNG ghi DB) lẫn `/publish` (chấm rồi ghi DB nếu đạt). Mỗi
     lần gọi route nào cũng chấm LẠI TỪ ĐẦU — route `/publish` không tin bất kỳ Scorecard nào UI đã
     thấy trước đó qua `/evaluate` (tag vs fence: UI chỉ gợi ý nút sáng/tắt, server luôn tự verify
@@ -201,6 +202,32 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
             tenant_ids=tenant_ids,
             threshold_success=recipe.scorecard_threshold.success,
             threshold_citation_accuracy=recipe.scorecard_threshold.citation_accuracy,
+            # Chấm trên tập **Core** (`evalhub.select_core`), không phải cả bộ. Cổng này chạy ĐỒNG
+            # BỘ trong một request HTTP: cả bộ golden nhân với trần `DEFAULT_MAX_TURNS` của
+            # agent-loop (vừa lên 6→20, engine#45) cho một request dài tới mức hỏng dưới dạng
+            # **timeout** thay vì dưới dạng scorecard trượt — hai kiểu hỏng người vận hành đọc rất
+            # khác nhau, và cái sau mới là thứ cổng này sinh ra để nói.
+            #
+            core_only=True,
+            # `core_min_answer=1`, KHÔNG phải mặc định 10 của evalhub — và đây là chỗ cần đọc kỹ.
+            #
+            # Bật `core_only` để giải bài **timeout**: đó là toàn bộ mục đích. Nhưng mặc định
+            # `min_answer=10` của `select_core` kèm theo một thứ khác hẳn — một **tiền điều kiện
+            # publish mới**: bộ nào dưới 10 case trả-lời thì `CoreSelectionError` → 400, tức không
+            # publish được, nơi trước bản vá này publish được bình thường (đường cũ chạy cả bộ,
+            # không có ngưỡng tối thiểu nào).
+            #
+            # Bán kính đã ĐO, không phỏng đoán: mọi fixture golden của các bài publish hiện có
+            # (`test_publish_reads_golden_from_db.py`, `test_publish_wires_judge.py`,
+            # `test_evaluate_certifies_the_recipe_it_scores.py`) chỉ có 1–2 case. Và từ app#61,
+            # golden set sinh tự động theo từng `section_role` lúc upload nên tenant vừa nạp một
+            # tài liệu cũng dưới ngưỡng — bộ nhỏ là ca THƯỜNG.
+            #
+            # Nâng ngưỡng đó là một quyết định SẢN PHẨM (đánh đổi: `success_rate` trên bộ nhỏ ít ý
+            # nghĩa, đổi lấy việc tenant nhỏ publish được), tách hẳn khỏi bài timeout mà PR này
+            # giải. Không gộp hai thứ vào một lần đổi: `1` giữ nguyên khả năng publish như hôm nay,
+            # còn chọn `10` hay số khác thì để một lần chốt riêng, tường minh.
+            core_min_answer=1,
             # DEC-03 hoàn thiện tại `studio_workbench.publish.recipe_hash()` — đây là mắt xích
             # DUY NHẤT còn thiếu của đường ống (evalhub đã mở `recipe_hash=` từ D20/`DEC-D20-02`,
             # chỉ chưa có caller nào tính+truyền giá trị thật). Băm ĐÚNG `recipe` vừa graph_lint
@@ -243,6 +270,12 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
         # `agent_config.tool_whitelist` (model tự ý gọi, không phải lỗi client khai `golden_set_ref`
         # sai). Message KHÔNG còn giả định cứng nguyên nhân — trả nguyên `str(exc)` (đã đủ cụ thể ở
         # cả 2 nguồn) thay vì diễn giải sai 1 trong 2 trường hợp.
+        #
+        # NGUỒN THỨ BA từ khi bật `core_only=True` ở trên: `evalhub.CoreSelectionError` — nó LÀ một
+        # `ValueError` nên rơi vào đúng khối này, và 400 là đúng ý ("bộ golden của tenant chưa đủ
+        # để chấm", không phải bug hệ thống). Thông điệp của nó tự nói rõ thiếu bao nhiêu case
+        # trả-lời và thiếu ở bộ golden chứ không ở luật chọn, nên `str(exc)` vẫn là thứ đúng để
+        # trả — giữ nguyên quy tắc "không diễn giải cứng nguyên nhân" của khối này.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except (AgentLoopExhausted, PermissionError) as exc:
         # app#44 — 2 loại exception MỚI `run_agent_loop()` có thể ném mà `interpreter.run()` không
