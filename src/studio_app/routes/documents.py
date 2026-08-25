@@ -387,14 +387,26 @@ async def list_documents(tenant_id: str | None = None) -> DocumentListResponse:
     pipeline = KbPipeline(await get_pool(), _ReadOnlyEmbedding())
     chunks = await pipeline.chunks_for_tenant(tenant_uuid)
 
+    # Gom kèm `doc_name`: cột hiển thị kb#64 vừa thêm, giữ nguyên hoa/thường/dấu tiếng Việt. Lấy
+    # tên của chunk ĐẦU TIÊN trong nhóm — mọi chunk cùng `doc_id` đến từ cùng một lần upload nên
+    # mang cùng tên; nếu lệch thì đó là dấu hiệu hai tài liệu đụng `doc_id` (xem issue app#70), và
+    # chọn cái đầu là chọn tất định thay vì chọn ngẫu nhiên theo thứ tự trả về.
     grouped: dict[tuple[str, str], int] = {}
+    names: dict[tuple[str, str], str] = {}
     for chunk in chunks:
-        grouped[(chunk.doc_id, chunk.section_role)] = grouped.get((chunk.doc_id, chunk.section_role), 0) + 1
+        key = (chunk.doc_id, chunk.section_role)
+        grouped[key] = grouped.get(key, 0) + 1
+        if chunk.doc_name and key not in names:
+            names[key] = chunk.doc_name
 
     documents = [
         DocumentSummary(
             id=doc_id,
-            name=_display_name(doc_id, section_role) if doc_id else _UNGROUPED_NAME,
+            # Ba nấc, tụt dần theo mức trung thực: tên gốc từ DB → tên đã slug hoá suy từ `doc_id`
+            # → nhãn gộp cho dòng chưa gắn tài liệu. Nấc giữa tồn tại vì dòng ghi TRƯỚC kb#64 có
+            # `doc_name` rỗng — hiện ô trống ở đó thì người dùng không hành động được với nó.
+            name=names.get((doc_id, section_role))
+            or (_display_name(doc_id, section_role) if doc_id else _UNGROUPED_NAME),
             section_role=section_role,
             chunk_count=count,
         )
