@@ -42,6 +42,11 @@ UNIQUE constraint, không 409). Không dựng bảng đăng ký tên gốc để
 1-dòng-1-chunk nên nhiều dòng của cùng 1 doc BẮT BUỘC chia sẻ 1 `doc_id`; UNIQUE(tenant_id, doc_id)
 trực tiếp trên bảng này là sai kỹ thuật, và một bảng đăng ký riêng nằm ngoài phạm vi yêu cầu hiện
 tại. Khác ca chéo phòng ban ở trên: đây LÀ cùng một ranh giới phân quyền, nên đánh đổi hợp lý.
+
+**`doc_name` (cột `kb.chunks.doc_name`) = `stem` NGUYÊN VĂN, KHÔNG qua `_slugify`** — vd
+`("hr", "Bao Cao Q1.docx")` → `"Bao Cao Q1"`. Tách riêng khỏi `doc_id` vì luật hiển thị: dữ liệu
+nội bộ (`doc_id`/`chunk_id` — đã slugify/hash, mất dấu/rút gọn) không được đưa thẳng lên UI —
+`doc_name` là seam DUY NHẤT cho việc đó, không dùng để xoá/so khớp (đó vẫn là việc của `doc_id`).
 """
 
 from __future__ import annotations
@@ -113,6 +118,10 @@ async def _tenant_slug(conn: Any, tenant_id: UUID) -> str:
 
 class UploadDocumentResponse(BaseModel):
     doc_id: str
+    doc_name: str
+    """Tên NGƯỜI ĐỌC ĐƯỢC để hiển thị UI — tên file gốc, bỏ đuôi, giữ nguyên hoa/thường/dấu. Khác
+    `doc_id` (khoá kỹ thuật, slugify) — luật hiển thị: không được đưa thẳng dữ liệu nội bộ
+    (`doc_id`/`chunk_id`) lên UI, xem `kb.chunks.doc_name` (`packages/kb/src/studio_kb/schema.py`)."""
     section_role: str
     chunk_count: int
     golden_set_ref: str
@@ -227,6 +236,11 @@ async def upload_document(
     # docstring đầu file — đây LÀ cùng ranh giới phân quyền nên đánh đổi hợp lý) — đổi lại, đây là
     # giá trị caller có thể tự tính lại được (biết cả tên file lẫn phòng ban mình vừa upload vào)
     # để gọi xoá sau này, không cần tra lại `chunk_id_prefix` đã hash.
+    # `doc_name` (cột riêng, KHÔNG phải khoá) = `stem` NGUYÊN VĂN, KHÔNG qua `_slugify` — đây là
+    # điểm khác biệt cố ý với `doc_id`: `doc_id` phải là khoá kỹ thuật ổn định (xoá/so khớp) nên
+    # slugify là bắt buộc, còn `doc_name` chỉ để HIỂN THỊ nên giữ nguyên hoa/thường/dấu tiếng Việt
+    # đúng như người upload đặt tên — luật hiển thị cấm đưa thẳng `doc_id`/`chunk_id` (dữ liệu nội
+    # bộ, đã slugify/hash) lên UI.
     stem = Path(file.filename).stem
     name_hash = hashlib.sha256(file.filename.encode("utf-8")).hexdigest()[:8]
     chunk_id_prefix = f"{tenant_uuid.hex}-{_slugify(section_role)}-{_slugify(stem)}-{name_hash}"
@@ -235,7 +249,7 @@ async def upload_document(
     chunks = cut_window(text, chunk_id_prefix, tenant_uuid, section_role)
     if not chunks:
         raise HTTPException(status_code=422, detail="tài liệu rỗng — không có chữ nào để cắt chunk")
-    chunks = [dataclasses.replace(c, doc_id=doc_id) for c in chunks]
+    chunks = [dataclasses.replace(c, doc_id=doc_id, doc_name=stem) for c in chunks]
 
     pipeline = KbPipeline(await get_pool(), build_embedding())
     embeddings = await pipeline.embed_invoke(chunks)
@@ -273,6 +287,7 @@ async def upload_document(
 
     return UploadDocumentResponse(
         doc_id=doc_id,
+        doc_name=stem,
         section_role=section_role,
         chunk_count=len(chunks),
         golden_set_ref=golden.golden_set_ref,
