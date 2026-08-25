@@ -20,7 +20,8 @@ from studio_app.routes.agents import (
     list_agents,
     rollback_agent,
 )
-from studio_workbench import create_recipe_d4
+from studio_contracts import Edge, Node, NodeType, Recipe
+from studio_workbench import create_recipe
 from studio_workbench.tenant_wall import ResolvedContext
 
 
@@ -30,8 +31,8 @@ async def _close_singleton_pools_after_test() -> AsyncIterator[None]:
     await close_pools()
 
 
-def _set_session(*, tenant_id: UUID, user: str, roles: list[str]) -> object:
-    session = ResolvedContext(tenant_id=tenant_id, user=user, roles=roles)
+def _set_session(*, tenant_id: UUID, user: str, system_roles: list[str]) -> object:
+    session = ResolvedContext(tenant_id=tenant_id, user=user, system_roles=system_roles)
     return middleware._request_session.set(session)
 
 
@@ -67,12 +68,32 @@ async def _seed_tenant(admin_pool: Pool, name: str) -> UUID:
     return UUID(str(row[0]))
 
 
-async def _seed_user(admin_pool: Pool, tenant_id: UUID, email: str, roles: list[str]) -> None:
+async def _seed_user(admin_pool: Pool, tenant_id: UUID, email: str, system_roles: list[str]) -> None:
     async with admin_pool.connection() as conn:
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
-            (str(tenant_id), email, "not-a-real-hash", roles),
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s)",
+            (str(tenant_id), email, "not-a-real-hash", system_roles),
         )
+
+
+def _seed_recipe(agent_id: str, tenant_id: UUID) -> Recipe:
+    """workbench#41 — `create_recipe_d4()` đã bị xoá. Dựng thủ công cùng hình dạng DAG 3-node nó
+    từng tự sinh (KB_RETRIEVE -> LLM_STEP -> END) — 2 test dùng hàm này chỉ cần recipe có cạnh
+    thật, không đụng chi tiết `kb_binding`/`system_prompt`."""
+    nodes = [
+        Node(id="n1", type=NodeType.KB_RETRIEVE, params={"top_k": 3}),
+        Node(id="n2", type=NodeType.LLM_STEP, params={"temperature": 0.0}),
+        Node(id="n4", type=NodeType.END, params={}),
+    ]
+    edges = [Edge(from_="n1", to="n2"), Edge(from_="n2", to="n4")]
+    return create_recipe(
+        agent_id=agent_id,
+        tenant_id=tenant_id,
+        system_prompt="Tra cứu quy trình và bảo mật Callisto.",
+        tool_whitelist=[],
+        nodes=nodes,
+        edges=edges,
+    )
 
 
 _RECIPE_JSON = '{"agent_id": "placeholder", "tenant_id": "placeholder"}'
@@ -114,7 +135,7 @@ async def test_list_agents_scoped_to_own_tenant_via_rls(admin_pool: Pool) -> Non
     await _seed_published_recipe(admin_pool, tenant_id=tenant_a, agent_id="agent-a1", version=1)
     await _seed_published_recipe(admin_pool, tenant_id=tenant_b, agent_id="agent-b1", version=1)
 
-    token = _set_session(tenant_id=tenant_a, user="user-a@acme.com", roles=["public"])
+    token = _set_session(tenant_id=tenant_a, user="user-a@acme.com", system_roles=["public"])
     try:
         async with _simulate_request_connection(tenant_a):
             result = await list_agents()
@@ -131,7 +152,7 @@ async def test_list_agents_returns_latest_published_version(admin_pool: Pool) ->
     await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-c1", version=1)
     await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-c1", version=2)
 
-    token = _set_session(tenant_id=tenant_id, user="user@acme.com", roles=["public"])
+    token = _set_session(tenant_id=tenant_id, user="user@acme.com", system_roles=["public"])
     try:
         async with _simulate_request_connection(tenant_id):
             result = await list_agents()
@@ -148,7 +169,7 @@ async def test_list_agents_excludes_unpublished_status(admin_pool: Pool) -> None
     await _seed_user(admin_pool, tenant_id, "user@acme.com", ["public"])
     await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-draft", version=1, status="draft")
 
-    token = _set_session(tenant_id=tenant_id, user="user@acme.com", roles=["public"])
+    token = _set_session(tenant_id=tenant_id, user="user@acme.com", system_roles=["public"])
     try:
         async with _simulate_request_connection(tenant_id):
             result = await list_agents()
@@ -163,7 +184,7 @@ async def test_rollback_requires_admin(admin_pool: Pool) -> None:
     await _seed_user(admin_pool, tenant_id, "user@acme.com", ["public"])
     await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-e1", version=1)
 
-    token = _set_session(tenant_id=tenant_id, user="user@acme.com", roles=["public"])
+    token = _set_session(tenant_id=tenant_id, user="user@acme.com", system_roles=["public"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection(tenant_id):
@@ -178,7 +199,7 @@ async def test_rollback_missing_version_returns_404(admin_pool: Pool) -> None:
     await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-f1", version=1)
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection(tenant_id):
@@ -199,7 +220,7 @@ async def test_rollback_restores_prior_version(admin_pool: Pool) -> None:
     await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-g1", version=1, status="draft")
     await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-g1", version=2, status="published")
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection(tenant_id):
             result = await rollback_agent("agent-g1", RollbackRequest(to_version=1))
@@ -222,7 +243,7 @@ async def test_list_agent_versions_requires_admin(admin_pool: Pool) -> None:
     await _seed_user(admin_pool, tenant_id, "user@acme.com", ["public"])
     await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-h1", version=1)
 
-    token = _set_session(tenant_id=tenant_id, user="user@acme.com", roles=["public"])
+    token = _set_session(tenant_id=tenant_id, user="user@acme.com", system_roles=["public"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection(tenant_id):
@@ -240,7 +261,7 @@ async def test_list_agent_versions_returns_real_rows_desc(admin_pool: Pool) -> N
     await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-i1", version=1, status="draft")
     await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-i1", version=2, status="published")
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection(tenant_id):
             result = await list_agent_versions("agent-i1")
@@ -259,7 +280,7 @@ async def test_list_agent_versions_scoped_to_own_tenant_via_rls(admin_pool: Pool
     await _seed_published_recipe(admin_pool, tenant_id=tenant_a, agent_id="agent-shared", version=1)
     await _seed_published_recipe(admin_pool, tenant_id=tenant_b, agent_id="agent-shared", version=1)
 
-    token = _set_session(tenant_id=tenant_a, user="admin-a@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_a, user="admin-a@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection(tenant_a):
             result = await list_agent_versions("agent-shared")
@@ -282,7 +303,7 @@ async def test_get_agent_recipe_normalizes_from_alias_regardless_of_write_path(a
     await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
 
     agent_id = "agent-k1"
-    recipe = create_recipe_d4(agent_id=agent_id, tenant_id=tenant_id)
+    recipe = _seed_recipe(agent_id, tenant_id)
     async with admin_pool.connection() as conn, conn.transaction():
         await _bind_tenant(conn, tenant_id)
         await conn.execute(
@@ -291,7 +312,7 @@ async def test_get_agent_recipe_normalizes_from_alias_regardless_of_write_path(a
             (agent_id, str(tenant_id), recipe.model_dump_json()),
         )
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection(tenant_id):
             result = await get_agent_recipe(agent_id)
@@ -299,7 +320,7 @@ async def test_get_agent_recipe_normalizes_from_alias_regardless_of_write_path(a
         middleware._request_session.reset(token)  # type: ignore[arg-type]
 
     edges = result.recipe["dag"]["edges"]  # type: ignore[index]
-    assert edges, "seed (create_recipe_d4) phải sinh cạnh thật — nếu rỗng, assert dưới vô nghĩa"
+    assert edges, "seed (_seed_recipe) phải sinh cạnh thật — nếu rỗng, assert dưới vô nghĩa"
     assert all("from" in e and "from_" not in e for e in edges), (
         f"route phải chuẩn hoá lại alias dây bất kể đường ghi cũ để lại 'from_' — thấy {edges}"
     )
@@ -325,7 +346,7 @@ async def test_get_agent_recipe_rejects_row_invalid_under_current_contract(admin
     await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
 
     agent_id = "agent-l1"
-    recipe_dict = create_recipe_d4(agent_id=agent_id, tenant_id=tenant_id).model_dump(mode="json", by_alias=True)
+    recipe_dict = _seed_recipe(agent_id, tenant_id).model_dump(mode="json", by_alias=True)
     recipe_dict["scorecard_threshold"]["success"] = -999
     async with admin_pool.connection() as conn, conn.transaction():
         await _bind_tenant(conn, tenant_id)
@@ -335,7 +356,7 @@ async def test_get_agent_recipe_rejects_row_invalid_under_current_contract(admin
             (agent_id, str(tenant_id), json.dumps(recipe_dict)),
         )
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection(tenant_id):

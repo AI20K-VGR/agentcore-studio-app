@@ -33,7 +33,7 @@ from studio_contracts.kb import KbSearchResultItem
 from studio_engine import agent_loop as engine_agent_loop
 from studio_engine import interpreter as engine_interpreter
 from studio_engine.interpreter import RunResult
-from studio_workbench import create_recipe, create_recipe_d4
+from studio_workbench import create_recipe
 from studio_workbench.tenant_wall import resolve_session
 
 # CỐ Ý khác `ANKOR_ID` default của workbench (a0…01) — nếu adapter "quên" thread tenant_id xuống
@@ -202,17 +202,25 @@ async def test_inv1_recipe_khai_tenant_khac_thi_session_thang() -> None:
        (`tenant_scope_ok`, `citations_from_trace`) sẽ chấm trên một danh tính sai."""
     kb = _RecordingKbSearch([_item("ankor-leave-001#c1")])
     writer = _CollectingTraceWriter()
-    recipe = create_recipe_d4(
+    # workbench#41 — create_recipe_d4() đã bị xoá. Dựng thủ công cùng hình dạng DAG 3-node, embed
+    # trực tiếp "query" vào params node n1 (create_recipe_d4(query=...) trước đây cũng làm vậy).
+    recipe = create_recipe(
         agent_id="agent-callisto-d4",
         tenant_id=CLIENT_CLAIMED_TENANT_ID,  # ← client khai
-        scope="t/public",
-        query="nghỉ phép?",
+        system_prompt="Tra cứu quy trình và bảo mật Callisto.",
+        tool_whitelist=[],
+        nodes=[
+            Node(id="n1", type=NodeType.KB_RETRIEVE, params={"query": "nghỉ phép?", "top_k": 3}),
+            Node(id="n2", type=NodeType.LLM_STEP, params={"temperature": 0.0}),
+            Node(id="n4", type=NodeType.END, params={}),
+        ],
+        edges=[Edge(from_="n1", to="n2"), Edge(from_="n2", to="n4")],
     )
 
     assert recipe.tenant_id == CLIENT_CLAIMED_TENANT_ID, "recipe phải thật sự khai tenant kia"
 
     # Cầu chì thứ hai, ở tầng NODE (review AIE-2 trên workbench#23). Từ workbench#23
-    # `create_recipe_d4` không còn ghi `tenant_id`/`section_roles` vào `node.params`, nên nếu chỉ
+    # builder không còn ghi `tenant_id`/`section_roles` vào `node.params`, nên nếu chỉ
     # dựa vào builder thì bài này sẽ XANH-RỖNG-NGHĨA đúng kiểu docstring cảnh báo ở trên: interpreter
     # có thể bị đổi thành "bổ sung" thay vì "ghi đè" (client params thắng) mà bài vẫn xanh, vì không
     # còn params nào để mà thắng (đã đo bằng mutant M3 thật — xem review PR#23). Thế lệch là ĐIỀU
@@ -240,7 +248,7 @@ async def test_inv1_recipe_khai_tenant_khac_thi_session_thang() -> None:
         embedding=FakeEmbedding(),
         trace_writer=writer,
         session_context=resolve_session(  # ← server resolve, khác recipe
-            {"tenant_id": TENANT_ID, "user": "eval-harness", "roles": ["public"]}
+            {"tenant_id": TENANT_ID, "user": "eval-harness", "system_roles": ["public"]}
         ),
     )
 
@@ -297,12 +305,25 @@ async def test_run_case_surfaces_engine_refusal_faithfully(final_answer_text: st
     # bên chỉ có nghĩa khi danh tính hai lượt giống nhau. Tự dựng `ResolvedContext` tay ở đây sẽ mở ra
     # khả năng lượt (1) và lượt (2) chạy dưới hai danh tính khác nhau mà test vẫn xanh.
     raw = await engine_agent_loop.run_agent_loop(
-        create_recipe_d4(agent_id="agent-callisto-d4", tenant_id=TENANT_ID, scope="t/public"),
+        # workbench#41 — create_recipe_d4() đã bị xoá; run_agent_loop() không đọc recipe.dag nên
+        # DAG cụ thể ở đây không quan trọng, chỉ cần Recipe hợp lệ.
+        create_recipe(
+            agent_id="agent-callisto-d4",
+            tenant_id=TENANT_ID,
+            system_prompt="Tra cứu quy trình và bảo mật Callisto.",
+            tool_whitelist=[],
+            nodes=[
+                Node(id="n1", type=NodeType.KB_RETRIEVE, params={"top_k": 3}),
+                Node(id="n2", type=NodeType.LLM_STEP, params={"temperature": 0.0}),
+                Node(id="n4", type=NodeType.END, params={}),
+            ],
+            edges=[Edge(from_="n1", to="n2"), Edge(from_="n2", to="n4")],
+        ),
         kb_search=_RecordingKbSearch([_item("ankor-leave-001#c1")]),
         llm=_MultiTurnScriptedLLM(scripted_responses),
         embedding=FakeEmbedding(),
         trace_writer=_CollectingTraceWriter(),
-        session_context=resolve_session({"tenant_id": TENANT_ID, "user": "eval-harness", "roles": roles}),
+        session_context=resolve_session({"tenant_id": TENANT_ID, "user": "eval-harness", "system_roles": roles}),
         question=query,
     )
     engine_out = _llm_answer(raw.final_state)
@@ -472,7 +493,13 @@ async def test_refused_coercion(monkeypatch: pytest.MonkeyPatch, llm_out: dict[s
 
 async def test_recipe_construction_via_real_builder(monkeypatch: pytest.MonkeyPatch) -> None:
     """KHÓA B8a: builder THẬT (chỉ patch agent_loop) — tenant_id vào recipe (D-13), agent_id ""
-    → fallback, section_roles round-trip qua scope "t/a,b" của adapter.
+    → fallback.
+
+    workbench#41: `create_recipe_d4`/`_parse_kb_scope` đã bị xoá, `certified_recipe()` dựng qua
+    `create_recipe` — `kb_binding` giờ HARDCODE cố định (`ankor/public`), `section_roles` KHÔNG
+    còn round-trip vào `kb_binding.scope` nữa (khác hành vi cũ trước bản vá này). Vô hại cho việc
+    chạy thật: `run_agent_loop()` không đọc `kb_binding` từ recipe để quyết định phạm vi —
+    `session_context` mới là hàng rào (INV-1).
 
     app#44: `query` giờ quan sát được qua `stub.questions` (kwarg `question=`), KHÔNG còn
     `node.params["query"]` — vòng lặp mới không đọc `recipe.dag` để lấy câu hỏi."""
@@ -482,9 +509,8 @@ async def test_recipe_construction_via_real_builder(monkeypatch: pytest.MonkeyPa
     recipe = stub.recipes[0]
     assert recipe.tenant_id == TENANT_ID
     assert recipe.agent_id == "agent-callisto-d4"
-    # `section_roles` round-trip giờ quan sát được qua `kb_binding.scope` (builder KHÔNG còn ghi
-    # nó vào `node.params` — hardening #122, `interpreter.run()` luôn ghi đè bằng session).
-    assert recipe.kb_binding.scope == "t/public,finance"
+    # kb_binding hardcode cố định (workbench#41) — không còn phản ánh section_roles của caller.
+    assert recipe.kb_binding.scope == "ankor/public"
     kb_node = next(n for n in recipe.dag.nodes if n.type.value == "kb-retrieve")
     assert "section_roles" not in kb_node.params
     assert "query" not in kb_node.params, "app#44: query không còn bơm vào node.params"
@@ -492,13 +518,13 @@ async def test_recipe_construction_via_real_builder(monkeypatch: pytest.MonkeyPa
 
 
 async def test_recipe_construction_empty_roles(monkeypatch: pytest.MonkeyPatch) -> None:
-    """KHÓA B8b: section_roles=[] → scope "t/" → node kb-retrieve nhận roles RỖNG (fail-closed phía
-    kb: không role nào được cấp ngầm)."""
+    """KHÓA B8b: section_roles=[] — kb_binding vẫn hardcode cố định (workbench#41), không đổi theo
+    roles rỗng hay không (khác hành vi cũ: trước đây scope rỗng phản ánh section_roles=[])."""
     runner, stub = _patched(monkeypatch, {"n2": {"answer": "x"}})
     await runner.run_case(agent_id="a", query="q?", tenant_id=TENANT_ID, section_roles=[])
 
     assert stub.recipes[0].agent_id == "a"  # passthrough khi non-empty (mutation-check T-2)
-    assert stub.recipes[0].kb_binding.scope == "t/"
+    assert stub.recipes[0].kb_binding.scope == "ankor/public"
     kb_node = next(n for n in stub.recipes[0].dag.nodes if n.type.value == "kb-retrieve")
     assert "section_roles" not in kb_node.params
 
@@ -625,7 +651,7 @@ def _tool_call_recipe(tenant_id: UUID, expression: str) -> Recipe:
     return create_recipe(
         agent_id="agent-tool-dispatch-check",
         tenant_id=tenant_id,
-        instructions="x",
+        system_prompt="x",
         tool_whitelist=["calculator"],
         nodes=[
             Node(id="n1", type=NodeType.KB_RETRIEVE, params={"top_k": 3}),

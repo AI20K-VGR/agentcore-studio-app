@@ -33,6 +33,7 @@ import studio_app.routes.publish as publish_module
 from studio_app.core._db import Pool, close_pools
 from studio_app.routes.publish import PublishRequest, _evaluate
 from studio_contracts import Aggregate, CaseResult, Gate, GateThreshold, Scorecard
+from studio_evalhub.golden_case import GoldenCase, GoldenSet
 from studio_workbench.publish import recipe_hash as _real_recipe_hash
 from studio_workbench.tenant_wall import ResolvedContext
 
@@ -82,8 +83,10 @@ class _StubEvalHarness:
 
 def _minimal_valid_dag() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """`kb-retrieve -> end`, 2 node — tối thiểu để qua được `graph_lint()` bên trong `_evaluate()`,
-    khác hẳn `create_recipe_d4`'s DAG 6-node cố định (đúng điểm bài này cần phân biệt: recipe canvas
-    và recipe fallback phải là 2 thứ RÕ RÀNG khác nhau, không trùng tình cờ)."""
+    khác hẳn DAG 3-node cố định (`eval_adapter.py::_CERTIFIED_NODES`, workbench#41 — trước đây
+    `create_recipe_d4`) mà `certified_recipe()` tự dựng ở nhánh không tiêm `recipe=` (đúng điểm bài
+    này cần phân biệt: recipe canvas và recipe fallback phải là 2 thứ RÕ RÀNG khác nhau, không
+    trùng tình cờ)."""
     nodes = [
         {"id": "n1", "type": "kb-retrieve", "params": {}},
         {"id": "n2", "type": "end", "params": {}},
@@ -92,29 +95,57 @@ def _minimal_valid_dag() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     return nodes, edges
 
 
+async def _fake_load_golden_set(ref: str, tenant_id: UUID) -> GoldenSet:
+    """Thay `_load_golden_set` (đọc `eval.golden_sets`) — cutover file→DB.
+
+    Bài trong file này CỐ Ý không đụng DB (xem `_SentinelPool`): chúng đo việc nối dây quanh
+    `EvalHarness.run()`, không đo nguồn bộ case. Sau cutover `_evaluate()` cần một request-scoped
+    connection đã bind `app.tenant_id` — dựng thật ở đây sẽ kéo cả DB + middleware vào một bài
+    không nói gì về hai thứ đó, và mỗi tầng thêm vào là một chỗ bài đỏ vì lý do khác.
+
+    Nguồn bộ case có bài riêng, đúng chỗ: `test_publish_reads_golden_from_db.py`.
+    """
+    del tenant_id
+    return GoldenSet(
+        golden_set_ref=ref,
+        cases=[
+            GoldenCase(
+                case_id="c1",
+                query="q?",
+                tenant="ankor",
+                section_roles=["public"],
+                expected_tenant="ankor",
+                expected_section_role="public",
+                expected="a",
+            )
+        ],
+    )
+
+
 async def test_evaluate_injects_the_canvas_recipe_it_returns_into_the_runner(
     pool: Pool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     del pool  # chỉ để trigger skip-nếu-thiếu-DSN đúng quy ước chung của suite, không tự query
     monkeypatch.setattr(publish_module, "EngineAgentRunner", _SpyEngineAgentRunner)
+    monkeypatch.setattr(publish_module, "_load_golden_set", _fake_load_golden_set)
     monkeypatch.setattr(publish_module, "EvalHarness", _StubEvalHarness)
 
     nodes, edges = _minimal_valid_dag()
     body = PublishRequest(
         agent_id="agent-inject-check",
-        instructions="Answer from KB only.",
+        system_prompt="Answer from KB only.",
         tool_whitelist=[],
         nodes=nodes,
         edges=edges,
     )
-    session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@acme.com", roles=["admin"])
+    session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@acme.com", system_roles=["admin"])
 
     recipe, _scorecard = await _evaluate("agent-inject-check", body, session)
 
     assert _SpyEngineAgentRunner.last_kwargs.get("recipe") is recipe, (
         "EngineAgentRunner phải được tiêm ĐÚNG object recipe mà _evaluate() trả về (thứ publish() "
-        "sẽ băm/ghi) — thiếu recipe= khiến certified_recipe() (eval_adapter.py) tự dựng "
-        "create_recipe_d4(...) để chạy, một recipe KHÁC hẳn canvas (kit#127, review app#26 ⛔): "
+        "sẽ băm/ghi) — thiếu recipe= khiến certified_recipe() (eval_adapter.py) tự dựng qua "
+        "create_recipe() để chạy, một recipe KHÁC hẳn canvas (kit#127, review app#26 ⛔): "
         "recipe_hash() khi đó băm một object mà harness chưa bao giờ chạm tới."
     )
 

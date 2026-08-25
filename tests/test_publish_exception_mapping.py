@@ -34,6 +34,7 @@ from studio_app.settings import LlmProvider, Settings
 from studio_contracts import Scorecard
 from studio_engine.agent_loop import AgentLoopExhausted
 from studio_engine.interpreter import RunResult
+from studio_evalhub.golden_case import GoldenCase, GoldenSet
 from studio_workbench.tenant_wall import ResolvedContext
 
 ANKOR_ID = UUID("a0000000-0000-0000-0000-000000000001")
@@ -76,7 +77,7 @@ def _settings(tmp_path: Path) -> Settings:
 def _body() -> PublishRequest:
     return PublishRequest(
         agent_id="agent-exc-mapping",
-        instructions="x",
+        system_prompt="x",
         tool_whitelist=[],
         nodes=[{"id": "n1", "type": "kb-retrieve", "params": {}}, {"id": "n2", "type": "end", "params": {}}],
         edges=[{"from": "n1", "to": "n2"}],
@@ -87,8 +88,36 @@ async def _fake_get_pool() -> _SentinelPool:
     return _SentinelPool()
 
 
+async def _fake_load_golden_set(ref: str, tenant_id: UUID) -> GoldenSet:
+    """Thay `_load_golden_set` (đọc `eval.golden_sets`) — cutover file→DB.
+
+    Bài trong file này CỐ Ý không đụng DB (xem `_SentinelPool`): chúng đo việc nối dây quanh
+    `EvalHarness.run()`, không đo nguồn bộ case. Sau cutover `_evaluate()` cần một request-scoped
+    connection đã bind `app.tenant_id` — dựng thật ở đây sẽ kéo cả DB + middleware vào một bài
+    không nói gì về hai thứ đó, và mỗi tầng thêm vào là một chỗ bài đỏ vì lý do khác.
+
+    Nguồn bộ case có bài riêng, đúng chỗ: `test_publish_reads_golden_from_db.py`.
+    """
+    del tenant_id
+    return GoldenSet(
+        golden_set_ref=ref,
+        cases=[
+            GoldenCase(
+                case_id="c1",
+                query="q?",
+                tenant="ankor",
+                section_roles=["public"],
+                expected_tenant="ankor",
+                expected_section_role="public",
+                expected="a",
+            )
+        ],
+    )
+
+
 async def _run_evaluate_with(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, exc: BaseException) -> HTTPException:
     monkeypatch.setattr(publish_module, "get_pool", _fake_get_pool)
+    monkeypatch.setattr(publish_module, "_load_golden_set", _fake_load_golden_set)
     monkeypatch.setattr(publish_module, "EngineAgentRunner", _SpyRunner)
     _RaisingEvalHarness._exc = exc
     monkeypatch.setattr(publish_module, "EvalHarness", _RaisingEvalHarness)
@@ -101,7 +130,7 @@ async def _run_evaluate_with(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ex
     monkeypatch.setattr(publish_module, "build_llm", lambda: None)
     monkeypatch.setattr(publish_module, "build_embedding", lambda: None)
 
-    session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@acme.com", roles=["admin"])
+    session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@acme.com", system_roles=["admin"])
     with pytest.raises(HTTPException) as exc_info:
         await _evaluate("agent-exc-mapping", _body(), session)
     return exc_info.value

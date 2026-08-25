@@ -63,7 +63,7 @@ async def list_agent_versions(agent_id: str) -> list[VersionSummary]:
     session = get_request_session()
     conn = get_request_connection()
     identity = await fetch_fresh_identity(conn, session.user)
-    require_admin(identity.roles)
+    require_admin(identity.system_roles)
 
     cur = await conn.execute(
         """
@@ -102,7 +102,7 @@ async def get_agent_recipe(agent_id: str, version: int | None = None) -> AgentRe
     session = get_request_session()
     conn = get_request_connection()
     identity = await fetch_fresh_identity(conn, session.user)
-    require_admin(identity.roles)
+    require_admin(identity.system_roles)
 
     if version is None:
         cur = await conn.execute(
@@ -145,7 +145,7 @@ async def get_agent_recipe(agent_id: str, version: int | None = None) -> AgentRe
     #
     # Review app#37 round 2 (dholmes0207, N1): `str(exc)` echo `input_value` của field TRƯỢT
     # validate — hôm nay an toàn (field trượt luôn là `scorecard_threshold.success`, không nhạy
-    # cảm), nhưng `agent_config.instructions`/`kb_binding.scope` (`schema.py` xếp loại tenant PII,
+    # cảm), nhưng `agent_config.system_prompt`/`kb_binding.scope` (`schema.py` xếp loại tenant PII,
     # đúng lý do bật RLS `FORCE`) nằm CÙNG model. Ngày nào một ràng buộc mới rơi lên 1 trong 2 field
     # đó (đúng khuôn kit#129 §3.1 vừa làm với `scorecard_threshold`), `str(exc)` sẽ mang tenant PII
     # vào body 500 → access log của reverse-proxy/APM — đúng hạng lỗ mà
@@ -182,7 +182,7 @@ async def rollback_agent(agent_id: str, body: RollbackRequest) -> RollbackRespon
     session = get_request_session()
     conn = get_request_connection()
     identity = await fetch_fresh_identity(conn, session.user)
-    require_admin(identity.roles)
+    require_admin(identity.system_roles)
 
     # `session.tenant_id` (JWT), KHÔNG phải `identity.tenant_id` (tươi) — khớp đúng convention đã
     # có ở `routes/chat.py`/`routes/runs.py` (cả 2 dùng `session.tenant_id` cho mọi thao tác đọc/ghi

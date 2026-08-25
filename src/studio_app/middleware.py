@@ -45,7 +45,7 @@ def get_request_connection() -> AsyncConnection[Any]:
 
 
 def get_request_session() -> ResolvedContext:
-    """Return the current request's resolved identity (tenant_id/user/roles) — the value a valid
+    """Return the current request's resolved identity (tenant_id/user/system_roles) — the value a valid
     `Authorization: Bearer <jwt>` header resolves to via `jwt_auth.verify_token` +
     `studio_workbench.tenant_wall.resolve_session` (see `_resolve_jwt_session` below). Call ONLY
     from within a request scope that actually carried a valid Bearer token — raises `HTTPException
@@ -59,7 +59,7 @@ def get_request_session() -> ResolvedContext:
     `tenant_context_middleware` sets `app.tenant_id` (for `get_request_connection()`'s RLS-scoped
     connection) from this SAME source — as of `kit#129` §3.2 remediation, JWT/login is the ONLY
     way either one gets populated (the older `x-tenant-id` header dev-stub path was removed
-    entirely, not just deprioritized). Routes that need `user`/`roles`, not just `tenant_id` for
+    entirely, not just deprioritized). Routes that need `user`/`system_roles`, not just `tenant_id` for
     `SET LOCAL`, must go through this function, never re-derive identity themselves."""
     session = _request_session.get()
     if session is None:

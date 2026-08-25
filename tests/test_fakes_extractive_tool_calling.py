@@ -37,7 +37,7 @@ async def test_first_turn_emits_tool_call_kb_search_with_the_question_as_query()
     phát ĐÚNG tín hiệu `TOOL_CALL:` mà `agent_protocol.parse_agent_signal` nhận ra, `tool="kb_search"`,
     `params["query"]` bằng đúng câu hỏi đã đưa vào `build_agent_prompt`."""
     question = "nghỉ phép cần báo trước bao lâu?"
-    prompt = build_agent_prompt(instructions="", question=question, tool_names=[KB_SEARCH_TOOL], observations=[])
+    prompt = build_agent_prompt(system_prompt="", question=question, tool_names=[KB_SEARCH_TOOL], observations=[])
 
     raw = await ExtractiveFakeLLM().complete(prompt)
     signal = parse_agent_signal(raw)
@@ -55,7 +55,7 @@ async def test_second_turn_answers_from_the_kb_observation_already_in_prompt() -
     question = "nghỉ phép cần báo trước bao lâu?"
     chunk = _item("ankor-leave-001#c1", "Báo trước 3 ngày làm việc.")
     obs = Observation(tool=KB_SEARCH_TOOL, params={"query": question}, result_text=render_kb_observation([chunk]))
-    prompt = build_agent_prompt(instructions="", question=question, tool_names=[KB_SEARCH_TOOL], observations=[obs])
+    prompt = build_agent_prompt(system_prompt="", question=question, tool_names=[KB_SEARCH_TOOL], observations=[obs])
 
     raw = await ExtractiveFakeLLM().complete(prompt)
     signal = parse_agent_signal(raw)
@@ -72,7 +72,7 @@ async def test_refuses_without_researching_again_when_kb_search_already_returned
     HIỆN DIỆN của block `[Kết quả kb_search]` trong prompt, không chỉ bằng việc thiếu `[chunk_id]`."""
     question = "câu hỏi thuộc tenant khác?"
     obs = Observation(tool=KB_SEARCH_TOOL, params={"query": question}, result_text=render_kb_observation([]))
-    prompt = build_agent_prompt(instructions="", question=question, tool_names=[KB_SEARCH_TOOL], observations=[obs])
+    prompt = build_agent_prompt(system_prompt="", question=question, tool_names=[KB_SEARCH_TOOL], observations=[obs])
 
     raw = await ExtractiveFakeLLM().complete(prompt)
     signal = parse_agent_signal(raw)

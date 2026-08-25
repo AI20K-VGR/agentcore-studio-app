@@ -18,10 +18,10 @@ import studio_app.routes.chat as chat_module
 from fastapi import HTTPException
 from studio_app import middleware
 from studio_app.routes.chat import ChatRequest, chat
-from studio_contracts import Recipe
+from studio_contracts import Edge, Node, NodeType, Recipe
 from studio_engine.agent_loop import AgentLoopExhausted
 from studio_engine.interpreter import RunResult
-from studio_workbench import create_recipe_d4
+from studio_workbench import create_recipe
 from studio_workbench.tenant_wall import ResolvedContext
 
 TENANT_ID = UUID("a0000000-0000-0000-0000-000000000001")
@@ -68,7 +68,22 @@ class _RaisingAgentLoop:
 
 
 def _recipe() -> Recipe:
-    return create_recipe_d4(agent_id="agent-chat-test", tenant_id=TENANT_ID, scope="t/public")
+    # workbench#41 — create_recipe_d4() đã bị xoá. Dựng thủ công cùng hình dạng DAG 3-node
+    # (KB_RETRIEVE -> LLM_STEP -> END); chat() không đọc recipe.dag (app#44), chỉ cần Recipe hợp lệ.
+    nodes = [
+        Node(id="n1", type=NodeType.KB_RETRIEVE, params={"top_k": 3}),
+        Node(id="n2", type=NodeType.LLM_STEP, params={"temperature": 0.0}),
+        Node(id="n4", type=NodeType.END, params={}),
+    ]
+    edges = [Edge(from_="n1", to="n2"), Edge(from_="n2", to="n4")]
+    return create_recipe(
+        agent_id="agent-chat-test",
+        tenant_id=TENANT_ID,
+        system_prompt="Tra cứu quy trình và bảo mật Callisto.",
+        tool_whitelist=[],
+        nodes=nodes,
+        edges=edges,
+    )
 
 
 async def _fake_load_recipe(agent_id: str) -> tuple[Recipe, int]:  # noqa: ARG001
@@ -76,7 +91,7 @@ async def _fake_load_recipe(agent_id: str) -> tuple[Recipe, int]:  # noqa: ARG00
 
 
 def _set_session() -> object:
-    session = ResolvedContext(tenant_id=TENANT_ID, user="victim@ankor.vn", roles=["public"])
+    session = ResolvedContext(tenant_id=TENANT_ID, user="victim@ankor.vn", system_roles=["public"])
     return middleware._request_session.set(session)
 
 

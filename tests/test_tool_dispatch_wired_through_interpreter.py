@@ -42,7 +42,7 @@ async def test_calculator_tool_call_returns_real_result_not_stub_marker() -> Non
     recipe = create_recipe(
         agent_id="smoke-calc-agent",
         tenant_id=_TENANT_ID,
-        instructions="x",
+        system_prompt="x",
         tool_whitelist=["calculator"],
         nodes=[
             Node(id="n1", type=NodeType.TOOL_CALL, params={"tool": "calculator", "expression": "6 * 7"}),
@@ -53,7 +53,7 @@ async def test_calculator_tool_call_returns_real_result_not_stub_marker() -> Non
 
     result = await engine_interpreter.run(
         recipe,
-        session_context=resolve_session({"tenant_id": _TENANT_ID, "user": "smoke-test", "roles": []}),
+        session_context=resolve_session({"tenant_id": _TENANT_ID, "user": "smoke-test", "system_roles": []}),
         kb_search=_NullKbSearch(),
         llm=FakeLLM(),
         embedding=FakeEmbedding(),

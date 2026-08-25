@@ -95,14 +95,14 @@ async def chat(agent_id: str, body: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=403, detail="recipe published thuộc tenant khác phiên hiện tại")
 
     # `body.as_roles` — CHỈ admin/superadmin được giả lập role khác (tra TƯƠI từ DB, không tin
-    # `session.roles`/JWT, cùng nguyên tắc mọi route nhạy cảm khác). Validate mỗi role giả lập phải
+    # `session.system_roles`/JWT, cùng nguyên tắc mọi route nhạy cảm khác). Validate mỗi role giả lập phải
     # là 1 section THẬT của tenant hiện tại — chặn gõ nhầm/role rác, không phải mở rộng quyền (chỉ
     # THU HẸP xuống 1 tập con, không bao giờ tự thêm được role không tồn tại).
     session_context: ResolvedContext = session
     if body.as_roles is not None:
         conn = get_request_connection()
         identity = await fetch_fresh_identity(conn, session.user)
-        require_admin(identity.roles)
+        require_admin(identity.system_roles)
         # `fetch_tenant_section_names` tự trừ `RESERVED_ROLE_NAMES` (review app#21 — tầng 2 lặp
         # lại, xem docstring hàm đó): trước bản vá, 1 dòng `core.sections` cũ tên "superadmin" sẽ
         # lọt vào `valid_section_names`, cho phép `as_roles=["superadmin"]` đi thẳng vào
@@ -115,7 +115,7 @@ async def chat(agent_id: str, body: ChatRequest) -> ChatResponse:
                 status_code=400,
                 detail=f"role {sorted(invalid)} không hợp lệ để giả lập — chỉ chấp nhận {sorted(valid_section_names)}",
             )
-        session_context = ResolvedContext(tenant_id=session.tenant_id, user=session.user, roles=body.as_roles)
+        session_context = ResolvedContext(tenant_id=session.tenant_id, user=session.user, system_roles=body.as_roles)
 
     # `Pool` (không phải `get_request_connection()`) — rủi ro pool self-deadlock CHƯA được giải
     # quyết ở route này, xem giải thích đầy đủ + lý do ở `routes/runs.py` (review `app#17` đợt 4,

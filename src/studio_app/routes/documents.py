@@ -111,9 +111,9 @@ async def upload_document(
     session = get_request_session()
     conn = get_request_connection()
     identity = await fetch_fresh_identity(conn, session.user)
-    require_admin(identity.roles)
+    require_admin(identity.system_roles)
 
-    if "superadmin" in identity.roles:
+    if "superadmin" in identity.system_roles:
         if tenant_id is None:
             raise HTTPException(
                 status_code=400, detail="superadmin phải khai tenant_id để upload tài liệu cho công ty nào"

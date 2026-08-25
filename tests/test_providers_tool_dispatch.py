@@ -26,7 +26,7 @@ def _recipe_with_tool_call(tool: str, whitelist: list[str]) -> Recipe:
     return create_recipe(
         agent_id="agent-tool-dispatch-test",
         tenant_id=_ANKOR_ID,
-        instructions="x",
+        system_prompt="x",
         tool_whitelist=whitelist,
         nodes=[
             Node(id="n1", type=NodeType.TOOL_CALL, params={"tool": tool}),
@@ -178,10 +178,19 @@ def test_find_unsupported_tool_call_generalizes_beyond_kb_search() -> None:
 
 
 def test_find_unsupported_tool_call_returns_none_when_recipe_has_no_tool_call_node() -> None:
-    """`create_recipe_d4()` (production call path, `eval_adapter.py`) không còn sinh node
-    `tool-call` nào từ workbench#31 — khoá lại rằng đó là None hợp lệ (không tool-call = không có
-    gì để soi), không phải false-negative của hàm này."""
-    from studio_workbench import create_recipe_d4
-
-    recipe = create_recipe_d4()
+    """DAG production call path (`eval_adapter.py::certified_recipe`, workbench#41 — trước đây
+    `create_recipe_d4()`) không sinh node `tool-call` nào — khoá lại rằng đó là None hợp lệ (không
+    tool-call = không có gì để soi), không phải false-negative của hàm này."""
+    recipe = create_recipe(
+        agent_id="agent-tool-dispatch-test",
+        tenant_id=_ANKOR_ID,
+        system_prompt="x",
+        tool_whitelist=[],
+        nodes=[
+            Node(id="n1", type=NodeType.KB_RETRIEVE, params={"top_k": 3}),
+            Node(id="n2", type=NodeType.LLM_STEP, params={"temperature": 0.0}),
+            Node(id="n4", type=NodeType.END, params={}),
+        ],
+        edges=[Edge(from_="n1", to="n2"), Edge(from_="n2", to="n4")],
+    )
     assert find_unsupported_tool_call(recipe) is None
