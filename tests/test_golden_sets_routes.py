@@ -17,7 +17,8 @@ import pytest_asyncio
 from fastapi import HTTPException
 from studio_app import middleware
 from studio_app.core._db import Pool, close_pools, get_pool
-from studio_app.routes.golden_sets import UploadGoldenSetRequest, upload_golden_set
+from studio_app.routes.golden_sets import UploadGoldenSetRequest, overlay_golden_set, upload_golden_set
+from studio_evalhub.golden_case import GoldenCase, GoldenSet
 from studio_evalhub.golden_store import read_golden_set
 from studio_workbench.tenant_wall import ResolvedContext
 
@@ -277,3 +278,60 @@ async def test_superadmin_khai_tenant_thi_ghi_duoc_cho_tenant_do(admin_pool: Poo
     async with pool.connection() as conn, conn.transaction():
         await conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(dich),))
         assert len((await read_golden_set(conn, "nap-ho", dich)).cases) == 1
+
+
+def _overlay_case(case_id: str, query: str, source: str | None = None) -> GoldenCase:
+    return GoldenCase(
+        case_id=case_id,
+        query=query,
+        tenant="ankor",
+        section_roles=["hr"],
+        expected_tenant="ankor",
+        expected_section_role="hr",
+        expected="12 ngày",
+        expected_citation=["d#c1"],
+        source=source,
+    )
+
+
+def test_overlay_thay_case_trung_khoa_va_giu_phan_con_lai() -> None:
+    """Luật phủ: case vừa nạp thắng trên khoá của nó, case cũ khác khoá giữ nguyên.
+
+    Khoá là `(tenant, câu hỏi chuẩn hoá, phòng ban)` — KHÔNG phải `case_id`. Nên `U-01` thay được
+    `AI-1` dù hai id chẳng liên quan gì nhau: chúng hỏi cùng một câu."""
+    uploaded = GoldenSet(golden_set_ref="x", cases=[_overlay_case("U-01", "Nghỉ phép bao nhiêu ngày?")])
+    existing = GoldenSet(
+        golden_set_ref="x",
+        cases=[
+            _overlay_case("AI-1", "nghỉ phép bao nhiêu ngày?", "ai"),
+            _overlay_case("AI-2", "Bảo hiểm ra sao?", "ai"),
+        ],
+    )
+
+    merged, n_kept = overlay_golden_set(uploaded, existing)
+
+    assert [c.case_id for c in merged.cases] == ["U-01", "AI-2"]
+    assert n_kept == 1, "case cũ không trùng khoá phải được giữ — nếu không là xoá trắng bộ máy sinh"
+
+
+def test_overlay_nap_lai_y_het_khong_doi_gi() -> None:
+    """Hồi quy DE bắt ở review app#68. Bản trước dùng `merge_golden_sets`, mà hàm đó phân xử va
+    chạm bằng luật `source` (chỉ `human` thắng `ai`) nên **mọi** cặp khác đều ném — kể cả hai case
+    giống hệt nhau. Hệ quả: chạy lại script, thử lại sau lỗi mạng, hay sửa một case rồi gửi cả bộ
+    đều trả 409, trong khi `write_golden_set` vốn là upsert idempotent."""
+    uploaded = GoldenSet(golden_set_ref="x", cases=[_overlay_case("U-01", "Nghỉ phép bao nhiêu ngày?")])
+    existing = GoldenSet(golden_set_ref="x", cases=[_overlay_case("AI-2", "Bảo hiểm ra sao?", "ai")])
+
+    first, _ = overlay_golden_set(uploaded, existing)
+    second, _ = overlay_golden_set(uploaded, first)
+
+    assert [c.case_id for c in first.cases] == [c.case_id for c in second.cases]
+
+
+def test_overlay_bo_cu_rong_thi_ra_dung_bo_vua_nap() -> None:
+    merged, n_kept = overlay_golden_set(
+        GoldenSet(golden_set_ref="x", cases=[_overlay_case("U-01", "q?")]),
+        GoldenSet(golden_set_ref="x", cases=[]),
+    )
+    assert [c.case_id for c in merged.cases] == ["U-01"]
+    assert n_kept == 0

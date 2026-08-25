@@ -29,7 +29,7 @@ from fastapi import APIRouter, HTTPException
 from psycopg import sql
 from pydantic import BaseModel, Field, ValidationError
 from studio_evalhub.golden_case import GoldenCase, GoldenSet
-from studio_evalhub.golden_merge import GoldenSetMergeConflict, merge_golden_sets
+from studio_evalhub.golden_merge import case_key
 from studio_evalhub.golden_store import GoldenSetNotFound, GoldenSetScopeError, read_golden_set, write_golden_set
 
 from studio_app.authz import fetch_fresh_identity, require_admin
@@ -58,6 +58,7 @@ class UploadGoldenSetResponse(BaseModel):
     n_case: int
     """Tổng case của bộ SAU khi hợp nhất — không phải số case vừa nạp lên."""
     n_traps: int
+    """Số case bẫy — suy từ `expects_refusal`, không từ một cờ người nạp tự khai."""
     n_uploaded: int
     """Số case trong payload vừa gửi. Tách khỏi `n_case` để giao diện nói được *"nạp 12, bộ giờ có
     31"* thay vì một con số mà người dùng không biết đối chiếu với cái gì."""
@@ -86,6 +87,26 @@ def _phan_giai_tenant(identity: Any, khai: str | None) -> UUID:
     if khai is not None and khai != str(identity.tenant_id):
         raise HTTPException(status_code=403, detail="company-admin chỉ nạp được golden set cho tenant mình")
     return UUID(str(identity.tenant_id))
+
+
+def overlay_golden_set(uploaded: GoldenSet, existing: GoldenSet) -> tuple[GoldenSet, int]:
+    """Phủ `uploaded` lên `existing`: case vừa nạp thắng trên khoá của nó, case cũ có khoá không nằm
+    trong bộ nạp thì giữ nguyên. Trả `(bộ kết quả, số case cũ giữ lại)`.
+
+    Tách khỏi route để test được **không cần Postgres** — đây là toàn bộ luật ghi đè, và nó là chỗ
+    đã sai một lần rồi (review app#68, DongAnh2704) nên xứng đáng có bài riêng.
+
+    Dùng `case_key` của evalhub chứ không tự chuẩn hoá câu hỏi lại: hai cách chuẩn hoá lệch nhau là
+    hai bộ trông giống hệt mà không khớp được, và lỗi đó chỉ lộ ra khi đã có dữ liệu thật.
+
+    **Không** có khái niệm va chạm ở đây, khác `merge_golden_sets`. Hàm kia hợp nhất hai nguồn NGANG
+    HÀNG nên va chạm nghĩa là "hai bên bất đồng, không ai có thẩm quyền" — ném cho người quyết là
+    đúng. Còn ở đây người dùng chủ động nạp bộ của mình lên ref của chính mình: họ LÀ bên có thẩm
+    quyền trên những khoá họ gửi. Phủ thì không bất đồng với ai.
+    """
+    uploaded_keys = {case_key(c) for c in uploaded.cases}
+    kept = [c for c in existing.cases if case_key(c) not in uploaded_keys]
+    return GoldenSet(golden_set_ref=uploaded.golden_set_ref, cases=[*uploaded.cases, *kept]), len(kept)
 
 
 @router.post("", response_model=UploadGoldenSetResponse)
@@ -121,31 +142,33 @@ async def upload_golden_set(body: UploadGoldenSetRequest) -> UploadGoldenSetResp
         # đóng, nên phần còn lại của request không thừa hưởng quyền này.
         await conn.execute(sql.SQL("SET LOCAL app.tenant_id = {}").format(sql.Literal(str(tenant_uuid))))
 
-        # HỢP NHẤT với bộ đang có, không ghi đè. Bản trước gọi thẳng `write_golden_set`, nên một
-        # người nạp bộ của mình trùng `golden_set_ref` sẽ **xoá sạch** bộ máy vừa sinh lúc upload
-        # tài liệu (`golden_autogen.regenerate_for_section`, app#61) — mất im lặng, không cảnh báo,
-        # và hai đường ghi vào cùng một `golden_set_ref` lại có hai luật khác nhau (đường sinh máy
-        # đã biết giữ `source="human"`, đường này thì không). `merge_golden_sets` là luật ĐÃ CÓ cho
-        # đúng việc này: khoá theo `(tenant, query chuẩn hoá, section_roles)` chứ không theo
-        # `case_id` — hai nguồn đặt id độc lập nhau nên khoá theo id là khoá theo thứ không so được.
+        # PHỦ LÊN bộ đang có, không ghi đè cả bộ và cũng không `merge_golden_sets`.
         #
-        # Bộ vừa nạp đứng TRƯỚC: người vừa gõ tay thắng bản máy sinh ở case trùng. Đó là toàn bộ lý
-        # do `source="human"` tồn tại.
+        # Bản trước gọi thẳng `write_golden_set`, nên nạp một bộ trùng `golden_set_ref` sẽ XOÁ SẠCH
+        # bộ máy vừa sinh lúc upload tài liệu (`golden_autogen`, app#61) — mất im lặng.
+        #
+        # Bản sau đó dùng `merge_golden_sets` và sai theo kiểu khác, DE bắt được ở review app#68:
+        # hàm đó phân xử va chạm bằng luật `source` (chỉ `human` thắng `ai`), nên **mọi** cặp khác
+        # đều ném — kể cả hai case GIỐNG HỆT nhau. Hệ quả: nạp lại đúng bộ vừa nạp (chạy lại script,
+        # thử lại sau lỗi mạng, sửa một case rồi gửi cả bộ) trả 409 trên mọi case trùng khoá. Đó là
+        # hồi quy thẳng so với `write_golden_set`, mà docstring của nó khai use-case chính là "nạp
+        # lại một bộ đã sửa" — tức upsert idempotent.
+        #
+        # Gốc rễ là dùng sai công cụ, không phải sai tham số: `merge_golden_sets` hợp nhất hai nguồn
+        # NGANG HÀNG, nơi va chạm nghĩa là "hai bên bất đồng và không ai có thẩm quyền" — ném ra cho
+        # người quyết là đúng. Còn ở đây người dùng chủ động nạp bộ của mình lên ref của chính mình:
+        # họ LÀ bên có thẩm quyền trên những khoá họ gửi. Đó là phép **phủ**, và phủ thì không có
+        # khái niệm va chạm.
+        #
+        # Luật: case vừa nạp thắng trên khoá của nó; case cũ có khoá KHÔNG nằm trong bộ nạp thì giữ
+        # nguyên. Dùng `case_key` của evalhub chứ không tự chuẩn hoá lại — hai cách chuẩn hoá câu
+        # hỏi lệch nhau là hai bộ trông giống nhau mà không khớp được.
         try:
             existing = await read_golden_set(conn, golden.golden_set_ref, tenant_uuid)
         except GoldenSetNotFound:
-            merged = golden
-            n_kept = 0
+            merged, n_kept = golden, 0
         else:
-            try:
-                merged = merge_golden_sets(golden, existing, golden_set_ref=golden.golden_set_ref)
-            except GoldenSetMergeConflict as exc:
-                # 409, không 500: hai bộ **cùng khoá mà khác đáp án kỳ vọng** là mâu thuẫn dữ liệu
-                # người dùng giải được (sửa case hoặc đổi ref), không phải hỏng hệ thống. Trả nguyên
-                # danh sách xung đột — `merge_golden_sets` liệt kê TẤT CẢ chứ không dừng ở cái đầu,
-                # nên người nạp sửa được một lượt thay vì bóc từng cái qua nhiều lần thử.
-                raise HTTPException(status_code=409, detail=f"bộ nạp lên xung đột với bộ đang có: {exc}") from exc
-            n_kept = len(merged.cases) - len(golden.cases)
+            merged, n_kept = overlay_golden_set(golden, existing)
 
         try:
             await write_golden_set(conn, merged, tenant_uuid)
