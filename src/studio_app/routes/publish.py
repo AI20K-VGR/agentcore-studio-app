@@ -294,9 +294,15 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
 
 @router.post("/{agent_id}/evaluate")
 async def evaluate_agent(agent_id: str, body: PublishRequest) -> dict[str, object]:
-    """Chấm điểm NGUYÊN golden_set_ref qua `EvalHarness` thật, trả `Scorecard` — KHÔNG gọi
-    `publish()`, không ghi `wb.recipes`. Dùng cho UI hiện điểm TRƯỚC khi quyết bấm Publish, để nút
-    Publish có căn cứ bật/tắt mà không phải "bấm thử xem có được không"."""
+    """Chấm điểm `golden_set_ref` qua `EvalHarness` thật, trả `Scorecard` — KHÔNG gọi `publish()`,
+    không ghi `wb.recipes`. Dùng cho UI hiện điểm TRƯỚC khi quyết bấm Publish, để nút Publish có
+    căn cứ bật/tắt mà không phải "bấm thử xem có được không".
+
+    Chấm trên tập **Core**, không phải cả bộ — route này đi qua chính `_evaluate()` mà `/publish`
+    dùng, nên nó thừa hưởng `core_only=True` ở đó (xem chú thích tại lời gọi `EvalHarness.run`).
+    Điều đó là **bắt buộc**, không phải chi tiết cài đặt: điểm hiện ở đây là thứ người dùng lấy để
+    quyết bấm Publish, nên nó phải được đo trên **đúng tập** mà cổng Publish sẽ chấm. Hai route
+    chấm hai tập khác nhau thì con số xem trước không còn nói gì về kết quả thật."""
     session = get_request_session()
 
     # Cùng gate role-gap đã đóng ở `routes/runs.py::create_run` — route này trước bản vá cũng gọi
