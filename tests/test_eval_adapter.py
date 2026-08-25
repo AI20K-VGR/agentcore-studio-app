@@ -248,7 +248,7 @@ async def test_inv1_recipe_khai_tenant_khac_thi_session_thang() -> None:
         embedding=FakeEmbedding(),
         trace_writer=writer,
         session_context=resolve_session(  # ← server resolve, khác recipe
-            {"tenant_id": TENANT_ID, "user": "eval-harness", "roles": ["public"]}
+            {"tenant_id": TENANT_ID, "user": "eval-harness", "system_roles": ["public"]}
         ),
     )
 
@@ -323,7 +323,7 @@ async def test_run_case_surfaces_engine_refusal_faithfully(final_answer_text: st
         llm=_MultiTurnScriptedLLM(scripted_responses),
         embedding=FakeEmbedding(),
         trace_writer=_CollectingTraceWriter(),
-        session_context=resolve_session({"tenant_id": TENANT_ID, "user": "eval-harness", "roles": roles}),
+        session_context=resolve_session({"tenant_id": TENANT_ID, "user": "eval-harness", "system_roles": roles}),
         question=query,
     )
     engine_out = _llm_answer(raw.final_state)

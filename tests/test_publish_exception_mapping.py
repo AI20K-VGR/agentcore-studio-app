@@ -130,7 +130,7 @@ async def _run_evaluate_with(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ex
     monkeypatch.setattr(publish_module, "build_llm", lambda: None)
     monkeypatch.setattr(publish_module, "build_embedding", lambda: None)
 
-    session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@acme.com", roles=["admin"])
+    session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@acme.com", system_roles=["admin"])
     with pytest.raises(HTTPException) as exc_info:
         await _evaluate("agent-exc-mapping", _body(), session)
     return exc_info.value

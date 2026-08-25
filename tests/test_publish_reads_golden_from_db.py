@@ -146,7 +146,7 @@ async def test_bo_case_di_vao_harness_den_tu_db_chu_khong_phai_file(
 
         token = middleware._request_conn.set(conn)
         try:
-            session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@ankor.vn", roles=["admin"])
+            session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@ankor.vn", system_roles=["admin"])
             await _evaluate("agent-golden-from-db", _body(), session)
         finally:
             middleware._request_conn.reset(token)
@@ -190,7 +190,7 @@ async def test_chua_nap_bo_nao_thi_400_va_chi_duong_nap(
         await _bind(conn, ANKOR_ID)
         token = middleware._request_conn.set(conn)
         try:
-            session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@ankor.vn", roles=["admin"])
+            session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@ankor.vn", system_roles=["admin"])
             with pytest.raises(HTTPException) as bat:
                 await _evaluate("agent-golden-from-db", body_chua_nap, session)
         finally:
@@ -218,7 +218,7 @@ async def test_connection_bind_tenant_khac_thi_500_chu_khong_phai_400(
         await _bind(conn, BOREA_ID)  # connection: borea
         token = middleware._request_conn.set(conn)
         try:
-            session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@ankor.vn", roles=["admin"])  # phiên: ankor
+            session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@ankor.vn", system_roles=["admin"])  # phiên: ankor
             with pytest.raises(HTTPException) as bat:
                 await _evaluate("agent-golden-from-db", _body(), session)
         finally:
@@ -248,7 +248,7 @@ async def test_moi_tenant_doc_bo_cua_rieng_minh(
             await write_golden_set(conn, GoldenSet(golden_set_ref=ref, cases=[_case(case_id)]), tenant_id)
             token = middleware._request_conn.set(conn)
             try:
-                session = ResolvedContext(tenant_id=tenant_id, user="u@x.vn", roles=["admin"])
+                session = ResolvedContext(tenant_id=tenant_id, user="u@x.vn", system_roles=["admin"])
                 await _evaluate("agent-golden-from-db", body_ref, session)
             finally:
                 middleware._request_conn.reset(token)

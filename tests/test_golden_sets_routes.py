@@ -28,8 +28,8 @@ async def _close_singleton_pools_after_test() -> AsyncIterator[None]:
     await close_pools()
 
 
-def _set_session(*, tenant_id: UUID, user: str, roles: list[str]) -> object:
-    return middleware._request_session.set(ResolvedContext(tenant_id=tenant_id, user=user, roles=roles))
+def _set_session(*, tenant_id: UUID, user: str, system_roles: list[str]) -> object:
+    return middleware._request_session.set(ResolvedContext(tenant_id=tenant_id, user=user, system_roles=system_roles))
 
 
 @asynccontextmanager
@@ -52,11 +52,11 @@ async def _seed_tenant(admin_pool: Pool, name: str) -> UUID:
     return UUID(str(row[0]))
 
 
-async def _seed_user(admin_pool: Pool, tenant_id: UUID, email: str, roles: list[str]) -> UUID:
+async def _seed_user(admin_pool: Pool, tenant_id: UUID, email: str, system_roles: list[str]) -> UUID:
     async with admin_pool.connection() as conn:
         cur = await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s) RETURNING id",
-            (str(tenant_id), email, "not-a-real-hash", roles),
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s) RETURNING id",
+            (str(tenant_id), email, "not-a-real-hash", system_roles),
         )
         row = await cur.fetchone()
     assert row is not None
@@ -84,7 +84,7 @@ async def test_company_admin_nap_bo_roi_doc_lai_ra_dung(admin_pool: Pool) -> Non
     tenant_id = await _seed_tenant(admin_pool, "golden-probe-a")
     await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
             ket_qua = await upload_golden_set(
@@ -114,7 +114,7 @@ async def test_n_bay_suy_tu_expects_refusal_khong_tu_payload(admin_pool: Pool) -
     tenant_id = await _seed_tenant(admin_pool, "golden-probe-b")
     await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
             ket_qua = await upload_golden_set(
@@ -146,7 +146,7 @@ async def test_route_KHONG_khai_ho_source(admin_pool: Pool) -> None:
     tenant_id = await _seed_tenant(admin_pool, "golden-probe-c")
     await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
             await upload_golden_set(
@@ -179,7 +179,7 @@ async def test_field_go_sai_tra_422_va_neu_dich_danh_field(admin_pool: Pool) -> 
     sai = _case("U-01")
     sai["expected_citaion"] = sai.pop("expected_citation")
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as bat:
             async with _simulate_request_connection():
@@ -196,7 +196,7 @@ async def test_bo_rong_tra_422(admin_pool: Pool) -> None:
     tenant_id = await _seed_tenant(admin_pool, "golden-probe-e")
     await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as bat:
             async with _simulate_request_connection():
@@ -216,7 +216,7 @@ async def test_company_admin_khai_tenant_khac_tra_403(admin_pool: Pool) -> None:
     khac = await _seed_tenant(admin_pool, "golden-probe-f-khac")
     await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as bat:
             async with _simulate_request_connection():
@@ -235,7 +235,7 @@ async def test_superadmin_khong_khai_tenant_tra_400(admin_pool: Pool) -> None:
     sys_tenant = await _seed_tenant(admin_pool, "golden-probe-g-system")
     await _seed_user(admin_pool, sys_tenant, "root@system.com", ["superadmin"])
 
-    token = _set_session(tenant_id=sys_tenant, user="root@system.com", roles=["superadmin"])
+    token = _set_session(tenant_id=sys_tenant, user="root@system.com", system_roles=["superadmin"])
     try:
         with pytest.raises(HTTPException) as bat:
             async with _simulate_request_connection():
@@ -261,7 +261,7 @@ async def test_superadmin_khai_tenant_thi_ghi_duoc_cho_tenant_do(admin_pool: Poo
     dich = await _seed_tenant(admin_pool, "golden-probe-h-dich")
     await _seed_user(admin_pool, sys_tenant, "root@system.com", ["superadmin"])
 
-    token = _set_session(tenant_id=sys_tenant, user="root@system.com", roles=["superadmin"])
+    token = _set_session(tenant_id=sys_tenant, user="root@system.com", system_roles=["superadmin"])
     try:
         async with _simulate_request_connection():
             ket_qua = await upload_golden_set(

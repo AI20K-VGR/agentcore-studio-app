@@ -194,7 +194,7 @@ class EngineAgentRunner:
         (`question=`), không còn là 1 khoá bơm vào recipe — recipe gốc dùng NGUYÊN VẸN, cùng object
         cho mọi case trong 1 run (giữ đúng bất biến `DEC-D20-07`, chỉ đổi CƠ CHẾ truyền `query`).
 
-        `section_roles` đi qua `session_context.roles` — phần danh tính do server resolve. Từ
+        `section_roles` đi qua `session_context.system_roles` — phần danh tính do server resolve. Từ
         `workbench#23` nó **không còn** xuống `node.params`; vòng lặp mới không đọc `node.params`
         của `recipe.dag` chút nào, và (workbench#39/#41) cũng không đọc `recipe.kb_binding` — đã
         grep `agent_loop.py`/`interpreter.py`: không dòng nào chạm `recipe.kb_binding`, chỉ chạm
@@ -229,7 +229,9 @@ class EngineAgentRunner:
         toàn KHÔNG CẦN graph_lint đi trước, vì
         không nhánh nào của `run_agent_loop()` từng đọc `dag.nodes`/`dag.edges`."""
         base = self.certified_recipe(agent_id=agent_id, tenant_id=tenant_id, section_roles=section_roles)
-        session_context = resolve_session({"tenant_id": tenant_id, "user": "eval-harness", "roles": section_roles})
+        session_context = resolve_session(
+            {"tenant_id": tenant_id, "user": "eval-harness", "system_roles": section_roles}
+        )
         # `tool_dispatch=` (engine#32 review finding): trước fix này thiếu tham số, nên MỌI recipe
         # eval-gate qua đây âm thầm fallback về `WhitelistToolDispatch` (stub `interpreter.py`).
         # Chỉ tiêm `RealToolDispatch` khi `self._recipe` được caller đưa vào (branch (a) —

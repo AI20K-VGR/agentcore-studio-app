@@ -31,8 +31,8 @@ async def _close_singleton_pools_after_test() -> AsyncIterator[None]:
     await close_pools()
 
 
-def _set_session(*, tenant_id: UUID, user: str, roles: list[str]) -> object:
-    session = ResolvedContext(tenant_id=tenant_id, user=user, roles=roles)
+def _set_session(*, tenant_id: UUID, user: str, system_roles: list[str]) -> object:
+    session = ResolvedContext(tenant_id=tenant_id, user=user, system_roles=system_roles)
     return middleware._request_session.set(session)
 
 
@@ -68,11 +68,11 @@ async def _seed_tenant(admin_pool: Pool, name: str) -> UUID:
     return UUID(str(row[0]))
 
 
-async def _seed_user(admin_pool: Pool, tenant_id: UUID, email: str, roles: list[str]) -> None:
+async def _seed_user(admin_pool: Pool, tenant_id: UUID, email: str, system_roles: list[str]) -> None:
     async with admin_pool.connection() as conn:
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
-            (str(tenant_id), email, "not-a-real-hash", roles),
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s)",
+            (str(tenant_id), email, "not-a-real-hash", system_roles),
         )
 
 
@@ -135,7 +135,7 @@ async def test_list_agents_scoped_to_own_tenant_via_rls(admin_pool: Pool) -> Non
     await _seed_published_recipe(admin_pool, tenant_id=tenant_a, agent_id="agent-a1", version=1)
     await _seed_published_recipe(admin_pool, tenant_id=tenant_b, agent_id="agent-b1", version=1)
 
-    token = _set_session(tenant_id=tenant_a, user="user-a@acme.com", roles=["public"])
+    token = _set_session(tenant_id=tenant_a, user="user-a@acme.com", system_roles=["public"])
     try:
         async with _simulate_request_connection(tenant_a):
             result = await list_agents()
@@ -152,7 +152,7 @@ async def test_list_agents_returns_latest_published_version(admin_pool: Pool) ->
     await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-c1", version=1)
     await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-c1", version=2)
 
-    token = _set_session(tenant_id=tenant_id, user="user@acme.com", roles=["public"])
+    token = _set_session(tenant_id=tenant_id, user="user@acme.com", system_roles=["public"])
     try:
         async with _simulate_request_connection(tenant_id):
             result = await list_agents()
@@ -169,7 +169,7 @@ async def test_list_agents_excludes_unpublished_status(admin_pool: Pool) -> None
     await _seed_user(admin_pool, tenant_id, "user@acme.com", ["public"])
     await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-draft", version=1, status="draft")
 
-    token = _set_session(tenant_id=tenant_id, user="user@acme.com", roles=["public"])
+    token = _set_session(tenant_id=tenant_id, user="user@acme.com", system_roles=["public"])
     try:
         async with _simulate_request_connection(tenant_id):
             result = await list_agents()
@@ -184,7 +184,7 @@ async def test_rollback_requires_admin(admin_pool: Pool) -> None:
     await _seed_user(admin_pool, tenant_id, "user@acme.com", ["public"])
     await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-e1", version=1)
 
-    token = _set_session(tenant_id=tenant_id, user="user@acme.com", roles=["public"])
+    token = _set_session(tenant_id=tenant_id, user="user@acme.com", system_roles=["public"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection(tenant_id):
@@ -199,7 +199,7 @@ async def test_rollback_missing_version_returns_404(admin_pool: Pool) -> None:
     await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-f1", version=1)
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection(tenant_id):
@@ -220,7 +220,7 @@ async def test_rollback_restores_prior_version(admin_pool: Pool) -> None:
     await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-g1", version=1, status="draft")
     await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-g1", version=2, status="published")
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection(tenant_id):
             result = await rollback_agent("agent-g1", RollbackRequest(to_version=1))
@@ -243,7 +243,7 @@ async def test_list_agent_versions_requires_admin(admin_pool: Pool) -> None:
     await _seed_user(admin_pool, tenant_id, "user@acme.com", ["public"])
     await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-h1", version=1)
 
-    token = _set_session(tenant_id=tenant_id, user="user@acme.com", roles=["public"])
+    token = _set_session(tenant_id=tenant_id, user="user@acme.com", system_roles=["public"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection(tenant_id):
@@ -261,7 +261,7 @@ async def test_list_agent_versions_returns_real_rows_desc(admin_pool: Pool) -> N
     await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-i1", version=1, status="draft")
     await _seed_published_recipe(admin_pool, tenant_id=tenant_id, agent_id="agent-i1", version=2, status="published")
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection(tenant_id):
             result = await list_agent_versions("agent-i1")
@@ -280,7 +280,7 @@ async def test_list_agent_versions_scoped_to_own_tenant_via_rls(admin_pool: Pool
     await _seed_published_recipe(admin_pool, tenant_id=tenant_a, agent_id="agent-shared", version=1)
     await _seed_published_recipe(admin_pool, tenant_id=tenant_b, agent_id="agent-shared", version=1)
 
-    token = _set_session(tenant_id=tenant_a, user="admin-a@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_a, user="admin-a@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection(tenant_a):
             result = await list_agent_versions("agent-shared")
@@ -312,7 +312,7 @@ async def test_get_agent_recipe_normalizes_from_alias_regardless_of_write_path(a
             (agent_id, str(tenant_id), recipe.model_dump_json()),
         )
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection(tenant_id):
             result = await get_agent_recipe(agent_id)
@@ -356,7 +356,7 @@ async def test_get_agent_recipe_rejects_row_invalid_under_current_contract(admin
             (agent_id, str(tenant_id), json.dumps(recipe_dict)),
         )
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection(tenant_id):

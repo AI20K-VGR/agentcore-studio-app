@@ -55,7 +55,7 @@ async def create_section(body: CreateSectionRequest) -> SectionResponse:
     session = get_request_session()
     conn = get_request_connection()
     identity = await fetch_fresh_identity(conn, session.user)
-    require_superadmin(identity.roles)
+    require_superadmin(identity.system_roles)
 
     # Parse UUID TRƯỚC khi query — cùng bug đã sửa ở routes/documents.py (review app#27,
     # dholmes0207/TranBaDat2607, finding #2): tenant_id sai định dạng đi thẳng vào WHERE id = %s
@@ -95,7 +95,7 @@ async def list_sections(tenant_id: str | None = None) -> list[SectionResponse]:
     conn = get_request_connection()
     identity = await fetch_fresh_identity(conn, session.user)
 
-    if "superadmin" in identity.roles:
+    if "superadmin" in identity.system_roles:
         if tenant_id is None:
             raise HTTPException(
                 status_code=400, detail="superadmin phải khai ?tenant_id= để xem sections của công ty nào"
@@ -106,7 +106,7 @@ async def list_sections(tenant_id: str | None = None) -> list[SectionResponse]:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=f"tenant_id không phải UUID hợp lệ: {tenant_id!r}") from exc
         target_tenant_id = tenant_id
-    elif "admin" in identity.roles:
+    elif "admin" in identity.system_roles:
         if tenant_id is not None and tenant_id != str(identity.tenant_id):
             raise HTTPException(status_code=403, detail="company-admin chỉ xem được sections của tenant mình")
         target_tenant_id = str(identity.tenant_id)
@@ -126,7 +126,7 @@ async def list_sections(tenant_id: str | None = None) -> list[SectionResponse]:
 
 @router.patch("/{section_id}", response_model=SectionResponse)
 async def rename_section(section_id: str, body: RenameSectionRequest) -> SectionResponse:
-    """Đổi tên — 1 transaction cascade sang `core.users.roles` (MỌI user trong tenant đó đang gắn
+    """Đổi tên — 1 transaction cascade sang `core.users.system_roles` (MỌI user trong tenant đó đang gắn
     tên cũ, đổi luôn sang tên mới). KHÔNG cascade sang `kb.chunks.section_role` — bảng đó hiện chỉ
     được ghi bởi `ingest_callisto.py` (fixture, hard-bind tenant `ankor`/`borea`), không có đường
     nào ghi cho 1 tenant thật do superadmin tạo (`KbPipeline` vẫn `NotImplementedError`) — cascade
@@ -134,7 +134,7 @@ async def rename_section(section_id: str, body: RenameSectionRequest) -> Section
     session = get_request_session()
     conn = get_request_connection()
     identity = await fetch_fresh_identity(conn, session.user)
-    require_superadmin(identity.roles)
+    require_superadmin(identity.system_roles)
 
     async with conn.transaction():
         cur = await conn.execute(
@@ -157,7 +157,7 @@ async def rename_section(section_id: str, body: RenameSectionRequest) -> Section
         assert updated is not None
 
         await conn.execute(
-            "UPDATE core.users SET roles = array_replace(roles, %s, %s) WHERE tenant_id = %s AND %s = ANY(roles)",
+            "UPDATE core.users SET system_roles = array_replace(system_roles, %s, %s) WHERE tenant_id = %s AND %s = ANY(system_roles)",
             (old_name, body.name, tenant_id, old_name),
         )
 
@@ -169,11 +169,11 @@ async def rename_section(section_id: str, body: RenameSectionRequest) -> Section
 @router.delete("/{section_id}", status_code=204)
 async def delete_section(section_id: str) -> None:
     """Chặn (409) nếu còn `core.users` gắn role này — fail-closed, không xoá nửa vời để lại role
-    mồ côi (không ai với tới được, nhưng vẫn nằm trong `roles[]` của user đó mãi mãi)."""
+    mồ côi (không ai với tới được, nhưng vẫn nằm trong `system_roles[]` của user đó mãi mãi)."""
     session = get_request_session()
     conn = get_request_connection()
     identity = await fetch_fresh_identity(conn, session.user)
-    require_superadmin(identity.roles)
+    require_superadmin(identity.system_roles)
 
     cur = await conn.execute(
         "SELECT tenant_id, name FROM core.sections WHERE id = %s",
@@ -185,7 +185,7 @@ async def delete_section(section_id: str) -> None:
     tenant_id, name = row
 
     cur = await conn.execute(
-        "SELECT count(*) FROM core.users WHERE tenant_id = %s AND %s = ANY(roles)",
+        "SELECT count(*) FROM core.users WHERE tenant_id = %s AND %s = ANY(system_roles)",
         (tenant_id, name),
     )
     user_count_row = await cur.fetchone()

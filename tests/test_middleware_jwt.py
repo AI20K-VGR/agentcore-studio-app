@@ -53,7 +53,7 @@ def test_valid_bearer_token_resolves_full_identity(monkeypatch: pytest.MonkeyPat
     (app#21 🔶 — `iat` cần đi kèm để `authz.fetch_fresh_identity` so được với `password_changed_at`
     và hết hiệu lực JWT ký trước lần đổi mật khẩu gần nhất, xem `middleware.py`/`authz.py`)."""
     monkeypatch.setattr(jwt_auth, "get_settings", _settings)
-    token = jwt_auth.issue_token(ResolvedContext(tenant_id=_TENANT_ID, user="dozyboy", roles=["public"]))
+    token = jwt_auth.issue_token(ResolvedContext(tenant_id=_TENANT_ID, user="dozyboy", system_roles=["public"]))
 
     result = _resolve_jwt_session(_FakeRequest({"authorization": f"Bearer {token}"}))  # type: ignore[arg-type]
 
@@ -61,7 +61,7 @@ def test_valid_bearer_token_resolves_full_identity(monkeypatch: pytest.MonkeyPat
     session, token_issued_at = result
     assert session.tenant_id == _TENANT_ID
     assert session.user == "dozyboy"
-    assert session.roles == ["public"]
+    assert session.system_roles == ["public"]
     assert token_issued_at == jwt_auth.issued_at(token)
 
 
@@ -69,7 +69,7 @@ def test_bearer_prefix_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None
     """`bearer`/`Bearer`/`BEARER` đều phải hoạt động — HTTP header case-insensitive theo spec,
     không nên phụ thuộc client viết đúng hoa/thường."""
     monkeypatch.setattr(jwt_auth, "get_settings", _settings)
-    token = jwt_auth.issue_token(ResolvedContext(tenant_id=_TENANT_ID, user="dozyboy", roles=[]))
+    token = jwt_auth.issue_token(ResolvedContext(tenant_id=_TENANT_ID, user="dozyboy", system_roles=[]))
 
     result = _resolve_jwt_session(_FakeRequest({"authorization": f"bearer {token}"}))  # type: ignore[arg-type]
     assert result is not None

@@ -90,7 +90,7 @@ async def create_run(body: RunRequest) -> ConnectivityCheckResponse:
     # khoản đăng nhập đều gọi được, dù endpoint giờ không chạm KB/LLM/DB nào khác ngoài chính
     # identity-check này.
     identity = await fetch_fresh_identity(get_request_connection(), session.user)
-    require_admin(identity.roles)
+    require_admin(identity.system_roles)
 
     results = _check_tool_connectivity(body.tool_whitelist)
     return ConnectivityCheckResponse(agent_id=body.agent_id, results=results)

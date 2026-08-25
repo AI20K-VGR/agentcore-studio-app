@@ -1,4 +1,4 @@
-"""Ký/verify JWT cho identity `{tenant_id, user, roles}`, cộng `hash_password()`/`verify_password()`
+"""Ký/verify JWT cho identity `{tenant_id, user, system_roles}`, cộng `hash_password()`/`verify_password()`
 (bcrypt) dùng chung cho cả login lẫn tạo tài khoản (Kế hoạch 3).
 
 Chữ ký được verify bằng `settings.jwt_secret` (HS256) — một request không có khoá bí mật đó KHÔNG
@@ -6,7 +6,7 @@ THỂ tự chế ra 1 token hợp lệ.
 
 `issue_token()` giờ CHỈ được gọi từ `routes/auth.py::login`, SAU KHI đã verify mật khẩu thật khớp
 `core.users.password_hash` — khác giai đoạn trước (`routes/auth.py::demo_login`, đã bị xoá hẳn),
-lúc đó `issue_token()` ký bất kỳ `tenant`/`user`/`roles` nào caller đưa vào, không có bước kiểm mật
+lúc đó `issue_token()` ký bất kỳ `tenant`/`user`/`system_roles` nào caller đưa vào, không có bước kiểm mật
 khẩu nào đứng trước. Câu hỏi "ai được phép TỰ XIN token cho tenant/user nào?" giờ đã đóng bằng mật
 khẩu thật, không còn là identity provider để trống như giai đoạn demo-login.
 """
@@ -105,7 +105,7 @@ def issue_token(session: ResolvedContext) -> str:
     claims = {
         "tenant_id": str(session.tenant_id),
         "user": session.user,
-        "roles": session.roles,
+        "system_roles": session.system_roles,
         "iat": now,
         "exp": now + timedelta(minutes=settings.jwt_expire_minutes),
     }
@@ -133,17 +133,17 @@ def verify_token(token: str) -> ResolvedContext:
     try:
         tenant_id = UUID(str(claims["tenant_id"]))
         user = str(claims["user"])
-        roles = [str(r) for r in claims.get("roles", [])]
+        roles = [str(r) for r in claims.get("system_roles", [])]
     except (KeyError, ValueError) as exc:
         raise InvalidTokenError(f"JWT thiếu/sai claim bắt buộc: {exc}") from exc
 
-    return ResolvedContext(tenant_id=tenant_id, user=user, roles=roles)
+    return ResolvedContext(tenant_id=tenant_id, user=user, system_roles=roles)
 
 
 def issued_at(token: str) -> datetime:
     """Giải mã lại `iat` của 1 JWT (chữ ký/hạn dùng đã qua `_decode_claims` y hệt `verify_token`).
     Tách riêng khỏi `verify_token()` thay vì đổi chữ ký hàm đó — nhiều call site/test hiện đọc
-    thẳng `.tenant_id`/`.user`/`.roles` trên kết quả `verify_token()`, đổi thành tuple sẽ vỡ hết.
+    thẳng `.tenant_id`/`.user`/`.system_roles` trên kết quả `verify_token()`, đổi thành tuple sẽ vỡ hết.
 
     Dùng ở `middleware.py` để `authz.fetch_fresh_identity` so được `iat` với `core.users.
     password_changed_at` — JWT ký TRƯỚC lần đổi mật khẩu gần nhất phải bị coi là hết hiệu lực

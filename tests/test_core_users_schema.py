@@ -36,7 +36,7 @@ async def test_app_role_can_dml_core_users_after_grant(admin_pool: Pool, pool: P
 
     async with pool.connection() as conn:
         cur = await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s) RETURNING id",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s) RETURNING id",
             (tenant_id, "dml-probe@example.com", hash_password("whatever"), ["admin"]),
         )
         inserted = await cur.fetchone()
@@ -78,7 +78,7 @@ async def test_core_users_email_insert_is_idempotent(admin_pool: Pool) -> None:
         tenant_id = row[0]
 
         insert_sql = (
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) "
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) "
             "VALUES (%s, %s, %s, %s) ON CONFLICT (email) DO NOTHING"
         )
         params = (tenant_id, "idempotent-probe@agentcore.internal", hash_password("whatever"), ["superadmin"])

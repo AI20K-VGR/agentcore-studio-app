@@ -27,8 +27,8 @@ async def _close_singleton_pools_after_test() -> AsyncIterator[None]:
     await close_pools()
 
 
-def _set_session(*, tenant_id: UUID, user: str, roles: list[str]) -> object:
-    session = ResolvedContext(tenant_id=tenant_id, user=user, roles=roles)
+def _set_session(*, tenant_id: UUID, user: str, system_roles: list[str]) -> object:
+    session = ResolvedContext(tenant_id=tenant_id, user=user, system_roles=system_roles)
     return middleware._request_session.set(session)
 
 
@@ -56,11 +56,11 @@ async def _seed_tenant(admin_pool: Pool, name: str) -> UUID:
     return UUID(str(row[0]))
 
 
-async def _seed_user(admin_pool: Pool, tenant_id: UUID, email: str, roles: list[str]) -> None:
+async def _seed_user(admin_pool: Pool, tenant_id: UUID, email: str, system_roles: list[str]) -> None:
     async with admin_pool.connection() as conn:
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
-            (str(tenant_id), email, "not-a-real-hash", roles),
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s)",
+            (str(tenant_id), email, "not-a-real-hash", system_roles),
         )
 
 
@@ -92,30 +92,30 @@ async def _seed_published_recipe(admin_pool: Pool, tenant_id: UUID, agent_id: st
 
 
 async def test_chat_as_roles_requires_admin(admin_pool: Pool) -> None:
-    tenant_id = await _seed_tenant(admin_pool, "chat-as-roles-probe-a")
+    tenant_id = await _seed_tenant(admin_pool, "chat-as-system_roles-probe-a")
     await _seed_user(admin_pool, tenant_id, "employee@acme.com", ["hr"])
-    await _seed_published_recipe(admin_pool, tenant_id, "agent-as-roles-a")
+    await _seed_published_recipe(admin_pool, tenant_id, "agent-as-system_roles-a")
 
-    token = _set_session(tenant_id=tenant_id, user="employee@acme.com", roles=["hr"])
+    token = _set_session(tenant_id=tenant_id, user="employee@acme.com", system_roles=["hr"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection(tenant_id):
-                await chat("agent-as-roles-a", ChatRequest(message="hi", as_roles=["hr"]))
+                await chat("agent-as-system_roles-a", ChatRequest(message="hi", as_roles=["hr"]))
         assert exc_info.value.status_code == 403
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
 
 
 async def test_chat_as_roles_rejects_unknown_section(admin_pool: Pool) -> None:
-    tenant_id = await _seed_tenant(admin_pool, "chat-as-roles-probe-b")
+    tenant_id = await _seed_tenant(admin_pool, "chat-as-system_roles-probe-b")
     await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
-    await _seed_published_recipe(admin_pool, tenant_id, "agent-as-roles-b")
+    await _seed_published_recipe(admin_pool, tenant_id, "agent-as-system_roles-b")
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection(tenant_id):
-                await chat("agent-as-roles-b", ChatRequest(message="hi", as_roles=["khong-ton-tai"]))
+                await chat("agent-as-system_roles-b", ChatRequest(message="hi", as_roles=["khong-ton-tai"]))
         assert exc_info.value.status_code == 400
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
@@ -126,10 +126,10 @@ async def test_chat_as_roles_rejects_reserved_role_name_even_if_section_exists(a
     qua `chat.py`) tự trừ `RESERVED_ROLE_NAMES`. Seed thẳng section "superadmin" bằng SQL (bỏ qua
     validator layer-1, mô phỏng đúng ca dòng cũ từ trước layer-1 tồn tại): `as_roles=["superadmin"]`
     vẫn phải bị 400 dù section đó CÓ THẬT trong `core.sections` — nếu không, giá trị đó đi thẳng
-    vào `session_context.roles`, đầu vào của hàng rào nội dung KB ở `interpreter.run()`."""
-    tenant_id = await _seed_tenant(admin_pool, "chat-as-roles-probe-c")
+    vào `session_context.system_roles`, đầu vào của hàng rào nội dung KB ở `interpreter.run()`."""
+    tenant_id = await _seed_tenant(admin_pool, "chat-as-system_roles-probe-c")
     await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
-    await _seed_published_recipe(admin_pool, tenant_id, "agent-as-roles-c")
+    await _seed_published_recipe(admin_pool, tenant_id, "agent-as-system_roles-c")
     async with admin_pool.connection() as conn:
         cur = await conn.execute("SELECT id FROM core.users WHERE email = %s", ("admin@acme.com",))
         admin_row = await cur.fetchone()
@@ -139,11 +139,11 @@ async def test_chat_as_roles_rejects_reserved_role_name_even_if_section_exists(a
             (str(tenant_id), "superadmin", admin_row[0]),
         )
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection(tenant_id):
-                await chat("agent-as-roles-c", ChatRequest(message="hi", as_roles=["superadmin"]))
+                await chat("agent-as-system_roles-c", ChatRequest(message="hi", as_roles=["superadmin"]))
         assert exc_info.value.status_code == 400
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]

@@ -1,7 +1,7 @@
-"""Roles TƯƠI tra từ `core.users` mỗi request — KHÔNG BAO GIỜ tin `session.roles` (claim JWT) để
+"""Roles TƯƠI tra từ `core.users` mỗi request — KHÔNG BAO GIỜ tin `session.system_roles` (claim JWT) để
 phân quyền. JWT là ảnh chụp lúc đăng nhập, sống tới `settings.jwt_expire_minutes` (mặc định 480
 phút = 8 tiếng): 1 tài khoản bị thu hồi quyền hoặc chuyển tenant giữa chừng vẫn còn quyền cũ trong
-JWT cũ tới lúc hết hạn nếu route tin thẳng `session.roles` (review `app#17`, Important #1, đợt 8).
+JWT cũ tới lúc hết hạn nếu route tin thẳng `session.system_roles` (review `app#17`, Important #1, đợt 8).
 
 Tách khỏi `middleware.py` có chủ đích — module đó tự giới hạn phạm vi ở việc giữ 1 connection +
 danh tính JWT-derived cho request (F9), không phải nơi quyết "danh tính đó được làm gì". `authz.py`
@@ -10,7 +10,7 @@ route quyết định.
 
 Ban đầu (`app#17`) `FreshRoles`/`require_admin`/`require_superadmin` chỉ sống trong
 `routes/admin.py`. Sau khi thêm `routes/sections.py`/`routes/agents.py` + gate lại
-`routes/runs.py`/`routes/publish.py`, cùng 1 round-trip `SELECT id, roles, tenant_id FROM
+`routes/runs.py`/`routes/publish.py`, cùng 1 round-trip `SELECT id, system_roles, tenant_id FROM
 core.users WHERE email=%s` lặp lại ở 7+ route handler — gom về đây 1 lần."""
 
 from __future__ import annotations
@@ -27,12 +27,12 @@ from studio_app.middleware import get_request_token_issued_at
 from studio_app.validators import RESERVED_ROLE_NAMES
 
 FreshRoles = NewType("FreshRoles", list[str])
-"""Type riêng cho "roles vừa tra từ `core.users` trong request này" — KHÁC `list[str]` thường (vd
-`session.roles`, claim JWT). Không có type riêng, `require_admin(session.roles)` type-check sạch
+"""Type riêng cho "system_roles vừa tra từ `core.users` trong request này" — KHÁC `list[str]` thường (vd
+`session.system_roles`, claim JWT). Không có type riêng, `require_admin(session.roles)` type-check sạch
 như `require_admin(fresh_roles)` — mypy không phân biệt được, 1 lần review-miss là bug leo quyền
 sống lại lặng lẽ (review `app#17` đợt 9, Type-safety gap). `NewType` không chặn được ai CỐ TÌNH viết
-`require_admin(FreshRoles(session.roles))` để né mypy — nhưng chặn được ca ngộ nhận, việc thực tế
-hay xảy ra hơn nhiều: gõ nhầm `session.roles` thay vì roles vừa tra sẽ ĐỎ NGAY ở mypy, không đợi
+`require_admin(FreshRoles(session.system_roles))` để né mypy — nhưng chặn được ca ngộ nhận, việc thực tế
+hay xảy ra hơn nhiều: gõ nhầm `session.system_roles` thay vì system_roles vừa tra sẽ ĐỎ NGAY ở mypy, không đợi
 tới lúc chạy production."""
 
 
@@ -40,15 +40,15 @@ tới lúc chạy production."""
 class FreshIdentity:
     """Danh tính TƯƠI của người gọi, tra lại từ `core.users` trong CHÍNH request này — `id` +
     `tenant_id` dùng khi route cần ghi dữ liệu THUỘC ĐÚNG tenant người gọi (thay vì tin
-    `session.tenant_id` từ JWT), `roles` dùng cho `require_admin`/`require_superadmin`."""
+    `session.tenant_id` từ JWT), `system_roles` dùng cho `require_admin`/`require_superadmin`."""
 
     id: UUID
     tenant_id: UUID
-    roles: FreshRoles
+    system_roles: FreshRoles
 
 
 async def fetch_fresh_identity(conn: AsyncConnection, email: str) -> FreshIdentity:
-    """`SELECT id, roles, tenant_id, password_changed_at, is_active FROM core.users WHERE email =
+    """`SELECT id, system_roles, tenant_id, password_changed_at, is_active FROM core.users WHERE email =
     %s` — round-trip DUY NHẤT dùng chung cho mọi route cần roles/tenant tươi thay vì tin JWT.
 
     Raise `HTTPException(403)` nếu JWT hợp lệ (chữ ký đúng, chưa hết hạn) nhưng KHÔNG còn dòng nào
@@ -79,7 +79,7 @@ async def fetch_fresh_identity(conn: AsyncConnection, email: str) -> FreshIdenti
     cầu, cùng dạng nợ kỹ thuật đã ghi nhận công khai ở `routes/admin.py` (comment trên
     `fetch_fresh_identity` ở `create_user`) cho khoảng-hở tenant_context tương tự."""
     cur = await conn.execute(
-        "SELECT id, roles, tenant_id, password_changed_at, is_active FROM core.users WHERE email = %s",
+        "SELECT id, system_roles, tenant_id, password_changed_at, is_active FROM core.users WHERE email = %s",
         (email,),
     )
     row = await cur.fetchone()
@@ -104,7 +104,7 @@ async def fetch_fresh_identity(conn: AsyncConnection, email: str) -> FreshIdenti
             status_code=401,
             detail="Mật khẩu đã đổi sau khi phiên này đăng nhập — đăng nhập lại.",
         )
-    return FreshIdentity(id=user_id, tenant_id=tenant_id, roles=FreshRoles(list(roles_raw)))
+    return FreshIdentity(id=user_id, tenant_id=tenant_id, system_roles=FreshRoles(list(roles_raw)))
 
 
 async def fetch_tenant_section_names(conn: AsyncConnection, tenant_id: object) -> set[str]:
@@ -113,10 +113,10 @@ async def fetch_tenant_section_names(conn: AsyncConnection, tenant_id: object) -
     trong `routes/admin.py`): `routes/auth.py::login` (mở rộng role admin lúc phát JWT) và
     `routes/chat.py::chat` (validate `as_roles`) đều tự đọc `core.sections` RỒI DÙNG THẲNG, không
     qua tầng trừ nào — 1 dòng `core.sections` tên `"superadmin"` còn sót từ TRƯỚC layer-1
-    (`validators.reject_reserved_section_name`) sẽ: (a) lọt vào JWT `roles` của MỌI company-admin
-    tenant đó lúc login (UI web định tuyến tầng theo `session.roles`, JWT — admin đó bị đưa nhầm
+    (`validators.reject_reserved_section_name`) sẽ: (a) lọt vào JWT `system_roles` của MỌI company-admin
+    tenant đó lúc login (UI web định tuyến tầng theo `session.system_roles`, JWT — admin đó bị đưa nhầm
     vào Superadmin Console, mọi lời gọi rồi 403 vì backend vẫn tra roles TƯƠI), và (b) lọt vào
-    `as_roles` hợp lệ ở `chat.py`, đi thẳng vào `session_context.roles` — đầu vào của hàng rào nội
+    `as_roles` hợp lệ ở `chat.py`, đi thẳng vào `session_context.system_roles` — đầu vào của hàng rào nội
     dung KB ở `interpreter.run()`. Gom về đây 1 hàm DUY NHẤT để call site MỚI không lặp lại đúng
     lỗ này lần thứ 3 — không dùng cho `routes/admin.py::create_user`/`update_user_roles` (2 chỗ đó
     còn hợp thêm `{"admin"}` vào vocab, khác hình dạng, giữ nguyên logic riêng của chúng)."""
@@ -124,15 +124,15 @@ async def fetch_tenant_section_names(conn: AsyncConnection, tenant_id: object) -
     return {row[0] for row in await cur.fetchall()} - RESERVED_ROLE_NAMES
 
 
-def require_superadmin(roles: FreshRoles) -> None:
+def require_superadmin(system_roles: FreshRoles) -> None:
     """403 — đã đăng nhập rồi (qua `get_request_session()`, 401 xử lý ở lớp dưới), chỉ thiếu ĐÚNG
-    quyền superadmin. `roles` PHẢI là `FreshRoles` (tra qua `fetch_fresh_identity`), không phải
-    `session.roles` — xem docstring module."""
-    if "superadmin" not in roles:
+    quyền superadmin. `system_roles` PHẢI là `FreshRoles` (tra qua `fetch_fresh_identity`), không phải
+    `session.system_roles` — xem docstring module."""
+    if "superadmin" not in system_roles:
         raise HTTPException(status_code=403, detail="Cần quyền superadmin.")
 
 
-def require_admin(roles: FreshRoles) -> None:
-    """Cùng lý do `require_superadmin` ở trên — `roles` phải là roles TƯƠI từ DB, không phải JWT."""
-    if "admin" not in roles and "superadmin" not in roles:
+def require_admin(system_roles: FreshRoles) -> None:
+    """Cùng lý do `require_superadmin` ở trên — `system_roles` phải là roles TƯƠI từ DB, không phải JWT."""
+    if "admin" not in system_roles and "superadmin" not in system_roles:
         raise HTTPException(status_code=403, detail="Cần quyền admin.")

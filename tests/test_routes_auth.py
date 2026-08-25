@@ -82,7 +82,7 @@ def _settings() -> Settings:
 
 async def test_login_succeeds_with_correct_password(admin_pool: Pool, monkeypatch: pytest.MonkeyPatch) -> None:
     """Đường thật (Kế hoạch 3) end-to-end: seed 1 dòng `core.users` thật, đăng nhập đúng mật khẩu
-    -> token verify được ra đúng tenant/roles đã seed."""
+    -> token verify được ra đúng tenant/system_roles đã seed."""
     monkeypatch.setattr(jwt_auth, "get_settings", _settings)
     async with admin_pool.connection() as conn:
         cur = await conn.execute("INSERT INTO core.tenants (name) VALUES (%s) RETURNING id", ("acme",))
@@ -90,7 +90,7 @@ async def test_login_succeeds_with_correct_password(admin_pool: Pool, monkeypatc
         assert row is not None
         tenant_id = row[0]
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s)",
             (tenant_id, "real@acme.com", hash_password("correct-horse-battery-staple"), ["admin", "public"]),
         )
 
@@ -100,7 +100,7 @@ async def test_login_succeeds_with_correct_password(admin_pool: Pool, monkeypatc
         )
 
     assert response.tenant_id == str(tenant_id)
-    assert response.roles == ["admin", "public"]
+    assert response.system_roles == ["admin", "public"]
     resolved = jwt_auth.verify_token(response.access_token)
     assert resolved.tenant_id == tenant_id
 
@@ -113,7 +113,7 @@ async def test_login_rejects_wrong_password(admin_pool: Pool, monkeypatch: pytes
         assert row is not None
         tenant_id = row[0]
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s)",
             (tenant_id, "wrongpw@acme.com", hash_password("correct-password"), ["public"]),
         )
 
@@ -145,7 +145,7 @@ async def test_login_rejects_oversized_password_with_401_not_500_for_existing_em
         assert row is not None
         tenant_id = row[0]
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s)",
             (tenant_id, "oversized@acme.com", hash_password("short-password"), ["public"]),
         )
 
@@ -204,7 +204,7 @@ async def test_login_expands_admin_roles_to_all_tenant_sections(
     admin_pool: Pool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Quyết định qua AskUserQuestion: admin công ty mặc định thấy MỌI nội dung, không phải tự
-    tick từng phòng ban. `core.users.roles` trong DB vẫn CHỈ lưu `["admin"]` — JWT phát ra mới là
+    tick từng phòng ban. `core.users.system_roles` trong DB vẫn CHỈ lưu `["admin"]` — JWT phát ra mới là
     nơi mở rộng, đúng phạm vi `apps/studio` (filter nội dung nằm ở `packages/engine`, ngoài phạm
     vi sửa ở đây)."""
     monkeypatch.setattr(jwt_auth, "get_settings", _settings)
@@ -214,7 +214,7 @@ async def test_login_expands_admin_roles_to_all_tenant_sections(
         assert row is not None
         tenant_id = row[0]
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s)",
             (tenant_id, "admin-expand@acme.com", hash_password("password-123"), ["admin"]),
         )
         admin_row = await conn.execute("SELECT id FROM core.users WHERE email = %s", ("admin-expand@acme.com",))
@@ -228,18 +228,18 @@ async def test_login_expands_admin_roles_to_all_tenant_sections(
     async with _simulate_request_connection():
         response = await login(LoginRequest(email="admin-expand@acme.com", password="password-123"), _fake_request())
 
-    assert set(response.roles) == {"admin", "hr", "finance"}
+    assert set(response.system_roles) == {"admin", "hr", "finance"}
 
-    # `core.users.roles` trong DB KHÔNG bị ghi đè — chỉ JWT phát ra mới mở rộng.
+    # `core.users.system_roles` trong DB KHÔNG bị ghi đè — chỉ JWT phát ra mới mở rộng.
     async with admin_pool.connection() as conn:
-        cur = await conn.execute("SELECT roles FROM core.users WHERE email = %s", ("admin-expand@acme.com",))
+        cur = await conn.execute("SELECT system_roles FROM core.users WHERE email = %s", ("admin-expand@acme.com",))
         row = await cur.fetchone()
     assert row is not None
     assert list(row[0]) == ["admin"]
 
 
 async def test_login_does_not_expand_employee_roles(admin_pool: Pool, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Đối chứng: nhân viên KHÔNG có `"admin"` thì roles JWT giữ nguyên đúng như DB — mở rộng chỉ
+    """Đối chứng: nhân viên KHÔNG có `"admin"` thì system_roles JWT giữ nguyên đúng như DB — mở rộng chỉ
     áp dụng cho admin, không phải mọi tài khoản."""
     monkeypatch.setattr(jwt_auth, "get_settings", _settings)
     async with admin_pool.connection() as conn:
@@ -250,7 +250,7 @@ async def test_login_does_not_expand_employee_roles(admin_pool: Pool, monkeypatc
         assert row is not None
         tenant_id = row[0]
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s)",
             (tenant_id, "employee-no-expand@acme.com", hash_password("password-123"), ["hr"]),
         )
         employee_row = await conn.execute(
@@ -268,7 +268,7 @@ async def test_login_does_not_expand_employee_roles(admin_pool: Pool, monkeypatc
             LoginRequest(email="employee-no-expand@acme.com", password="password-123"), _fake_request()
         )
 
-    assert response.roles == ["hr"]
+    assert response.system_roles == ["hr"]
 
 
 async def test_login_rejects_deactivated_user(admin_pool: Pool, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -281,7 +281,7 @@ async def test_login_rejects_deactivated_user(admin_pool: Pool, monkeypatch: pyt
         assert row is not None
         tenant_id = row[0]
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles, is_active) VALUES (%s, %s, %s, %s, false)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles, is_active) VALUES (%s, %s, %s, %s, false)",
             (tenant_id, "deactivated@acme.com", hash_password("correct-horse-battery-staple"), ["public"]),
         )
 
@@ -293,8 +293,8 @@ async def test_login_rejects_deactivated_user(admin_pool: Pool, monkeypatch: pyt
     assert exc_info.value.status_code == 401
 
 
-def _set_session(*, tenant_id: object, user: str, roles: list[str]) -> object:
-    session = ResolvedContext(tenant_id=tenant_id, user=user, roles=roles)  # type: ignore[arg-type]
+def _set_session(*, tenant_id: object, user: str, system_roles: list[str]) -> object:
+    session = ResolvedContext(tenant_id=tenant_id, user=user, system_roles=system_roles)  # type: ignore[arg-type]
     return middleware._request_session.set(session)
 
 
@@ -308,11 +308,11 @@ async def test_change_own_password_succeeds_and_new_password_logs_in(
         assert row is not None
         tenant_id = row[0]
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s)",
             (tenant_id, "changepw@acme.com", hash_password("old-password-123"), ["admin"]),
         )
 
-    token = _set_session(tenant_id=tenant_id, user="changepw@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="changepw@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
             result = await change_own_password(
@@ -345,11 +345,11 @@ async def test_change_own_password_rejects_wrong_old_password(
         assert row is not None
         tenant_id = row[0]
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s)",
             (tenant_id, "changepw-wrong@acme.com", hash_password("old-password-123"), ["admin"]),
         )
 
-    token = _set_session(tenant_id=tenant_id, user="changepw-wrong@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="changepw-wrong@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
@@ -383,11 +383,11 @@ async def test_change_own_password_rate_limited_after_repeated_wrong_attempts(
         assert row is not None
         tenant_id = row[0]
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s)",
             (tenant_id, "changepw-rl@acme.com", hash_password("old-password-123"), ["admin"]),
         )
 
-    token = _set_session(tenant_id=tenant_id, user="changepw-rl@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="changepw-rl@acme.com", system_roles=["admin"])
     try:
         for _ in range(10):  # đúng `rate_limit._CAPACITY` — burst này còn token, verify chạy thật
             with pytest.raises(HTTPException) as exc_info:
@@ -419,7 +419,7 @@ async def test_fetch_fresh_identity_rejects_jwt_issued_before_password_change(ad
         assert row is not None
         tenant_id = row[0]
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles, password_changed_at) "
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles, password_changed_at) "
             "VALUES (%s, %s, %s, %s, now())",
             (tenant_id, "stale-jwt@acme.com", hash_password("whatever"), ["admin"]),
         )
@@ -443,7 +443,7 @@ async def test_fetch_fresh_identity_accepts_jwt_issued_after_password_change(adm
         assert row is not None
         tenant_id = row[0]
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles, password_changed_at) "
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles, password_changed_at) "
             "VALUES (%s, %s, %s, %s, now())",
             (tenant_id, "fresh-jwt@acme.com", hash_password("whatever"), ["admin"]),
         )
@@ -454,7 +454,7 @@ async def test_fetch_fresh_identity_accepts_jwt_issued_after_password_change(adm
             identity = await fetch_fresh_identity(conn, "fresh-jwt@acme.com")
         finally:
             middleware._request_token_issued_at.reset(iat_token)
-        assert identity.roles == ["admin"]
+        assert identity.system_roles == ["admin"]
 
 
 async def test_fetch_fresh_identity_rejects_deactivated_account(admin_pool: Pool) -> None:
@@ -470,7 +470,7 @@ async def test_fetch_fresh_identity_rejects_deactivated_account(admin_pool: Pool
         assert row is not None
         tenant_id = row[0]
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles, is_active) VALUES (%s, %s, %s, %s, false)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles, is_active) VALUES (%s, %s, %s, %s, false)",
             (tenant_id, "deactivated@acme.com", hash_password("whatever"), ["admin"]),
         )
 
@@ -488,12 +488,12 @@ async def test_fetch_fresh_identity_accepts_active_account(admin_pool: Pool) -> 
         assert row is not None
         tenant_id = row[0]
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s)",
             (tenant_id, "active@acme.com", hash_password("whatever"), ["admin"]),
         )
 
         identity = await fetch_fresh_identity(conn, "active@acme.com")
-        assert identity.roles == ["admin"]
+        assert identity.system_roles == ["admin"]
 
 
 async def test_change_own_password_rejects_deactivated_account(
@@ -510,11 +510,11 @@ async def test_change_own_password_rejects_deactivated_account(
         assert row is not None
         tenant_id = row[0]
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles, is_active) VALUES (%s, %s, %s, %s, false)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles, is_active) VALUES (%s, %s, %s, %s, false)",
             (tenant_id, "deact-pw@acme.com", hash_password("old-password-123"), ["admin"]),
         )
 
-    token = _set_session(tenant_id=tenant_id, user="deact-pw@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="deact-pw@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
@@ -529,11 +529,11 @@ async def test_change_own_password_rejects_deactivated_account(
 async def test_login_does_not_leak_reserved_role_name_from_legacy_section(
     admin_pool: Pool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """review `app#21` (phát hiện qua review độc lập) — `login()` mở rộng JWT roles của admin bằng
+    """review `app#21` (phát hiện qua review độc lập) — `login()` mở rộng JWT system_roles của admin bằng
     MỌI `core.sections` của tenant. Trước bản vá, 1 dòng `core.sections` CŨ (từ trước layer-1
     `validators.reject_reserved_section_name` tồn tại) tên `"superadmin"` sẽ lọt thẳng vào JWT
-    `roles` — không cấp quyền backend thật (mọi route nhạy cảm tra roles TƯƠI qua `fetch_fresh_
-    identity`), nhưng UI web định tuyến tầng THUẦN theo `session.roles` (JWT), nên admin đó bị đưa
+    `system_roles` — không cấp quyền backend thật (mọi route nhạy cảm tra system_roles TƯƠI qua `fetch_fresh_
+    identity`), nhưng UI web định tuyến tầng THUẦN theo `session.system_roles` (JWT), nên admin đó bị đưa
     nhầm vào Superadmin Console rồi mọi lời gọi 403. Seed thẳng section "superadmin" bằng SQL (bỏ
     qua validator, mô phỏng đúng ca dòng cũ) để PIN riêng `fetch_tenant_section_names`."""
     monkeypatch.setattr(jwt_auth, "get_settings", _settings)
@@ -543,7 +543,7 @@ async def test_login_does_not_leak_reserved_role_name_from_legacy_section(
         assert row is not None
         tenant_id = row[0]
         cur = await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s) RETURNING id",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s) RETURNING id",
             (tenant_id, "admin-legacy-sa@acme.com", hash_password("password-123"), ["admin"]),
         )
         admin_row = await cur.fetchone()
@@ -556,5 +556,5 @@ async def test_login_does_not_leak_reserved_role_name_from_legacy_section(
     async with _simulate_request_connection():
         response = await login(LoginRequest(email="admin-legacy-sa@acme.com", password="password-123"), _fake_request())
 
-    assert "superadmin" not in response.roles
-    assert set(response.roles) == {"admin"}
+    assert "superadmin" not in response.system_roles
+    assert set(response.system_roles) == {"admin"}
