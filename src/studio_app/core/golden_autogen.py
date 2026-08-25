@@ -21,7 +21,7 @@ UUID để lấp cho đủ là dựng một tham chiếu trỏ vào hư không. 
 
 ## Vì sao sinh trên CẢ TENANT rồi mới lọc theo phòng ban
 
-`build_cases` dựng case **bẫy** bằng cách **ghép chéo vai** (`_chon_nguon_bay`): hỏi dưới vai A
+`build_cases` dựng case **bẫy** bằng cách **ghép chéo vai** (`_pick_trap_source`): hỏi dưới vai A
 trong khi đáp án nằm ở vai B, kỳ vọng agent **từ chối**. Đưa nó chunk của đúng một phòng ban thì
 không còn gì để ghép chéo — đo được:
 

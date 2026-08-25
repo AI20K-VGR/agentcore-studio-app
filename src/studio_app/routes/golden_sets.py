@@ -29,7 +29,8 @@ from fastapi import APIRouter, HTTPException
 from psycopg import sql
 from pydantic import BaseModel, Field, ValidationError
 from studio_evalhub.golden_case import GoldenCase, GoldenSet
-from studio_evalhub.golden_store import GoldenSetScopeError, write_golden_set
+from studio_evalhub.golden_merge import GoldenSetMergeConflict, merge_golden_sets
+from studio_evalhub.golden_store import GoldenSetNotFound, GoldenSetScopeError, read_golden_set, write_golden_set
 
 from studio_app.authz import fetch_fresh_identity, require_admin
 from studio_app.middleware import get_request_connection, get_request_session
@@ -55,7 +56,14 @@ class UploadGoldenSetResponse(BaseModel):
     golden_set_ref: str
     tenant_id: str
     n_case: int
-    n_bay: int
+    """Tổng case của bộ SAU khi hợp nhất — không phải số case vừa nạp lên."""
+    n_traps: int
+    n_uploaded: int
+    """Số case trong payload vừa gửi. Tách khỏi `n_case` để giao diện nói được *"nạp 12, bộ giờ có
+    31"* thay vì một con số mà người dùng không biết đối chiếu với cái gì."""
+    n_kept_from_existing: int
+    """Case của bộ cũ còn sống sót qua lần hợp nhất này (case cũ không trùng khoá với case vừa nạp).
+    Khai ra vì đây đúng là câu người dùng lo khi bấm nạp đè: *"bộ máy sinh của tôi có mất không?"*"""
     """Số case bẫy — suy từ `expects_refusal` (hai trục tenant/vai), KHÔNG từ một cờ trong payload.
 
     Trả về để người nạp thấy ngay bộ của họ có nhánh từ-chối hay không: một bộ 0 case bẫy chấm được
@@ -112,14 +120,43 @@ async def upload_golden_set(body: UploadGoldenSetRequest) -> UploadGoldenSetResp
         # scope về tenant đích trong đúng transaction này. `SET LOCAL` hết hiệu lực khi transaction
         # đóng, nên phần còn lại của request không thừa hưởng quyền này.
         await conn.execute(sql.SQL("SET LOCAL app.tenant_id = {}").format(sql.Literal(str(tenant_uuid))))
+
+        # HỢP NHẤT với bộ đang có, không ghi đè. Bản trước gọi thẳng `write_golden_set`, nên một
+        # người nạp bộ của mình trùng `golden_set_ref` sẽ **xoá sạch** bộ máy vừa sinh lúc upload
+        # tài liệu (`golden_autogen.regenerate_for_section`, app#61) — mất im lặng, không cảnh báo,
+        # và hai đường ghi vào cùng một `golden_set_ref` lại có hai luật khác nhau (đường sinh máy
+        # đã biết giữ `source="human"`, đường này thì không). `merge_golden_sets` là luật ĐÃ CÓ cho
+        # đúng việc này: khoá theo `(tenant, query chuẩn hoá, section_roles)` chứ không theo
+        # `case_id` — hai nguồn đặt id độc lập nhau nên khoá theo id là khoá theo thứ không so được.
+        #
+        # Bộ vừa nạp đứng TRƯỚC: người vừa gõ tay thắng bản máy sinh ở case trùng. Đó là toàn bộ lý
+        # do `source="human"` tồn tại.
         try:
-            await write_golden_set(conn, golden, tenant_uuid)
+            existing = await read_golden_set(conn, golden.golden_set_ref, tenant_uuid)
+        except GoldenSetNotFound:
+            merged = golden
+            n_kept = 0
+        else:
+            try:
+                merged = merge_golden_sets(golden, existing, golden_set_ref=golden.golden_set_ref)
+            except GoldenSetMergeConflict as exc:
+                # 409, không 500: hai bộ **cùng khoá mà khác đáp án kỳ vọng** là mâu thuẫn dữ liệu
+                # người dùng giải được (sửa case hoặc đổi ref), không phải hỏng hệ thống. Trả nguyên
+                # danh sách xung đột — `merge_golden_sets` liệt kê TẤT CẢ chứ không dừng ở cái đầu,
+                # nên người nạp sửa được một lượt thay vì bóc từng cái qua nhiều lần thử.
+                raise HTTPException(status_code=409, detail=f"bộ nạp lên xung đột với bộ đang có: {exc}") from exc
+            n_kept = len(merged.cases) - len(golden.cases)
+
+        try:
+            await write_golden_set(conn, merged, tenant_uuid)
         except GoldenSetScopeError as exc:  # pragma: no cover — chỉ tới được khi bind ở trên hỏng
             raise HTTPException(status_code=500, detail=f"golden set scope: {exc}") from exc
 
     return UploadGoldenSetResponse(
-        golden_set_ref=golden.golden_set_ref,
+        golden_set_ref=merged.golden_set_ref,
         tenant_id=str(tenant_uuid),
-        n_case=len(golden.cases),
-        n_bay=sum(1 for c in golden.cases if c.expects_refusal),
+        n_case=len(merged.cases),
+        n_traps=sum(1 for c in merged.cases if c.expects_refusal),
+        n_uploaded=len(golden.cases),
+        n_kept_from_existing=max(n_kept, 0),
     )

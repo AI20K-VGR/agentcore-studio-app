@@ -88,15 +88,15 @@ async def test_company_admin_nap_bo_roi_doc_lai_ra_dung(admin_pool: Pool) -> Non
     token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
-            ket_qua = await upload_golden_set(
+            result = await upload_golden_set(
                 UploadGoldenSetRequest(golden_set_ref="bo-cua-toi", cases=[_case("U-01"), _case("U-02", bay=True)])
             )
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
 
-    assert ket_qua.n_case == 2
-    assert ket_qua.n_bay == 1
-    assert ket_qua.tenant_id == str(tenant_id)
+    assert result.n_case == 2
+    assert result.n_traps == 1
+    assert result.tenant_id == str(tenant_id)
 
     pool = await get_pool()
     async with pool.connection() as conn, conn.transaction():
@@ -105,8 +105,8 @@ async def test_company_admin_nap_bo_roi_doc_lai_ra_dung(admin_pool: Pool) -> Non
     assert [c.case_id for c in doc_lai.cases] == ["U-01", "U-02"]
 
 
-async def test_n_bay_suy_tu_expects_refusal_khong_tu_payload(admin_pool: Pool) -> None:
-    """`n_bay` suy từ **hai trục tenant/vai**, không từ một cờ người nạp tự khai.
+async def test_n_traps_derived_from_expects_refusal_not_from_payload(admin_pool: Pool) -> None:
+    """`n_traps` suy từ **hai trục tenant/vai**, không từ một cờ người nạp tự khai.
 
     Case dưới đây khai `expected_citation` **không rỗng** (trông như case trả-lời-được) nhưng
     `expected_section_role` nằm **ngoài** `section_roles` — tức nó là bẫy T6 theo luật của
@@ -118,7 +118,7 @@ async def test_n_bay_suy_tu_expects_refusal_khong_tu_payload(admin_pool: Pool) -
     token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
-            ket_qua = await upload_golden_set(
+            result = await upload_golden_set(
                 UploadGoldenSetRequest(
                     golden_set_ref="bay-t6",
                     cases=[
@@ -133,7 +133,7 @@ async def test_n_bay_suy_tu_expects_refusal_khong_tu_payload(admin_pool: Pool) -
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
 
-    assert ket_qua.n_bay == 1, "case chéo-vai phải được đếm là bẫy dù expected_citation không rỗng"
+    assert result.n_traps == 1, "case chéo-vai phải được đếm là bẫy dù expected_citation không rỗng"
 
 
 async def test_route_KHONG_khai_ho_source(admin_pool: Pool) -> None:
@@ -265,13 +265,13 @@ async def test_superadmin_khai_tenant_thi_ghi_duoc_cho_tenant_do(admin_pool: Poo
     token = _set_session(tenant_id=sys_tenant, user="root@system.com", system_roles=["superadmin"])
     try:
         async with _simulate_request_connection():
-            ket_qua = await upload_golden_set(
+            result = await upload_golden_set(
                 UploadGoldenSetRequest(golden_set_ref="nap-ho", cases=[_case("U-01")], tenant_id=str(dich))
             )
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
 
-    assert ket_qua.tenant_id == str(dich)
+    assert result.tenant_id == str(dich)
 
     pool = await get_pool()
     async with pool.connection() as conn, conn.transaction():
