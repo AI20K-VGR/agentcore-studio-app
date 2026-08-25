@@ -92,9 +92,10 @@ async def test_company_admin_uploads_document(admin_pool: Pool) -> None:
 
     assert result.section_role == "hr"
     assert result.chunk_count == 1
-    # `doc_id` (cột `kb.chunks.doc_id`, tách khỏi PK `chunk_id`) = slug thuần của tên file, KHÔNG
-    # còn tenant-hex-prefixed — xem docstring `routes/documents.py` (quyết định doc_id column).
-    assert result.doc_id == "leave"
+    # `doc_id` (cột `kb.chunks.doc_id`, tách khỏi PK `chunk_id`) = `{slug(section_role)}-{slug(tên
+    # file)}`, KHÔNG còn tenant-hex-prefixed — xem docstring `routes/documents.py` (quyết định
+    # doc_id column, review app#58).
+    assert result.doc_id == "hr-leave"
 
     async with admin_pool.connection() as conn:
         # `kb.chunks` có `FORCE ROW LEVEL SECURITY` — cắn cả owner nếu chưa `set_config`
@@ -107,8 +108,9 @@ async def test_company_admin_uploads_document(admin_pool: Pool) -> None:
 
 
 async def test_upload_doc_id_la_slug_ten_file(admin_pool: Pool) -> None:
-    """`doc_id` = `_slugify(stem)` thuần — hoa/khoảng trắng trong tên file phải bị gộp/hạ chữ
-    (khớp quyết định doc_id column, khác `chunk_id_prefix` vẫn giữ hash để tránh đụng PK)."""
+    """`doc_id` = `{slug(section_role)}-{slug(stem)}` — hoa/khoảng trắng trong tên file phải bị
+    gộp/hạ chữ (khớp quyết định doc_id column, khác `chunk_id_prefix` vẫn giữ hash để tránh đụng
+    PK)."""
     tenant_id = await _seed_tenant(admin_pool, "documents-probe-m")
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
@@ -124,7 +126,46 @@ async def test_upload_doc_id_la_slug_ten_file(admin_pool: Pool) -> None:
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
 
-    assert result.doc_id == "bao-cao-q1"
+    assert result.doc_id == "hr-bao-cao-q1"
+
+
+async def test_reupload_ten_trung_khac_phong_ban_khong_xoa_nham(admin_pool: Pool) -> None:
+    """review app#58 (dholmes0207) — tái hiện đúng ca bug: 2 tài liệu KHÁC NHAU, cùng tên file,
+    khác `section_role`. Bản trước khi vá dùng `doc_id = slug(stem)` (không mang phòng ban), nên
+    upload file thứ hai xoá LUÔN tài liệu phòng ban đầu qua `delete_by_doc_id` (không lọc phòng
+    ban). `section_role` trong khoá `doc_id` là ranh giới phân quyền đọc thật
+    (`fetch_tenant_section_names`), khác hẳn một re-upload cùng tài liệu."""
+    tenant_id = await _seed_tenant(admin_pool, "documents-probe-o")
+    admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+    await _seed_section(admin_pool, tenant_id, "hr", admin_id)
+    await _seed_section(admin_pool, tenant_id, "finance", admin_id)
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    try:
+        async with _simulate_request_connection():
+            hr_result = await upload_document(
+                file=_md_upload_file("leave.md", b"## Nghi phep\nQuy dinh nghi phep phong nhan su."),
+                section_role="hr",
+                tenant_id=None,
+            )
+            finance_result = await upload_document(
+                file=_md_upload_file("leave.md", b"## Han muc\nQuy dinh han muc chi tieu phong tai chinh."),
+                section_role="finance",
+                tenant_id=None,
+            )
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert hr_result.doc_id != finance_result.doc_id
+
+    async with admin_pool.connection() as conn:
+        await conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(tenant_id),))
+        cur = await conn.execute(
+            "SELECT section_role, count(*) FROM kb.chunks WHERE tenant_id = %s GROUP BY section_role",
+            (str(tenant_id),),
+        )
+        rows = await cur.fetchall()
+    assert dict(rows) == {"hr": 1, "finance": 1}, "cả hai tài liệu phải còn sống — không cái nào bị xoá nhầm"
 
 
 async def test_reupload_cung_doc_id_xoa_orphan_chunk(admin_pool: Pool) -> None:
