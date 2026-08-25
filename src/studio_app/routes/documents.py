@@ -23,13 +23,30 @@ Cơ chế fence nội dung THẬT (`routes/chat.py` → `interpreter.run()` → 
 route này validate `section_role` qua `fetch_tenant_section_names` — đúng hàm `routes/chat.py`
 dùng cho `as_roles` — thay vì 1 vocab cố định.
 
-**Giới hạn đã biết:** chưa kiểm tra được `doc_id` đã tồn tại trước khi ghi. Re-upload cùng tên
-file + phòng ban sẽ `ON CONFLICT DO UPDATE` (`postgres.py::_UPSERT`) các `chunk_id` trùng, nhưng
-nếu bản mới có ÍT chunk hơn bản cũ, các `chunk_id` dư sẽ mồ côi lại trong DB (không bị xoá).
+**`doc_id` (cột `kb.chunks.doc_id`, tách khỏi vai trò PK của `chunk_id`) = `{slug(section_role)}-
+{slug(stem)}`** — vd `("hr", "Bao Cao Q1.docx")` → `"hr-bao-cao-q1"`. Route xoá TOÀN BỘ chunk cũ
+cùng `doc_id` (`KbPipeline.delete_by_doc_id`) TRƯỚC khi ghi chunk mới, nên re-upload không còn để
+lại `chunk_id` mồ côi (đóng giới hạn cũ từng ghi ở đây — bản có ÍT chunk hơn bản trước không còn
+sót dòng thừa).
+
+`section_role` BẮT BUỘC nằm trong khoá — review app#58 (dholmes0207): bản trước chỉ dùng
+`slug(stem)`, nên 2 tài liệu CÙNG TÊN FILE ở 2 phòng ban khác nhau (khác `section_role`, tức khác
+ranh giới phân quyền đọc — `fetch_tenant_section_names`/`as_roles` ở `routes/chat.py`) đụng cùng
+`doc_id`, và lệnh xoá orphan (không lọc theo phòng ban) xoá LUÔN tài liệu phòng ban kia. Tái hiện
+được: upload `leave.md` vào `hr` rồi `finance` xoá mất bản `hr` — không lỗi, không cảnh báo.
+
+**Rủi ro đã biết, chấp nhận CÓ CHỦ ĐÍCH (không chặn):** 2 file GỐC khác nhau, CÙNG `section_role`,
+có thể slugify tên ra CÙNG `doc_id` (vd `"Doc 123.md"` và `"doc-123.md"` đều ra `"doc-123"`) — route
+không phân biệt được với một re-upload hợp lệ, nên file sau **ghi đè êm** file trước (không có
+UNIQUE constraint, không 409). Không dựng bảng đăng ký tên gốc để chặn cứng — `kb.chunks` là
+1-dòng-1-chunk nên nhiều dòng của cùng 1 doc BẮT BUỘC chia sẻ 1 `doc_id`; UNIQUE(tenant_id, doc_id)
+trực tiếp trên bảng này là sai kỹ thuật, và một bảng đăng ký riêng nằm ngoài phạm vi yêu cầu hiện
+tại. Khác ca chéo phòng ban ở trên: đây LÀ cùng một ranh giới phân quyền, nên đánh đổi hợp lý.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import re
 from pathlib import Path
@@ -166,24 +183,44 @@ async def upload_document(
             detail=f"tài liệu quá dài: {word_count} từ, tối đa {_MAX_WORDS}",
         )
 
-    # Tiền tố `tenant_uuid.hex` bắt buộc: `chunk_id` (`{doc_id}#c{n}`) là PRIMARY KEY toàn bảng
-    # `kb.chunks`, KHÔNG tenant-scoped — 2 tenant cùng `doc_id` sẽ `ON CONFLICT DO UPDATE` đè lẫn
-    # nhau (`postgres.py::_UPSERT`). Không dùng tên hiển thị công ty (có thể trùng giữa 2 tenant).
+    # `chunk_id_prefix` — tiền tố `tenant_uuid.hex` bắt buộc: `chunk_id` (`{chunk_id_prefix}#c{n}`)
+    # là PRIMARY KEY toàn bảng `kb.chunks`, KHÔNG tenant-scoped — 2 tenant cùng tên file sẽ
+    # `ON CONFLICT DO UPDATE` đè lẫn nhau (`postgres.py::_UPSERT`) nếu thiếu tiền tố này. Không
+    # dùng tên hiển thị công ty (có thể trùng giữa 2 tenant).
     # Hậu tố hash 8-hex của TÊN FILE GỐC (trước `_slugify`) — review app#27 (dholmes0207): 2 tên
     # file khác nhau (vd "HR-Policy.md" / "hr policy.md", hay tên tiếng Việt có dấu bị `_slugify`
-    # gộp hết thành "-") có thể slugify ra CÙNG chuỗi, khiến tài liệu sau ghi đè im lặng tài liệu
-    # trước qua `ON CONFLICT DO UPDATE` dù là 2 tài liệu khác nhau. Hash bám theo tên gốc nên cùng
-    # 1 file re-upload nguyên tên vẫn ra đúng `doc_id` cũ (idempotent), chỉ tên khác mới tách riêng.
+    # gộp hết thành "-") có thể slugify ra CÙNG chuỗi — hash giữ `chunk_id_prefix` (PK) tách biệt
+    # cho 2 upload khác nhau dù trùng slug. Hash bám theo tên gốc nên cùng 1 file re-upload nguyên
+    # tên vẫn ra đúng `chunk_id_prefix` cũ (idempotent), chỉ tên khác mới tách riêng.
+    #
+    # `doc_id` (cột riêng, KHÔNG phải PK) = `{slug(section_role)}-{slug(stem)}` — khoá con người
+    # dùng để xoá theo tài liệu (`KbPipeline.delete_by_doc_id`). PHẢI mang `section_role` — review
+    # app#58 (dholmes0207): thiếu nó, lệnh xoá orphan (chỉ lọc `tenant_id`+`doc_id`, KHÔNG lọc
+    # phòng ban) xoá NHẦM tài liệu cùng tên ở phòng ban khác (2 tài liệu khác nhau, khác ranh giới
+    # phân quyền đọc, chỉ vì trùng tên file). Cố ý KHÔNG mang hash/tenant-hex: 2 file gốc khác
+    # nhau, CÙNG phòng ban, trùng slug sẽ chia sẻ `doc_id` và ghi đè lẫn nhau (đã chấp nhận, xem
+    # docstring đầu file — đây LÀ cùng ranh giới phân quyền nên đánh đổi hợp lý) — đổi lại, đây là
+    # giá trị caller có thể tự tính lại được (biết cả tên file lẫn phòng ban mình vừa upload vào)
+    # để gọi xoá sau này, không cần tra lại `chunk_id_prefix` đã hash.
     stem = Path(file.filename).stem
     name_hash = hashlib.sha256(file.filename.encode("utf-8")).hexdigest()[:8]
-    doc_id = f"{tenant_uuid.hex}-{_slugify(section_role)}-{_slugify(stem)}-{name_hash}"
+    chunk_id_prefix = f"{tenant_uuid.hex}-{_slugify(section_role)}-{_slugify(stem)}-{name_hash}"
+    doc_id = f"{_slugify(section_role)}-{_slugify(stem)}"
 
-    chunks = cut_window(text, doc_id, tenant_uuid, section_role)
+    chunks = cut_window(text, chunk_id_prefix, tenant_uuid, section_role)
     if not chunks:
         raise HTTPException(status_code=422, detail="tài liệu rỗng — không có chữ nào để cắt chunk")
+    chunks = [dataclasses.replace(c, doc_id=doc_id) for c in chunks]
 
     pipeline = KbPipeline(await get_pool(), build_embedding())
     embeddings = await pipeline.embed_invoke(chunks)
+    # Xoá chunk cũ của CÙNG `doc_id` trước khi ghi chunk mới — đóng giới hạn orphan-chunk cũ (xem
+    # docstring đầu file): re-upload bản NGẮN HƠN không còn sót `chunk_id` mồ côi. Đặt SAU
+    # `embed_invoke` (không chạm DB) để lỗi embedding không xoá mất dữ liệu cũ trước khi có dữ liệu
+    # mới sẵn sàng ghi — nhưng KHÔNG atomic với `index` bên dưới (2 giao dịch riêng, đúng seam
+    # 5-method của `KbPipeline`): xoá thành công rồi `index` lỗi giữa chừng vẫn có thể để tenant
+    # tạm thời mất doc này, biết và chấp nhận cho phạm vi hiện tại.
+    await pipeline.delete_by_doc_id(tenant_uuid, doc_id)
     await pipeline.index(chunks, embeddings)
 
     return UploadDocumentResponse(doc_id=doc_id, section_role=section_role, chunk_count=len(chunks))
