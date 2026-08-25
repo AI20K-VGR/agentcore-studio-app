@@ -31,8 +31,8 @@ async def _close_singleton_pools_after_test() -> AsyncIterator[None]:
     await close_pools()
 
 
-def _set_session(*, tenant_id: UUID, user: str, roles: list[str]) -> object:
-    session = ResolvedContext(tenant_id=tenant_id, user=user, roles=roles)
+def _set_session(*, tenant_id: UUID, user: str, system_roles: list[str]) -> object:
+    session = ResolvedContext(tenant_id=tenant_id, user=user, system_roles=system_roles)
     return middleware._request_session.set(session)
 
 
@@ -55,11 +55,12 @@ async def _seed_tenant(admin_pool: Pool, name: str) -> UUID:
     return UUID(str(row[0]))
 
 
-async def _seed_user(admin_pool: Pool, tenant_id: UUID, email: str, roles: list[str]) -> UUID:
+async def _seed_user(admin_pool: Pool, tenant_id: UUID, email: str, system_roles: list[str]) -> UUID:
     async with admin_pool.connection() as conn:
         cur = await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s) RETURNING id",
-            (str(tenant_id), email, "not-a-real-hash", roles),
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) "
+            "VALUES (%s, %s, %s, %s) RETURNING id",
+            (str(tenant_id), email, "not-a-real-hash", system_roles),
         )
         row = await cur.fetchone()
     assert row is not None
@@ -70,7 +71,7 @@ async def test_only_superadmin_can_create_section(admin_pool: Pool) -> None:
     tenant_id = await _seed_tenant(admin_pool, "sections-probe-a")
     await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
@@ -84,7 +85,7 @@ async def test_superadmin_creates_section(admin_pool: Pool) -> None:
     tenant_id = await _seed_tenant(admin_pool, "sections-probe-b")
     await _seed_user(admin_pool, tenant_id, "su@sys", ["superadmin"])
 
-    token = _set_session(tenant_id=tenant_id, user="su@sys", roles=["superadmin"])
+    token = _set_session(tenant_id=tenant_id, user="su@sys", system_roles=["superadmin"])
     try:
         async with _simulate_request_connection():
             result = await create_section(CreateSectionRequest(tenant_id=str(tenant_id), name="finance"))
@@ -115,7 +116,7 @@ async def test_create_section_rejects_unknown_tenant(admin_pool: Pool) -> None:
     tenant_id = await _seed_tenant(admin_pool, "sections-probe-c")
     await _seed_user(admin_pool, tenant_id, "su@sys", ["superadmin"])
 
-    token = _set_session(tenant_id=tenant_id, user="su@sys", roles=["superadmin"])
+    token = _set_session(tenant_id=tenant_id, user="su@sys", system_roles=["superadmin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
@@ -129,7 +130,7 @@ async def test_create_section_rejects_duplicate_name_same_tenant(admin_pool: Poo
     tenant_id = await _seed_tenant(admin_pool, "sections-probe-d")
     await _seed_user(admin_pool, tenant_id, "su@sys", ["superadmin"])
 
-    token = _set_session(tenant_id=tenant_id, user="su@sys", roles=["superadmin"])
+    token = _set_session(tenant_id=tenant_id, user="su@sys", system_roles=["superadmin"])
     try:
         async with _simulate_request_connection():
             await create_section(CreateSectionRequest(tenant_id=str(tenant_id), name="hr"))
@@ -148,7 +149,7 @@ async def test_two_tenants_can_share_section_name(admin_pool: Pool) -> None:
     tenant_b = await _seed_tenant(admin_pool, "sections-probe-e-b")
     await _seed_user(admin_pool, tenant_a, "su@sys", ["superadmin"])
 
-    token = _set_session(tenant_id=tenant_a, user="su@sys", roles=["superadmin"])
+    token = _set_session(tenant_id=tenant_a, user="su@sys", system_roles=["superadmin"])
     try:
         async with _simulate_request_connection():
             await create_section(CreateSectionRequest(tenant_id=str(tenant_a), name="hr"))
@@ -171,7 +172,7 @@ async def test_company_admin_cannot_see_other_tenant_sections(admin_pool: Pool) 
             (str(tenant_b), "hr", str(admin_a_id)),
         )
 
-    token = _set_session(tenant_id=tenant_a, user="admin-a@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_a, user="admin-a@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
@@ -190,7 +191,7 @@ async def test_company_admin_lists_own_tenant_sections(admin_pool: Pool) -> None
             (str(tenant_id), "engineering", str(admin_id)),
         )
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
             result = await list_sections(tenant_id=None)
@@ -213,7 +214,7 @@ async def test_rename_section_cascades_to_user_roles(admin_pool: Pool) -> None:
     assert row is not None
     section_id = row[0]
 
-    token = _set_session(tenant_id=tenant_id, user="su@sys", roles=["superadmin"])
+    token = _set_session(tenant_id=tenant_id, user="su@sys", system_roles=["superadmin"])
     try:
         async with _simulate_request_connection():
             result = await rename_section(str(section_id), RenameSectionRequest(name="people"))
@@ -222,7 +223,7 @@ async def test_rename_section_cascades_to_user_roles(admin_pool: Pool) -> None:
 
     assert result.name == "people"
     async with admin_pool.connection() as conn:
-        cur = await conn.execute("SELECT roles FROM core.users WHERE email = %s", ("hr-user@acme.com",))
+        cur = await conn.execute("SELECT system_roles FROM core.users WHERE email = %s", ("hr-user@acme.com",))
         row = await cur.fetchone()
     assert row is not None
     assert list(row[0]) == ["people"], "role cũ 'hr' phải được thay bằng 'people' sau rename"
@@ -241,7 +242,7 @@ async def test_delete_section_blocked_when_user_still_assigned(admin_pool: Pool)
     assert row is not None
     section_id = row[0]
 
-    token = _set_session(tenant_id=tenant_id, user="su@sys", roles=["superadmin"])
+    token = _set_session(tenant_id=tenant_id, user="su@sys", system_roles=["superadmin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
@@ -269,7 +270,7 @@ async def test_delete_section_succeeds_when_unused(admin_pool: Pool) -> None:
     assert row is not None
     section_id = row[0]
 
-    token = _set_session(tenant_id=tenant_id, user="su@sys", roles=["superadmin"])
+    token = _set_session(tenant_id=tenant_id, user="su@sys", system_roles=["superadmin"])
     try:
         async with _simulate_request_connection():
             await delete_section(str(section_id))

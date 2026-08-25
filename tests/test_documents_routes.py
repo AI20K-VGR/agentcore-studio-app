@@ -24,8 +24,8 @@ async def _close_singleton_pools_after_test() -> AsyncIterator[None]:
     await close_pools()
 
 
-def _set_session(*, tenant_id: UUID, user: str, roles: list[str]) -> object:
-    session = ResolvedContext(tenant_id=tenant_id, user=user, roles=roles)
+def _set_session(*, tenant_id: UUID, user: str, system_roles: list[str]) -> object:
+    session = ResolvedContext(tenant_id=tenant_id, user=user, system_roles=system_roles)
     return middleware._request_session.set(session)
 
 
@@ -48,11 +48,12 @@ async def _seed_tenant(admin_pool: Pool, name: str) -> UUID:
     return UUID(str(row[0]))
 
 
-async def _seed_user(admin_pool: Pool, tenant_id: UUID, email: str, roles: list[str]) -> UUID:
+async def _seed_user(admin_pool: Pool, tenant_id: UUID, email: str, system_roles: list[str]) -> UUID:
     async with admin_pool.connection() as conn:
         cur = await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s) RETURNING id",
-            (str(tenant_id), email, "not-a-real-hash", roles),
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) "
+            "VALUES (%s, %s, %s, %s) RETURNING id",
+            (str(tenant_id), email, "not-a-real-hash", system_roles),
         )
         row = await cur.fetchone()
     assert row is not None
@@ -79,7 +80,7 @@ async def test_company_admin_uploads_document(admin_pool: Pool) -> None:
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
             result = await upload_document(
@@ -92,7 +93,10 @@ async def test_company_admin_uploads_document(admin_pool: Pool) -> None:
 
     assert result.section_role == "hr"
     assert result.chunk_count == 1
-    assert result.doc_id.startswith(tenant_id.hex)
+    # `doc_id` (cột `kb.chunks.doc_id`, tách khỏi PK `chunk_id`) = `{slug(section_role)}-{slug(tên
+    # file)}`, KHÔNG còn tenant-hex-prefixed — xem docstring `routes/documents.py` (quyết định
+    # doc_id column, review app#58).
+    assert result.doc_id == "hr-leave"
 
     async with admin_pool.connection() as conn:
         # `kb.chunks` có `FORCE ROW LEVEL SECURITY` — cắn cả owner nếu chưa `set_config`
@@ -104,11 +108,116 @@ async def test_company_admin_uploads_document(admin_pool: Pool) -> None:
     assert row[0] == 1
 
 
+async def test_upload_doc_id_la_slug_ten_file(admin_pool: Pool) -> None:
+    """`doc_id` = `{slug(section_role)}-{slug(stem)}` — hoa/khoảng trắng trong tên file phải bị
+    gộp/hạ chữ (khớp quyết định doc_id column, khác `chunk_id_prefix` vẫn giữ hash để tránh đụng
+    PK)."""
+    tenant_id = await _seed_tenant(admin_pool, "documents-probe-m")
+    admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+    await _seed_section(admin_pool, tenant_id, "hr", admin_id)
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
+    try:
+        async with _simulate_request_connection():
+            result = await upload_document(
+                file=_md_upload_file("Bao Cao Q1.md", _VALID_MD),
+                section_role="hr",
+                tenant_id=None,
+            )
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert result.doc_id == "hr-bao-cao-q1"
+
+
+async def test_reupload_ten_trung_khac_phong_ban_khong_xoa_nham(admin_pool: Pool) -> None:
+    """review app#58 (dholmes0207) — tái hiện đúng ca bug: 2 tài liệu KHÁC NHAU, cùng tên file,
+    khác `section_role`. Bản trước khi vá dùng `doc_id = slug(stem)` (không mang phòng ban), nên
+    upload file thứ hai xoá LUÔN tài liệu phòng ban đầu qua `delete_by_doc_id` (không lọc phòng
+    ban). `section_role` trong khoá `doc_id` là ranh giới phân quyền đọc thật
+    (`fetch_tenant_section_names`), khác hẳn một re-upload cùng tài liệu."""
+    tenant_id = await _seed_tenant(admin_pool, "documents-probe-o")
+    admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+    await _seed_section(admin_pool, tenant_id, "hr", admin_id)
+    await _seed_section(admin_pool, tenant_id, "finance", admin_id)
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
+    try:
+        async with _simulate_request_connection():
+            hr_result = await upload_document(
+                file=_md_upload_file("leave.md", b"## Nghi phep\nQuy dinh nghi phep phong nhan su."),
+                section_role="hr",
+                tenant_id=None,
+            )
+            finance_result = await upload_document(
+                file=_md_upload_file("leave.md", b"## Han muc\nQuy dinh han muc chi tieu phong tai chinh."),
+                section_role="finance",
+                tenant_id=None,
+            )
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert hr_result.doc_id != finance_result.doc_id
+
+    async with admin_pool.connection() as conn:
+        await conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(tenant_id),))
+        cur = await conn.execute(
+            "SELECT section_role, count(*) FROM kb.chunks WHERE tenant_id = %s GROUP BY section_role",
+            (str(tenant_id),),
+        )
+        rows = await cur.fetchall()
+    assert dict(rows) == {"hr": 1, "finance": 1}, "cả hai tài liệu phải còn sống — không cái nào bị xoá nhầm"
+
+
+async def test_reupload_cung_doc_id_xoa_orphan_chunk(admin_pool: Pool) -> None:
+    """Re-upload CÙNG tên file với nội dung NGẮN HƠN (ít chunk hơn) không còn để lại `chunk_id`
+    mồ côi — đóng giới hạn cũ đã ghi trong docstring `routes/documents.py` (route giờ gọi
+    `pipeline.delete_by_doc_id` trước khi ghi chunk mới)."""
+    tenant_id = await _seed_tenant(admin_pool, "documents-probe-n")
+    admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+    await _seed_section(admin_pool, tenant_id, "hr", admin_id)
+
+    # 1000 từ > WORDS_PER_CHUNK (850) → 2 chunk ở lần upload đầu.
+    long_text = " ".join(f"tu{i}" for i in range(1000)).encode()
+    short_text = b"noi dung rat ngan sau khi sua lai file."
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
+    try:
+        async with _simulate_request_connection():
+            first = await upload_document(
+                file=_md_upload_file("bao-cao.txt", long_text),
+                section_role="hr",
+                tenant_id=None,
+            )
+            assert first.chunk_count == 2
+
+            second = await upload_document(
+                file=_md_upload_file("bao-cao.txt", short_text),
+                section_role="hr",
+                tenant_id=None,
+            )
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert second.chunk_count == 1
+    assert second.doc_id == first.doc_id
+
+    async with admin_pool.connection() as conn:
+        await conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(tenant_id),))
+        cur = await conn.execute(
+            "SELECT count(*) FROM kb.chunks WHERE tenant_id = %s AND doc_id = %s",
+            (str(tenant_id), second.doc_id),
+        )
+        row = await cur.fetchone()
+    assert row is not None
+    assert row[0] == 1  # không còn 1 chunk mồ côi từ lần upload trước (2 - 1 = 1 dư nếu chưa vá)
+
+
 async def test_upload_rejects_unknown_section_role(admin_pool: Pool) -> None:
     tenant_id = await _seed_tenant(admin_pool, "documents-probe-b")
     await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
@@ -129,7 +238,7 @@ async def test_upload_rejects_unsupported_extension(admin_pool: Pool) -> None:
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
@@ -150,7 +259,7 @@ async def test_upload_accepts_txt_file(admin_pool: Pool) -> None:
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
             result = await upload_document(
@@ -172,7 +281,7 @@ async def test_upload_accepts_md_without_heading(admin_pool: Pool) -> None:
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
             result = await upload_document(
@@ -203,7 +312,7 @@ async def test_upload_accepts_docx_file(admin_pool: Pool) -> None:
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
             result = await upload_document(
@@ -230,7 +339,7 @@ async def test_company_admin_cannot_upload_for_other_tenant(admin_pool: Pool) ->
     admin_a_id = await _seed_user(admin_pool, tenant_a, "admin-a@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_a, "hr", admin_a_id)
 
-    token = _set_session(tenant_id=tenant_a, user="admin-a@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_a, user="admin-a@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
@@ -248,7 +357,7 @@ async def test_superadmin_must_declare_tenant_id(admin_pool: Pool) -> None:
     tenant_id = await _seed_tenant(admin_pool, "documents-probe-f")
     await _seed_user(admin_pool, tenant_id, "su@sys", ["superadmin"])
 
-    token = _set_session(tenant_id=tenant_id, user="su@sys", roles=["superadmin"])
+    token = _set_session(tenant_id=tenant_id, user="su@sys", system_roles=["superadmin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
@@ -266,7 +375,7 @@ async def test_upload_rejects_unknown_tenant_for_superadmin(admin_pool: Pool) ->
     tenant_id = await _seed_tenant(admin_pool, "documents-probe-g")
     await _seed_user(admin_pool, tenant_id, "su@sys", ["superadmin"])
 
-    token = _set_session(tenant_id=tenant_id, user="su@sys", roles=["superadmin"])
+    token = _set_session(tenant_id=tenant_id, user="su@sys", system_roles=["superadmin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
@@ -296,7 +405,7 @@ async def test_upload_rejects_document_over_word_cap(admin_pool: Pool, monkeypat
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():
@@ -318,7 +427,7 @@ async def test_upload_accepts_document_dung_bang_word_cap(admin_pool: Pool, monk
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         async with _simulate_request_connection():
             result = await upload_document(
@@ -355,7 +464,7 @@ async def test_upload_rejects_corrupt_docx_bang_422_khong_phai_500(admin_pool: P
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
 
-    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", roles=["admin"])
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
     try:
         with pytest.raises(HTTPException) as exc_info:
             async with _simulate_request_connection():

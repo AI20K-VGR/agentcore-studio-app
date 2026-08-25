@@ -87,7 +87,7 @@ def _body(**overrides: object) -> _TestChatRequest:
 
 
 def _session() -> ResolvedContext:
-    return ResolvedContext(tenant_id=TENANT_ID, user="admin@ankor.vn", roles=["admin"])
+    return ResolvedContext(tenant_id=TENANT_ID, user="admin@ankor.vn", system_roles=["admin"])
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +194,7 @@ async def _seed_tenant(admin_pool: Pool, name: str) -> UUID:
 async def _seed_employee_user(admin_pool: Pool, tenant_id: UUID, email: str) -> None:
     async with admin_pool.connection() as conn:
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s)",
             (str(tenant_id), email, "not-a-real-hash", ["public"]),
         )
 
@@ -211,7 +211,7 @@ async def _simulate_request_connection() -> AsyncIterator[None]:
 
 
 def _set_session(tenant_id: UUID, user: str, roles: list[str]) -> Token[ResolvedContext | None]:
-    session = ResolvedContext(tenant_id=tenant_id, user=user, roles=roles)
+    session = ResolvedContext(tenant_id=tenant_id, user=user, system_roles=roles)
     return middleware._request_session.set(session)
 
 

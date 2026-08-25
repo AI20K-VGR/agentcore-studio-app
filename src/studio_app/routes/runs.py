@@ -41,7 +41,7 @@ async def get_run(run_id: str) -> RunResponse:
     session = get_request_session()
 
     identity = await fetch_fresh_identity(get_request_connection(), session.user)
-    require_admin(identity.roles)
+    require_admin(identity.system_roles)
 
     pool = await get_pool()
     events = await PgTraceReader(pool).read_run(run_id, session.tenant_id)

@@ -146,6 +146,6 @@ async def test_chat(agent_id: str, body: TestChatRequest) -> TestChatResponse:
 
     # Cùng gate role-gap các route admin khác (`routes/publish.py::evaluate_agent`/`publish_agent`).
     identity = await fetch_fresh_identity(get_request_connection(), session.user)
-    require_admin(identity.roles)
+    require_admin(identity.system_roles)
 
     return await _run_test_chat(agent_id, body, session)

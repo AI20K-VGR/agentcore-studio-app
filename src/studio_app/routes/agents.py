@@ -63,7 +63,7 @@ async def list_agent_versions(agent_id: str) -> list[VersionSummary]:
     session = get_request_session()
     conn = get_request_connection()
     identity = await fetch_fresh_identity(conn, session.user)
-    require_admin(identity.roles)
+    require_admin(identity.system_roles)
 
     cur = await conn.execute(
         """
@@ -102,7 +102,7 @@ async def get_agent_recipe(agent_id: str, version: int | None = None) -> AgentRe
     session = get_request_session()
     conn = get_request_connection()
     identity = await fetch_fresh_identity(conn, session.user)
-    require_admin(identity.roles)
+    require_admin(identity.system_roles)
 
     if version is None:
         cur = await conn.execute(
@@ -182,7 +182,7 @@ async def rollback_agent(agent_id: str, body: RollbackRequest) -> RollbackRespon
     session = get_request_session()
     conn = get_request_connection()
     identity = await fetch_fresh_identity(conn, session.user)
-    require_admin(identity.roles)
+    require_admin(identity.system_roles)
 
     # `session.tenant_id` (JWT), KHÔNG phải `identity.tenant_id` (tươi) — khớp đúng convention đã
     # có ở `routes/chat.py`/`routes/runs.py` (cả 2 dùng `session.tenant_id` cho mọi thao tác đọc/ghi

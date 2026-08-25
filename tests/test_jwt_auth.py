@@ -31,16 +31,16 @@ def _settings(*, secret: str = "test-secret-at-least-32-bytes-long", expire_minu
 
 def test_issue_then_verify_roundtrips_identity(monkeypatch: pytest.MonkeyPatch) -> None:
     """KHÓA: token ký ra bởi `issue_token()` phải verify được lại đúng CẢ 3 trường
-    (tenant_id/user/roles), không rơi rớt field nào qua vòng ký -> verify."""
+    (tenant_id/user/system_roles), không rơi rớt field nào qua vòng ký -> verify."""
     monkeypatch.setattr(jwt_auth, "get_settings", _settings)
-    session = ResolvedContext(tenant_id=_TENANT_ID, user="dozyboy@ankor.vn", roles=["public", "hr"])
+    session = ResolvedContext(tenant_id=_TENANT_ID, user="dozyboy@ankor.vn", system_roles=["public", "hr"])
 
     token = jwt_auth.issue_token(session)
     resolved = jwt_auth.verify_token(token)
 
     assert resolved.tenant_id == _TENANT_ID
     assert resolved.user == "dozyboy@ankor.vn"
-    assert resolved.roles == ["public", "hr"]
+    assert resolved.system_roles == ["public", "hr"]
 
 
 def test_verify_rejects_wrong_secret(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -48,7 +48,7 @@ def test_verify_rejects_wrong_secret(monkeypatch: pytest.MonkeyPatch) -> None:
     là bằng chứng "không ai giả mạo được token nếu không có `jwt_secret`" — nếu test này xanh mà
     lẽ ra phải đỏ, việc ký/verify không có tác dụng bảo vệ gì cả."""
     monkeypatch.setattr(jwt_auth, "get_settings", lambda: _settings(secret="secret-A-at-least-32-bytes-long!!"))
-    session = ResolvedContext(tenant_id=_TENANT_ID, user="attacker", roles=[])
+    session = ResolvedContext(tenant_id=_TENANT_ID, user="attacker", system_roles=[])
     token = jwt_auth.issue_token(session)
 
     monkeypatch.setattr(jwt_auth, "get_settings", lambda: _settings(secret="secret-B-at-least-32-bytes-long!!"))
@@ -63,7 +63,7 @@ def test_verify_rejects_expired_token(monkeypatch: pytest.MonkeyPatch) -> None:
     expired_claims = {
         "tenant_id": str(_TENANT_ID),
         "user": "dozyboy@ankor.vn",
-        "roles": [],
+        "system_roles": [],
         "iat": now - timedelta(minutes=10),
         "exp": now - timedelta(minutes=1),  # hết hạn 1 phút trước
     }
@@ -80,7 +80,7 @@ def test_verify_rejects_missing_tenant_id_claim(monkeypatch: pytest.MonkeyPatch)
     settings = _settings()
     now = datetime.now(UTC)
     token = pyjwt.encode(
-        {"user": "dozyboy@ankor.vn", "roles": [], "iat": now, "exp": now + timedelta(hours=1)},
+        {"user": "dozyboy@ankor.vn", "system_roles": [], "iat": now, "exp": now + timedelta(hours=1)},
         settings.jwt_secret,
         algorithm="HS256",
     )
@@ -157,8 +157,8 @@ def test_two_tenants_get_non_interchangeable_tokens(monkeypatch: pytest.MonkeyPa
     `issue_token` lờ đi `session` truyền vào mà ký hằng số."""
     monkeypatch.setattr(jwt_auth, "get_settings", _settings)
     other_tenant = uuid4()
-    token_a = jwt_auth.issue_token(ResolvedContext(tenant_id=_TENANT_ID, user="a", roles=[]))
-    token_b = jwt_auth.issue_token(ResolvedContext(tenant_id=other_tenant, user="b", roles=[]))
+    token_a = jwt_auth.issue_token(ResolvedContext(tenant_id=_TENANT_ID, user="a", system_roles=[]))
+    token_b = jwt_auth.issue_token(ResolvedContext(tenant_id=other_tenant, user="b", system_roles=[]))
 
     assert jwt_auth.verify_token(token_a).tenant_id == _TENANT_ID
     assert jwt_auth.verify_token(token_b).tenant_id == other_tenant

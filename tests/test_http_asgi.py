@@ -82,7 +82,7 @@ async def test_unauthenticated_users_route_returns_401(client: AsyncClient, admi
     del admin_pool
     res = await client.post(
         "/api/admin/users",
-        json={"email": "x@x.com", "password": "password123", "roles": ["public"]},
+        json={"email": "x@x.com", "password": "password123", "system_roles": ["public"]},
     )
     assert res.status_code == 401
 
@@ -274,14 +274,14 @@ async def test_login_end_to_end_through_real_http(client: AsyncClient, admin_poo
     """Đường thật, đầu-cuối qua HTTP: seed 1 dòng `core.users`, `POST /api/auth/login` bằng
     `httpx`, verify token trả về xài được để gọi tiếp 1 route cần auth (`/api/admin/companies`,
     kỳ vọng 403 vì role không phải superadmin — chứng minh token THẬT được middleware chấp nhận
-    và giải mã đúng roles, không phải 401 vì thiếu/sai token)."""
+    và giải mã đúng system_roles, không phải 401 vì thiếu/sai token)."""
     async with admin_pool.connection() as conn:
         cur = await conn.execute("INSERT INTO core.tenants (name) VALUES (%s) RETURNING id", ("http-e2e-co",))
         row = await cur.fetchone()
         assert row is not None
         tenant_id = row[0]
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s)",
             (tenant_id, "http-e2e@acme.com", hash_password("http-e2e-password-123"), ["admin", "public"]),
         )
 
@@ -332,12 +332,12 @@ async def test_create_company_partial_failure_does_not_orphan_tenant_through_rea
         assert row is not None
         su_tenant_id = row[0]
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s)",
             (su_tenant_id, "su-partial-fail@sys", hash_password("superadmin-password-123"), ["superadmin"]),
         )
         # Email đã tồn tại SẴN — dùng làm admin_email cho lần gọi bên dưới để buộc INSERT thứ 2 vỡ.
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s)",
             (su_tenant_id, "already-taken@acme.com", hash_password("whatever-password"), ["admin"]),
         )
 
@@ -380,14 +380,14 @@ async def test_demoted_admin_stale_jwt_cannot_create_user_through_real_http(
     client: AsyncClient, admin_pool: Pool
 ) -> None:
     """Important #1, review `app#17` đợt 8: trước bản vá, `create_user`/`create_company` phân
-    quyền bằng `session.roles` — claim JWT, ảnh chụp lúc đăng nhập, sống tới `jwt_expire_minutes`
-    (mặc định 480 phút = 8 tiếng). 1 admin bị thu hồi quyền giữa chừng (`core.users.roles` đổi
+    quyền bằng `session.system_roles` — claim JWT, ảnh chụp lúc đăng nhập, sống tới `jwt_expire_minutes`
+    (mặc định 480 phút = 8 tiếng). 1 admin bị thu hồi quyền giữa chừng (`core.users.system_roles` đổi
     trong DB, vd HR khoá tài khoản sau khi nhân viên nghỉ/vi phạm) vẫn còn "admin" trong JWT CŨ tới
     lúc hết hạn tự nhiên nếu route tin thẳng claim đó — route ĐÃ SẴN 1 lượt round-trip DB (tra
-    `created_by`) nên sửa rẻ: tra thêm cột `roles` ở CÙNG query, dùng giá trị TƯƠI đó để phân quyền
+    `created_by`) nên sửa rẻ: tra thêm cột `system_roles` ở CÙNG query, dùng giá trị TƯƠI đó để phân quyền
     thay vì JWT.
 
-    Kịch bản thật qua HTTP: đăng nhập lấy JWT với "admin" -> UPDATE thẳng `core.users.roles` xoá
+    Kịch bản thật qua HTTP: đăng nhập lấy JWT với "admin" -> UPDATE thẳng `core.users.system_roles` xoá
     "admin" (mô phỏng demote, KHÔNG qua API — hệ thống hiện chưa có route demote, đây là hành động
     admin DB trực tiếp) -> DÙNG LẠI đúng JWT cũ (chưa hết hạn) gọi `/api/admin/users` -> PHẢI 403,
     không phải 200."""
@@ -397,7 +397,7 @@ async def test_demoted_admin_stale_jwt_cannot_create_user_through_real_http(
         assert row is not None
         tenant_id = row[0]
         await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) VALUES (%s, %s, %s, %s)",
             (tenant_id, "soon-demoted@acme.com", hash_password("demoted-admin-password"), ["admin", "public"]),
         )
 
@@ -410,11 +410,13 @@ async def test_demoted_admin_stale_jwt_cannot_create_user_through_real_http(
     # Demote NGOÀI luồng API — JWT vừa phát ở trên KHÔNG hề biết chuyện này xảy ra, vẫn mang
     # "admin" trong chữ ký của nó tới lúc hết hạn tự nhiên.
     async with admin_pool.connection() as conn:
-        await conn.execute("UPDATE core.users SET roles = %s WHERE email = %s", (["public"], "soon-demoted@acme.com"))
+        await conn.execute(
+            "UPDATE core.users SET system_roles = %s WHERE email = %s", (["public"], "soon-demoted@acme.com")
+        )
 
     res = await client.post(
         "/api/admin/users",
-        json={"email": "should-not-exist@acme.com", "password": "password123", "roles": ["public"]},
+        json={"email": "should-not-exist@acme.com", "password": "password123", "system_roles": ["public"]},
         headers={"Authorization": f"Bearer {stale_admin_token}"},
     )
     assert res.status_code == 403, (
@@ -425,14 +427,14 @@ async def test_demoted_admin_stale_jwt_cannot_create_user_through_real_http(
         cur = await conn.execute("SELECT count(*) FROM core.users WHERE email = %s", ("should-not-exist@acme.com",))
         count_row = await cur.fetchone()
     assert count_row is not None
-    assert count_row[0] == 0, "user không được tạo dù JWT cũ còn 'admin' — phải tra roles tươi từ DB"
+    assert count_row[0] == 0, "user không được tạo dù JWT cũ còn 'admin' — phải tra system_roles tươi từ DB"
 
 
 async def test_rehomed_admin_stale_jwt_creates_user_in_fresh_tenant_not_stale_one(
     client: AsyncClient, admin_pool: Pool
 ) -> None:
     """Nửa THỨ HAI của Important #1 (đợt 8), review đợt 9 chỉ ra chưa có bài nào ghim riêng: mọi
-    bài test trong suite (kể cả bài demote roles ở trên) đều seed session/DB CÙNG 1 tenant, nên nếu
+    bài test trong suite (kể cả bài demote system_roles ở trên) đều seed session/DB CÙNG 1 tenant, nên nếu
     revert nguồn `tenant_id` của `create_user` về lại `str(session.tenant_id)` (JWT) thay vì
     `str(creator_tenant_id)` (tra tươi), TOÀN BỘ suite vẫn xanh — không bài nào phân biệt được 2
     nguồn đó vì chúng luôn TRÙNG giá trị trong mọi kịch bản khác. Bài này CỐ Ý làm chúng LỆCH nhau:
@@ -450,13 +452,14 @@ async def test_rehomed_admin_stale_jwt_creates_user_in_fresh_tenant_not_stale_on
         assert row is not None
         tenant_b = row[0]
         cur = await conn.execute(
-            "INSERT INTO core.users (tenant_id, email, password_hash, roles) VALUES (%s, %s, %s, %s) RETURNING id",
+            "INSERT INTO core.users (tenant_id, email, password_hash, system_roles) "
+            "VALUES (%s, %s, %s, %s) RETURNING id",
             (tenant_a, "soon-rehomed@acme.com", hash_password("rehomed-admin-password"), ["admin", "public"]),
         )
         row = await cur.fetchone()
         assert row is not None
         rehomed_admin_id = row[0]
-        # Vocab roles hợp lệ giờ tra động theo `core.sections` CỦA TENANT ĐÍCH (tenant_b, tenant
+        # Vocab system_roles hợp lệ giờ tra động theo `core.sections` CỦA TENANT ĐÍCH (tenant_b, tenant
         # TƯƠI sau re-home) — seed sẵn "public" cho tenant_b, không phải tenant_a, để request cuối
         # bài (tạo user role=["public"] SAU khi re-home) qua được vocab check.
         await conn.execute(
@@ -477,7 +480,7 @@ async def test_rehomed_admin_stale_jwt_creates_user_in_fresh_tenant_not_stale_on
 
     res = await client.post(
         "/api/admin/users",
-        json={"email": "landed-somewhere@acme.com", "password": "password123", "roles": ["public"]},
+        json={"email": "landed-somewhere@acme.com", "password": "password123", "system_roles": ["public"]},
         headers={"Authorization": f"Bearer {stale_tenant_a_token}"},
     )
     assert res.status_code == 200, f"admin re-home rồi vẫn phải tạo được user (đúng tenant MỚI) — thấy {res.text}"

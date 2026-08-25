@@ -269,7 +269,7 @@ async def evaluate_agent(agent_id: str, body: PublishRequest) -> dict[str, objec
     # Cùng gate role-gap đã đóng ở `routes/runs.py::create_run` — route này trước bản vá cũng gọi
     # được bởi bất kỳ ai đã đăng nhập, không riêng admin.
     identity = await fetch_fresh_identity(get_request_connection(), session.user)
-    require_admin(identity.roles)
+    require_admin(identity.system_roles)
 
     recipe, scorecard = await _evaluate(agent_id, body, session)
     return {
@@ -288,7 +288,7 @@ async def publish_agent(agent_id: str, body: PublishRequest) -> dict[str, object
 
     # Cùng gate role-gap đã đóng ở `routes/runs.py::create_run`.
     identity = await fetch_fresh_identity(get_request_connection(), session.user)
-    require_admin(identity.roles)
+    require_admin(identity.system_roles)
 
     recipe, scorecard = await _evaluate(agent_id, body, session)
 
