@@ -83,7 +83,7 @@ def _recipe(agent_id: str) -> Recipe:
     return create_recipe(
         agent_id=agent_id,
         tenant_id=ANKOR_ID,
-        instructions="Tra cứu quy trình và bảo mật Callisto.",
+        system_prompt="Tra cứu quy trình và bảo mật Callisto.",
         tool_whitelist=[],
         nodes=_CERTIFIED_NODES,
         edges=_CERTIFIED_EDGES,
