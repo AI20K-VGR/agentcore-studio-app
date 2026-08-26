@@ -90,6 +90,18 @@ async def _fake_load_recipe(agent_id: str) -> tuple[Recipe, int]:  # noqa: ARG00
     return _recipe(), 3
 
 
+async def _fake_start_new_conversation(agent_id: str, tenant_id: object) -> str:  # noqa: ARG001
+    """app#74 — double thay `_start_new_conversation` (đọc/ghi `wb.conversations` thật): bài ở
+    đây kiểm HỢP ĐỒNG NỐI DÂY của `chat()`, không kiểm lại hành vi DB (đã có nhóm test Postgres
+    thật riêng, `test_routes_chat_conversation.py`)."""
+    return "11111111-1111-1111-1111-111111111111"
+
+
+async def _fake_record_conversation_turn(**kwargs: object) -> None:  # noqa: ARG001
+    """app#74 — double thay `_record_conversation_turn` (INSERT `wb.conversation_messages` thật),
+    cùng lý do `_fake_start_new_conversation` ở trên."""
+
+
 def _set_session() -> object:
     session = ResolvedContext(tenant_id=TENANT_ID, user="victim@ankor.vn", system_roles=["public"])
     return middleware._request_session.set(session)
@@ -109,6 +121,8 @@ def test_chat_module_no_longer_imports_dag_only_helpers() -> None:
 async def test_chat_calls_run_agent_loop_with_message_as_question(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(chat_module, "_load_published_recipe", _fake_load_recipe)
     monkeypatch.setattr(chat_module, "get_pool", _fake_get_pool)
+    monkeypatch.setattr(chat_module, "_start_new_conversation", _fake_start_new_conversation)
+    monkeypatch.setattr(chat_module, "_record_conversation_turn", _fake_record_conversation_turn)
     stub = _RecordingAgentLoop()
     monkeypatch.setattr(chat_module, "agent_loop", stub)
 
@@ -122,8 +136,11 @@ async def test_chat_calls_run_agent_loop_with_message_as_question(monkeypatch: p
     assert response.citations == ["c1"]
     assert response.refused is False
     assert response.version == 3
+    assert response.conversation_id == "11111111-1111-1111-1111-111111111111"
     assert len(stub.calls) == 1
     assert stub.calls[0]["question"] == "nghỉ phép cần báo trước bao lâu?"
+    # app#74 — conversation mới (conversation_id=None trong request) => history rỗng.
+    assert stub.calls[0]["history"] == []
     # Recipe truyền đi phải NGUYÊN VẸN — không with_query/model_copy nào bơm message vào dag.
     assert stub.calls[0]["recipe"] == _recipe()
 
@@ -149,6 +166,7 @@ async def test_chat_maps_agent_loop_exceptions_to_clean_500(
     unhandled. Quyết định đã chốt với user (AskUserQuestion, cùng phiên app#44)."""
     monkeypatch.setattr(chat_module, "_load_published_recipe", _fake_load_recipe)
     monkeypatch.setattr(chat_module, "get_pool", _fake_get_pool)
+    monkeypatch.setattr(chat_module, "_start_new_conversation", _fake_start_new_conversation)
     monkeypatch.setattr(chat_module, "agent_loop", _RaisingAgentLoop(exc))
 
     token = _set_session()
