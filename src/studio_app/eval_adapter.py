@@ -171,7 +171,13 @@ class EngineAgentRunner:
             agent_id=agent_id or self._agent_id,
             tenant_id=tenant_id,
             system_prompt="Tra cứu quy trình và bảo mật Callisto.",
-            tool_whitelist=[],
+            # engine#49 (A4 reversed) — `_CERTIFIED_NODES` (n1) đã có sẵn 1 node `kb-retrieve` từ
+            # đầu; ý định gốc của recipe mặc định eval-gate luôn LÀ "có thể tra KB" (golden-set đo
+            # citation_accuracy, cần retrieval thật). Trước A4-reversal, `tool_whitelist=[]` không
+            # sao vì `run_agent_loop()` hard-code kb_search luôn bật bất kể whitelist — giờ
+            # `kb_search` phải khai tường minh ở đây để GIỮ NGUYÊN hành vi cũ (không phải fix mới),
+            # khớp `test_run_case_kb_search_dispatches_via_kb_branch_not_tool_dispatch`.
+            tool_whitelist=["kb_search"],
             nodes=_CERTIFIED_NODES,
             edges=_CERTIFIED_EDGES,
         )
@@ -243,12 +249,15 @@ class EngineAgentRunner:
         #
         # CỐ Ý không tiêm ở branch (b) (`self._recipe is None` — tự dựng qua `create_recipe`, dùng khi
         # eval-harness chạy rời khỏi route thật, ví dụ `test_eval_adapter.py`): `_CERTIFIED_NODES`
-        # khai `tool_whitelist=[]` (không tool nào được whitelist) và không có node `tool-call` nào
-        # trong DAG cố định — tiêm `RealToolDispatch` ở đây không đổi hành vi CHẠY (LLM không có tool
-        # nào để gọi dù dùng dispatcher nào), nhưng vẫn đổi object được hash (`certified_recipe()`
-        # docstring, D16 golden-batch determinism) nếu sau này thêm tool vào `_CERTIFIED_NODES` — nằm
-        # ngoài phạm vi finding gốc (engine#32). Sửa mặc định đó là quyết định riêng của bút chủ
-        # `packages/workbench`, không phải phần của fix này.
+        # khai `tool_whitelist=["kb_search"]` (engine#49, A4 reversed — trước đó `[]`, xem
+        # `certified_recipe()`) và không có node `tool-call` nào trong DAG cố định — `kb_search`
+        # không bao giờ đi qua `tool_dispatch` (nhánh dispatch riêng, `agent_loop.KB_SEARCH_TOOL`),
+        # nên tiêm `RealToolDispatch` ở đây vẫn không đổi hành vi CHẠY (LLM không có tool NGOÀI
+        # kb_search nào để gọi dù dùng dispatcher nào), nhưng vẫn đổi object được hash
+        # (`certified_recipe()` docstring, D16 golden-batch determinism) nếu sau này thêm tool khác
+        # vào `tool_whitelist`/`_CERTIFIED_NODES` — nằm ngoài phạm vi finding gốc (engine#32). Sửa
+        # mặc định đó là quyết định riêng của bút chủ `packages/workbench`, không phải phần của fix
+        # này.
         result = await agent_loop.run_agent_loop(
             base,
             kb_search=self._kb_search,
