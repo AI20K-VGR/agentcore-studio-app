@@ -327,7 +327,9 @@ async def test_run_case_surfaces_engine_refusal_faithfully(final_answer_text: st
             agent_id="agent-callisto-d4",
             tenant_id=TENANT_ID,
             system_prompt="Tra cứu quy trình và bảo mật Callisto.",
-            tool_whitelist=[],
+            # engine#49 (A4 reversed) — kb_search giờ gate qua whitelist như mọi tool; kịch bản test
+            # này script 1 TOOL_CALL kb_search nên cần khai nó ở đây, khớp `certified_recipe()`.
+            tool_whitelist=["kb_search"],
             nodes=[
                 Node(id="n1", type=NodeType.KB_RETRIEVE, params={"top_k": 3}),
                 Node(id="n2", type=NodeType.LLM_STEP, params={"temperature": 0.0}),
@@ -708,16 +710,19 @@ async def test_run_case_dispatches_real_tool_when_recipe_is_injected() -> None:
     assert tool_event.outputs.get("status") != "stub-dispatched"
 
 
-async def test_run_case_kb_search_always_available_even_without_injected_recipe() -> None:
-    """KHÓA D2 (app#44 — thay hẳn bài cũ, xem lý do dưới): branch (b) — `self._recipe is None`,
-    `create_recipe_d4` tự dựng whitelist mặc định `["kb_search"]`. Vòng lặp mới KHÔNG BAO GIỜ đưa
-    `kb_search` qua `ToolDispatch`/`WhitelistToolDispatch` nữa — nó có nhánh riêng
-    (`agent_loop.KB_SEARCH_TOOL`, A4: "kb_search luôn khả dụng, không bị `tool_whitelist` chặn") —
-    nên toàn bộ lớp bug bài D2 CŨ khoá ("kb_search lỡ đi qua stub tool-dispatch, ra
-    `{'tool':'kb_search','status':'stub-dispatched'}`") giờ KHÔNG THỂ xảy ra được nữa CẤU TRÚC, kể
-    cả khi caller không tiêm `recipe=`/`tool_dispatch=` gì cả. Bài này pin đúng bất biến MỚI thay
-    cho bất biến cũ đã hết ý nghĩa: `kb_search` luôn ra event `kb-retrieve` thật (`{"chunks": [...]}`),
-    không bao giờ ra event `tool-call` nào."""
+async def test_run_case_kb_search_dispatches_via_kb_branch_not_tool_dispatch() -> None:
+    """KHÓA D2 (app#44 — thay hẳn bài cũ, xem lý do dưới). engine#49 (A4 reversed, 2026-08-26):
+    tên/docstring cũ dựa trên A4 gốc ("kb_search luôn khả dụng, không bị `tool_whitelist` chặn") —
+    đã đảo ngược, `kb_search` giờ gate bằng `tool_whitelist` như mọi tool (xem
+    `certified_recipe()`, `tool_whitelist=["kb_search"]`). Bất biến bài này KHOÁ vẫn đúng
+    NGUYÊN VẸN, chỉ đổi LÝ DO: branch (b) (`self._recipe is None`) — `kb_search` KHÔNG BAO GIỜ đi
+    qua `ToolDispatch`/`WhitelistToolDispatch` (nó luôn có nhánh dispatch riêng,
+    `agent_loop.KB_SEARCH_TOOL`, xem `agent_loop.py`), nên lớp bug D2 CŨ ("kb_search lỡ đi qua
+    stub tool-dispatch, ra `{'tool':'kb_search','status':'stub-dispatched'}`") KHÔNG THỂ xảy ra
+    được nữa CẤU TRÚC, kể cả khi caller không tiêm `recipe=`/`tool_dispatch=` gì cả — miễn
+    `kb_search` có mặt trong `tool_whitelist` (nay khai tường minh, trước đây ngầm định qua A4).
+    `kb_search` luôn ra event `kb-retrieve` thật (`{"chunks": [...]}`), không bao giờ ra event
+    `tool-call` nào."""
     kb = _RecordingKbSearch([_item("ankor-leave-001#c1")])
     writer = _CollectingTraceWriter()
     llm = _MultiTurnScriptedLLM(
