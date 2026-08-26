@@ -31,6 +31,10 @@ recipe được băm giờ CHÍNH LÀ recipe được harness chạy qua từng 
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
 
@@ -38,6 +42,14 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, ValidationError
 from studio_contracts import Edge, Node, NodeType, Recipe, Scorecard
 from studio_engine.agent_loop import AgentLoopExhausted
+from studio_evalhub.eval_job_store import (
+    create_eval_job,
+    fail_eval_job,
+    finish_eval_job,
+    read_eval_job,
+    record_job_progress,
+    sweep_stale_jobs,
+)
 from studio_evalhub.golden_case import GoldenSet
 from studio_evalhub.golden_store import GoldenSetNotFound, GoldenSetScopeError, read_golden_set
 from studio_evalhub.harness import EvalHarness
@@ -51,6 +63,7 @@ from studio_workbench.publish import publish, recipe_hash
 from studio_workbench.tenant_wall import ResolvedContext
 from studio_workbench.validator import enforce_agent_shape, enforce_agent_topology
 
+from studio_app import middleware
 from studio_app.authz import fetch_fresh_identity, require_admin
 from studio_app.core._db import get_pool
 from studio_app.core.golden_autogen import auto_golden_set_ref
@@ -61,6 +74,10 @@ from studio_app.providers.factory import build_embedding, build_llm
 from studio_app.settings import get_settings
 
 router = APIRouter(prefix="/api/agents", tags=["publish"])
+
+jobs_router = APIRouter(prefix="/api/eval-jobs", tags=["publish"])
+"""Router RIÊNG: mã job không thuộc namespace của một agent nào — nó là mã của một LƯỢT CHẤM,
+và tra nó không cần biết agent nào trước."""
 
 
 class PublishRequest(BaseModel):
@@ -231,7 +248,13 @@ async def _build_recipe(agent_id: str, body: PublishRequest, session: ResolvedCo
     return recipe
 
 
-async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContext) -> tuple[Recipe, Scorecard]:
+async def _evaluate(
+    agent_id: str,
+    body: PublishRequest,
+    session: ResolvedContext,
+    *,
+    on_progress: Callable[[int, int], Awaitable[None]] | None = None,
+) -> tuple[Recipe, Scorecard]:
     """Dựng recipe từ canvas + chạy `golden_set_ref` qua `EvalHarness.run(core_only=True)` thật —
     tập **Core**, không phải cả bộ (xem chú thích tại lời gọi bên dưới). Dùng chung cho cả
     `/evaluate` (chỉ xem điểm) lẫn `/publish` (khi chưa có điểm tạm nào khớp `recipe_hash`).
@@ -347,6 +370,8 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
             # chạy, và hash ở đây sẽ chứng nhận nhầm đối tượng dù bản thân phép so ở `publish()`
             # vẫn "khớp" một cách vô nghĩa).
             recipe_hash=recipe_hash(recipe),
+            # Chỉ đường chạy nền truyền móc này; đường đồng bộ để `None` và không đổi gì.
+            on_progress=on_progress,
             # `apps/studio#20` — nhánh judge từng bị bỏ IM LẶNG: `EvalHarness.run` nhận `judge=`
             # từ D18 (`kit#118`) nhưng đường production chưa bao giờ truyền, nên
             # `if judge is not None and …` (`harness.py`) không bao giờ đúng. Không lỗi, không
@@ -479,3 +504,144 @@ async def publish_agent(agent_id: str, body: PublishRequest) -> dict[str, object
         "status": "published",
         "scorecard": scorecard.model_dump(mode="json"),
     }
+
+
+# ---------------------------------------------------------------------------------------------
+# Chấm điểm chạy nền (`kit` — việc 5). Xem `studio_evalhub.eval_job_store` cho lý do và hình dạng.
+# ---------------------------------------------------------------------------------------------
+
+_STALE_EVAL_JOB_SECONDS = 120
+"""Job `running` im lặng quá lâu ⇒ coi như tiến trình đã chết giữa chừng.
+
+Ngưỡng đo *"lâu không cập nhật"*, không phải *"chạy đã lâu"* (`sweep_stale_jobs`), nên một lượt chấm
+100 case chạy 8 phút vẫn an toàn miễn nó còn báo tiến độ sau mỗi case."""
+
+
+_BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
+"""Giữ tham chiếu tới task đang chạy.
+
+`asyncio.create_task` chỉ giữ **weak reference**: không giữ ở đâu cả thì GC thu task giữa chừng và
+lượt chấm biến mất không dấu vết. Đây là cái bẫy `asyncio` tự ghi trong tài liệu của chính nó."""
+
+
+@asynccontextmanager
+async def _tenant_scoped_connection(tenant_id: UUID) -> AsyncIterator[Any]:
+    """Kết nối riêng cho task nền, đã bind `app.tenant_id`.
+
+    Task nền chạy SAU khi request kết thúc, nên `get_request_connection()` không dùng được —
+    connection đó đã đóng. Nó phải tự lấy từ pool và **tự cầm hàng rào tenant**, thay vì được
+    `tenant_context_middleware` cầm hộ. Đây là chỗ dễ rò tenant nhất của cả việc này.
+
+    `SET LOCAL` trong một transaction ngắn chứ không `set_config(..., false)` ở mức session: giá
+    trị mức session **sống sót** khi connection trả về pool, nên một task chết giữa chừng để lại
+    một connection còn bind tenant cho request kế tiếp nhặt được. `SET LOCAL` tự hết hiệu lực khi
+    transaction đóng — không phụ thuộc vào việc ta có nhớ dọn hay không.
+
+    Hệ quả: mỗi bước DB của task là một transaction ngắn RIÊNG, không phải một transaction dài ôm
+    cả lượt chấm. Đó là chủ đích — giữ một transaction mở suốt 5-10 phút là giữ khoá và làm phình
+    bảng, và lượt chấm không cần tính nguyên tử giữa các bước.
+    """
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.transaction():
+        await conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(tenant_id),))
+        token = middleware._request_conn.set(conn)
+        try:
+            yield conn
+        finally:
+            middleware._request_conn.reset(token)
+
+
+async def _run_eval_job(job_id: UUID, agent_id: str, body: PublishRequest, session: ResolvedContext) -> None:
+    """Chạy trọn một lượt chấm ngoài vòng đời request, rồi ghi kết quả vào đúng chỗ `/publish` tra.
+
+    Không ném ra ngoài: task nền không có ai bắt, nên mọi lỗi phải thành `status='failed'` kèm
+    thông điệp — một job treo `running` mãi là thứ người dùng ngồi đợi một cách vô vọng."""
+
+    async def _on_progress(done: int, total: int) -> None:
+        async with _tenant_scoped_connection(session.tenant_id) as conn:
+            await record_job_progress(conn, job_id, done, total)
+
+    try:
+        async with _tenant_scoped_connection(session.tenant_id) as conn:
+            _, scorecard = await _evaluate(agent_id, body, session, on_progress=_on_progress)
+            await write_pending_scorecard(conn, scorecard, session.tenant_id)
+            await finish_eval_job(conn, job_id)
+    except Exception as exc:  # noqa: BLE001 — xem docstring: không ai bắt hộ task nền
+        detail = exc.detail if isinstance(exc, HTTPException) else f"{type(exc).__name__}: {exc}"
+        with contextlib.suppress(Exception):
+            async with _tenant_scoped_connection(session.tenant_id) as conn:
+                await fail_eval_job(conn, job_id, str(detail))
+
+
+@router.post("/{agent_id}/evaluate-async", status_code=202)
+async def evaluate_agent_async(agent_id: str, body: PublishRequest) -> dict[str, object]:
+    """Khởi động một lượt Chấm điểm chạy nền, trả **ngay** mã job.
+
+    Khác `/evaluate` (đồng bộ, giữ request mở suốt lượt chấm): route này nhả kết nối ngay, nên bộ
+    100 case chạy 5-10 phút không còn là một request treo. `/evaluate` giữ nguyên cho bộ nhỏ và cho
+    caller đang có.
+
+    Recipe được dựng + lint **đồng bộ** ở đây, trước khi tạo job: recipe hỏng phải ra 400 ngay lúc
+    bấm, không phải một job `failed` mà người dùng đợi rồi mới biết. Chỉ phần TỐN THỜI GIAN mới đi
+    xuống nền.
+    """
+    session = get_request_session()
+    identity = await fetch_fresh_identity(get_request_connection(), session.user)
+    require_admin(identity.system_roles)
+
+    recipe = await _build_recipe(agent_id, body, session)
+    job_id = await create_eval_job(get_request_connection(), session.tenant_id, recipe.agent_id, recipe_hash(recipe))
+
+    task = asyncio.create_task(_run_eval_job(job_id, agent_id, body, session))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+    return {"job_id": str(job_id), "status": "running", "agent_id": recipe.agent_id}
+
+
+@jobs_router.get("/{job_id}")
+async def read_eval_job_status(job_id: UUID) -> dict[str, object]:
+    """Trạng thái + tiến độ của một lượt chấm nền; kèm Scorecard khi đã xong.
+
+    Scorecard **không** lưu trên job — nó nằm ở `eval.scorecards` (`scorecard_store`), đúng chỗ
+    `/publish` tra. Route này ghép hai thứ đó lại bằng `(agent_id, recipe_hash)` có sẵn trên job,
+    nên không có nguồn sự thật thứ hai cho cùng một verdict.
+    """
+    session = get_request_session()
+    identity = await fetch_fresh_identity(get_request_connection(), session.user)
+    require_admin(identity.system_roles)
+
+    conn = get_request_connection()
+
+    # Dọn job treo NGAY TRONG đường đọc, không phải bằng một lượt quét lúc khởi động.
+    #
+    # Tiến trình chết giữa lượt chấm để lại job `running` mà không ai chuyển sang `failed` — người
+    # dùng mở lại trang và ngồi đợi một thứ đã không còn chạy. Lượt quét lúc boot giải được ca đó
+    # nhưng phải đi XUYÊN tenant, mà `eval.eval_jobs` bật `FORCE ROW LEVEL SECURITY`: chủ bảng cũng
+    # bị lọc, và `SET LOCAL row_security = off` KHÔNG vượt được (Postgres trả `InsufficientPrivilege`
+    # kèm gợi ý `ALTER TABLE NO FORCE` — đo được, không phải suy luận). Muốn quét xuyên tenant phải
+    # nới hàng rào hoặc lặp qua từng tenant, cả hai đều đắt hơn thứ nó mua.
+    #
+    # Ở đây thì miễn phí: route này đã chạy dưới RLS của đúng tenant sở hữu job, nên `sweep` tự giới
+    # hạn đúng phạm vi. Và nó chạy ĐÚNG LÚC có người nhìn — job treo mà không ai tra thì không phiền
+    # ai.
+    await sweep_stale_jobs(conn, stale_after_seconds=_STALE_EVAL_JOB_SECONDS)
+
+    job = await read_eval_job(conn, job_id)
+    if job is None:
+        # RLS đã lọc job của tenant khác thành `None`, nên 404 ở đây là MỘT nhánh cho cả "không có"
+        # lẫn "của công ty khác" — không rò tin tồn-tại-hay-không qua status code khác nhau.
+        raise HTTPException(status_code=404, detail=f"không có lượt chấm nào mang mã {job_id}")
+
+    payload: dict[str, object] = {
+        "job_id": str(job.job_id),
+        "agent_id": job.agent_id,
+        "status": job.status,
+        "done": job.done,
+        "total": job.total,
+        "detail": job.detail,
+    }
+    if job.status == "done":
+        scorecard = await read_pending_scorecard(conn, job.agent_id, job.recipe_hash)
+        payload["scorecard"] = None if scorecard is None else scorecard.model_dump(mode="json")
+    return payload
