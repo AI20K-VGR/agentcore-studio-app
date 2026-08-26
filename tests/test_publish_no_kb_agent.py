@@ -60,10 +60,14 @@ async def _fake_tenant_name(tenant_id: object) -> str:  # noqa: ARG001
     return TENANT_NAME
 
 
+_REQUESTED_REFS: list[str] = []
+
+
 async def _fake_load_golden_set(ref: str, tenant_id: UUID) -> GoldenSet:
     """Bộ của tenant — chỉ được gọi ở nhánh CÓ node KB. Case mang tên tenant THẬT, đúng như
     `golden_autogen.regenerate_for_section` sinh ra."""
     del tenant_id
+    _REQUESTED_REFS.append(ref)
     return GoldenSet(
         golden_set_ref=ref,
         cases=[
@@ -91,10 +95,13 @@ def _settings(tmp_path: Path) -> Settings:
     )
 
 
-async def _run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, with_kb_node: bool) -> None:
+async def _run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, with_kb_node: bool, section_roles: list[str] | None = None
+) -> None:
     async def _sentinel_pool() -> _SentinelPool:
         return _SentinelPool()
 
+    _REQUESTED_REFS.clear()
     monkeypatch.setattr(publish_module, "get_pool", _sentinel_pool)
     monkeypatch.setattr(publish_module, "EngineAgentRunner", _SpyRunner)
     monkeypatch.setattr(publish_module, "_load_golden_set", _fake_load_golden_set)
@@ -108,7 +115,8 @@ async def _run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, with_kb_node:
     nodes: list[dict[str, Any]] = [{"id": "n2", "type": "llm-step", "params": {}}]
     edges: list[dict[str, Any]] = []
     if with_kb_node:
-        nodes.insert(0, {"id": "n1", "type": "kb-retrieve", "params": {}})
+        params: dict[str, Any] = {"section_roles": section_roles} if section_roles else {}
+        nodes.insert(0, {"id": "n1", "type": "kb-retrieve", "params": params})
         edges = [{"from": "n1", "to": "n2", "when": None}]
 
     body = PublishRequest(agent_id="agent-no-kb", system_prompt="p", tool_whitelist=[], nodes=nodes, edges=edges)
@@ -159,3 +167,34 @@ async def test_real_tenant_name_is_resolvable_in_the_lookup_table(
     `GoldenCase.tenant` mang tên thật, nên mọi tenant khác hai cái đó làm cổng ném `KeyError`."""
     await _run(monkeypatch, tmp_path, with_kb_node=True)
     assert _StubEvalHarness.last_kwargs["tenant_ids"][TENANT_NAME] == ANKOR_ID
+
+
+async def test_declared_section_role_picks_the_generated_set(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Nấc 1 — canvas khai `section_roles` thì ref SUY từ đó, không đọc `recipe.golden_set_ref`.
+
+    `recipe.golden_set_ref` mang mặc định cứng `"callisto-2.0-golden-30-v1"` (`PublishRequest`) —
+    một bộ demo tenant thật không có. Đọc nó khi canvas ĐÃ nói rõ kho nào là chấm sai bộ."""
+    await _run(monkeypatch, tmp_path, with_kb_node=True, section_roles=["hr"])
+    assert _REQUESTED_REFS == ["kb-hr-auto-v1"]
+
+
+async def test_multiple_declared_roles_resolve_deterministically(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Nhiều vai khai cùng lúc ⇒ chọn theo thứ tự đã sắp, không theo thứ tự node xuất hiện.
+
+    Cùng một recipe phải cho cùng một bộ chấm ở hai lượt bấm — một ref nhảy giữa hai lượt làm
+    chênh lệch điểm không phân biệt được với chênh lệch do agent."""
+    await _run(monkeypatch, tmp_path, with_kb_node=True, section_roles=["hr", "finance"])
+    first = _REQUESTED_REFS[:]
+    await _run(monkeypatch, tmp_path, with_kb_node=True, section_roles=["finance", "hr"])
+    assert first == _REQUESTED_REFS == ["kb-finance-auto-v1"]
+
+
+async def test_undeclared_role_falls_back_to_the_recipe_ref(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Nấc 2 — không khai gì thì giữ NGUYÊN hành vi cũ: đọc `recipe.golden_set_ref`.
+
+    Vế bất đối xứng của bài nấc 1; thiếu nó thì không phân biệt được "suy từ vai đã khai" với
+    "luôn suy, bỏ qua ref"."""
+    await _run(monkeypatch, tmp_path, with_kb_node=True)
+    assert _REQUESTED_REFS == ["callisto-2.0-golden-30-v1"]

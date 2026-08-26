@@ -52,6 +52,7 @@ from studio_workbench.validator import enforce_agent_shape, enforce_agent_topolo
 
 from studio_app.authz import fetch_fresh_identity, require_admin
 from studio_app.core._db import get_pool
+from studio_app.core.golden_autogen import auto_golden_set_ref
 from studio_app.eval_adapter import EngineAgentRunner
 from studio_app.middleware import get_request_connection, get_request_session
 from studio_app.obs.trace_writer import PgTraceWriter
@@ -105,6 +106,53 @@ async def _tenant_name(tenant_id: UUID) -> str:
     if row is None:
         raise HTTPException(status_code=404, detail=f"tenant {tenant_id} không có trong core.tenants")
     return str(row[0])
+
+
+async def _resolve_golden_set(recipe: Recipe, tenant_id: UUID) -> GoldenSet:
+    """Bộ golden dùng để chấm agent CÓ gắn KB — ba nấc, dừng ở nấc đầu tiên cho ra kết quả.
+
+    **Nấc 1 — canvas khai.** `params["section_roles"]` của node `kb-retrieve` là chỗ người dựng
+    agent NÓI nó gắn kho nào; suy ref bằng `auto_golden_set_ref` (đúng tên
+    `golden_autogen.regenerate_for_section` đã sinh lúc upload). Đây là đường đúng và là đường duy
+    nhất không mơ hồ khi tenant có nhiều kho.
+
+    **Nấc 2 — `recipe.golden_set_ref`.** Hành vi cũ, giữ nguyên cho mọi caller đang khai ref tường
+    minh (test, bộ seed `callisto-*`, bộ người viết nạp qua `POST /api/admin/golden-sets`).
+
+    **Nấc 3 — cầu tạm, và CHỈ khi câu trả lời là duy nhất.** Node `kb-retrieve` hôm nay có
+    `fields: []` (`apps/web/src/recipe/contract.ts` — *"chỉ còn là 1 biểu tượng đánh dấu"*) nên nấc
+    1 luôn rỗng, và canvas gửi `golden_set_ref` mặc định cứng `"callisto-2.0-golden-30-v1"` — một
+    bộ demo tenant thật không có, nên nấc 2 ném `GoldenSetNotFound` và **mọi lần bấm Chấm điểm đều
+    400**. Khi đó lấy các phòng ban thật sự có chunk: đúng một ⇒ dùng nó; nhiều hơn ⇒ 400 nêu đích
+    danh lựa chọn, KHÔNG đoán. Đoán ở đây là chấm agent bằng bộ của phòng ban khác rồi trả về một
+    Scorecard trông hợp lệ — đúng lớp "chứng nhận sai đối tượng".
+
+    Nấc 3 biến mất khi canvas có ô chọn phòng ban cho node KB; lúc đó nấc 1 luôn trả lời được.
+    """
+    declared: list[str] = []
+    for node in recipe.dag.nodes:
+        if node.type is not NodeType.KB_RETRIEVE:
+            continue
+        # `Node.params` là `dict[str, object]` tự do (contract), nên phải tự thu hẹp kiểu — một
+        # `section_roles: "hr"` (chuỗi, không phải list) sẽ tách thành 2 ký tự nếu lặp thẳng.
+        raw = node.params.get("section_roles")
+        if isinstance(raw, list):
+            declared.extend(str(role) for role in raw)
+    if declared:
+        return await _load_golden_set(auto_golden_set_ref(sorted(set(declared))[0]), tenant_id)
+
+    try:
+        return await _load_golden_set(recipe.golden_set_ref, tenant_id)
+    except HTTPException as exc:
+        if exc.status_code != 400:
+            raise
+        cur = await get_request_connection().execute(
+            "SELECT DISTINCT section_role FROM kb.chunks ORDER BY section_role"
+        )
+        available = [str(row[0]) for row in await cur.fetchall()]
+        if len(available) != 1:
+            raise
+        return await _load_golden_set(auto_golden_set_ref(available[0]), tenant_id)
 
 
 async def _load_golden_set(ref: str, tenant_id: UUID) -> GoldenSet:
@@ -190,7 +238,15 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
     # trục đo được mà không nới chốt nào (xem docstring `studio_evalhub.no_kb_golden`). Bộ đó KHÔNG
     # nằm trong `eval.golden_sets`; nó là hằng số trong mã nên không đi qua `_load_golden_set`.
     has_kb_node = any(node.type is NodeType.KB_RETRIEVE for node in recipe.dag.nodes)
-    golden = await _load_golden_set(recipe.golden_set_ref, session.tenant_id) if has_kb_node else no_kb_golden_set()
+    if has_kb_node:
+        # `golden_set_ref` SUY từ phòng ban đã gắn, KHÔNG đọc `recipe.golden_set_ref`: field đó mang
+        # mặc định cứng `"callisto-2.0-golden-30-v1"` (`PublishRequest`) — một bộ demo mà tenant
+        # thật không có, nên mọi lần bấm Chấm điểm đều 400 `GoldenSetNotFound`. Bộ đúng là bộ
+        # `golden_autogen.regenerate_for_section` đã sinh sẵn lúc upload, tên theo đúng quy ước
+        # `auto_golden_set_ref` — nối hai đầu đó lại là toàn bộ nội dung của đoạn này.
+        golden = await _resolve_golden_set(recipe, session.tenant_id)
+    else:
+        golden = no_kb_golden_set()
 
     # `Pool` (không phải `get_request_connection()`) — rủi ro pool self-deadlock CHƯA được giải
     # quyết ở route này, xem giải thích đầy đủ + lý do ở `routes/runs.py` (review `app#17` đợt 4,
