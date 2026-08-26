@@ -48,8 +48,8 @@ class FreshIdentity:
 
 
 async def fetch_fresh_identity(conn: AsyncConnection, email: str) -> FreshIdentity:
-    """`SELECT id, system_roles, tenant_id, password_changed_at, is_active FROM core.users WHERE email =
-    %s` — round-trip DUY NHẤT dùng chung cho mọi route cần roles/tenant tươi thay vì tin JWT.
+    """`SELECT ... FROM core.users u JOIN core.tenants t ON t.id = u.tenant_id WHERE u.email = %s` —
+    round-trip DUY NHẤT dùng chung cho mọi route cần roles/tenant tươi thay vì tin JWT.
 
     Raise `HTTPException(403)` nếu JWT hợp lệ (chữ ký đúng, chưa hết hạn) nhưng KHÔNG còn dòng nào
     trong `core.users` khớp email đó — phòng thủ theo chiều sâu cho ca tài khoản bị offboard (xoá
@@ -63,6 +63,14 @@ async def fetch_fresh_identity(conn: AsyncConnection, email: str) -> FreshIdenti
     `fetch_fresh_identity` (admin/sections/agents/runs/publish) tới khi JWT tự hết hạn
     (`jwt_expire_minutes`, mặc định 480 phút), kể cả tự tạo/xoá user khác hay publish agent mới.
     Route `PATCH /api/auth/password` có cùng lỗ hở riêng, vá tại `change_own_password`.
+
+    Raise `HTTPException(403)` nếu `core.tenants.is_active = false` — công ty bị superadmin tạm
+    khoá (`PATCH /api/admin/companies/{tenant_id}`, app#75). Đây là lý do câu SELECT ở dưới JOIN
+    sang `core.tenants` thay vì chỉ đọc `core.users`: quyết định D2 của app#75 chốt chặn ở ĐÂY chứ
+    KHÔNG chỉ ở `routes/auth.py::login`. Chặn riêng ở `login` sẽ lặp lại đúng lỗ đã trả giá một
+    lần cho `is_active` của user (đoạn ngay trên) — mọi JWT cấp TRƯỚC lúc tạm khoá vẫn gọi lọt
+    mọi route tới khi tự hết hạn (`jwt_expire_minutes`, mặc định 480 phút). JOIN không tốn thêm
+    round-trip nào: hàm này đã đọc `core.users` sẵn, và `u.tenant_id` là FK có index.
 
     Raise `HTTPException(401)` nếu JWT ký TRƯỚC lần đổi mật khẩu gần nhất (`core.users.
     password_changed_at`) — đổi mật khẩu là cách người dùng tự xử lý phiên bị đánh cắp, JWT ký từ
@@ -79,7 +87,8 @@ async def fetch_fresh_identity(conn: AsyncConnection, email: str) -> FreshIdenti
     cầu, cùng dạng nợ kỹ thuật đã ghi nhận công khai ở `routes/admin.py` (comment trên
     `fetch_fresh_identity` ở `create_user`) cho khoảng-hở tenant_context tương tự."""
     cur = await conn.execute(
-        "SELECT id, system_roles, tenant_id, password_changed_at, is_active FROM core.users WHERE email = %s",
+        "SELECT u.id, u.system_roles, u.tenant_id, u.password_changed_at, u.is_active, t.is_active "
+        "FROM core.users u JOIN core.tenants t ON t.id = u.tenant_id WHERE u.email = %s",
         (email,),
     )
     row = await cur.fetchone()
@@ -88,11 +97,16 @@ async def fetch_fresh_identity(conn: AsyncConnection, email: str) -> FreshIdenti
             status_code=403,
             detail="Tài khoản gọi API không tồn tại trong core.users.",
         )
-    user_id, roles_raw, tenant_id, password_changed_at, is_active = row
+    user_id, roles_raw, tenant_id, password_changed_at, is_active, tenant_is_active = row
     if not is_active:
         raise HTTPException(
             status_code=403,
             detail="Tài khoản đã bị vô hiệu hoá.",
+        )
+    if not tenant_is_active:
+        raise HTTPException(
+            status_code=403,
+            detail="Công ty của tài khoản này đã bị tạm khoá.",
         )
     # `- 1s`: `iat` là unix timestamp NGUYÊN GIÂY (JWT chuẩn), `password_changed_at` là
     # `TIMESTAMPTZ` micro-giây từ `now()` — 1 JWT ký CÙNG giây với lần đổi mật khẩu (login lại
