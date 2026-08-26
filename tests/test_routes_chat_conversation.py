@@ -191,6 +191,54 @@ async def test_conversation_round_trip_threads_history_and_persists_messages(
     assert rows[1][1] == "hỏi 2"
 
 
+async def test_conversation_history_windowed_to_cap_most_recent_in_order(
+    admin_pool: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review dholmes0207 (PR app#85) — bài round-trip 2-lượt ở trên chỉ seed ĐÚNG 1 lượt lịch sử,
+    nên 4 mutant độc lập (bỏ `reversed()`, `turn_index DESC -> ASC`, cap `10 -> 1`, bỏ hẳn `LIMIT`)
+    đều sống — trên tập 1 phần tử, cả 4 biến thể cho ra cùng 1 kết quả quan sát được. Tự gieo lại cả
+    4 mutant đó vào bản ĐÃ SỬA xác nhận bài này bắt đỏ đủ cả 4 (xem PR).
+
+    Seed hẳn `_CONVERSATION_HISTORY_CAP + 2` lượt rồi assert theo NỘI DUNG + THỨ TỰ (không chỉ
+    `len`) — 1 assert duy nhất giết cả 4: sai thứ tự (M1/M2) hoặc sai cap/thiếu LIMIT (M3/M4) đều
+    làm danh sách so sánh lệch."""
+    tenant_id = await _seed_tenant(admin_pool, "chat-conv-history-window")
+    agent_id = "agent-conv-history-window"
+    await _seed_published_recipe(admin_pool, tenant_id, agent_id)
+    conversation_id = await _seed_conversation(admin_pool, tenant_id, agent_id)
+    total_seeded = chat_module._CONVERSATION_HISTORY_CAP + 2  # cố ý vượt cap
+    for i in range(1, total_seeded + 1):
+        await _seed_message(admin_pool, tenant_id, conversation_id, i, f"hỏi {i}", f"đáp {i}")
+
+    stub = _RecordingAgentLoop()
+    monkeypatch.setattr(chat_module, "agent_loop", stub)
+    monkeypatch.setattr(chat_module, "get_pool", _fake_get_pool)
+
+    token = _set_session(tenant_id=tenant_id, user="u@acme.com", system_roles=["public"])
+    try:
+        async with _simulate_request_connection(tenant_id):
+            await chat(agent_id, ChatRequest(message="hỏi mới", conversation_id=str(conversation_id)))
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    history = cast("list[HistoryTurn]", stub.calls[0]["history"])
+    assert len(history) == chat_module._CONVERSATION_HISTORY_CAP  # giết M3 (cap sai)/M4 (bỏ LIMIT)
+    expected_first = total_seeded - chat_module._CONVERSATION_HISTORY_CAP + 1  # 12-10+1 = 3
+    assert [h.question for h in history] == [f"hỏi {i}" for i in range(expected_first, total_seeded + 1)], (
+        "phải là N lượt GẦN NHẤT (không phải N lượt đầu), theo thứ tự CŨ->MỚI"  # giết M1 (order)/M2 (DESC->ASC)
+    )
+
+
+def test_conversation_history_cap_matches_engine() -> None:
+    """review dholmes0207 (PR app#85) — `_CONVERSATION_HISTORY_CAP` phải giữ khớp tay với
+    `agent_loop._MAX_HISTORY_TURNS` (docstring `chat.py` đã nói rõ lý do không import thẳng tên
+    private đó vào code sản phẩm). Bài này GHIM bất biến đó — engine nâng/hạ số mà không đổi theo ở
+    đây thì đỏ ngay, thay vì lịch sử âm thầm ngắn/dài đi không ai biết."""
+    from studio_engine.agent_loop import _MAX_HISTORY_TURNS
+
+    assert chat_module._CONVERSATION_HISTORY_CAP == _MAX_HISTORY_TURNS
+
+
 async def test_conversation_id_from_other_tenant_is_404_not_a_leak(admin_pool: Pool) -> None:
     tenant_a = await _seed_tenant(admin_pool, "chat-conv-tenant-a")
     tenant_b = await _seed_tenant(admin_pool, "chat-conv-tenant-b")

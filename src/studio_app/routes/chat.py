@@ -232,12 +232,22 @@ async def chat(agent_id: str, body: ChatRequest) -> ChatResponse:
         session_context = ResolvedContext(tenant_id=session.tenant_id, user=session.user, system_roles=body.as_roles)
 
     # app#74 — resolve `conversation_id`/`history` TRƯỚC `run_agent_loop`, cùng connection request-
-    # scope (RLS + fence agent_id, xem docstring module + 2 helper trên).
+    # scope (RLS + fence agent_id, xem docstring module + 2 helper trên). Phiên đã có (`conversation_id`
+    # có giá trị) thì đọc lịch sử ngay — không có gì để trì hoãn. Phiên MỚI thì CHƯA tạo
+    # `wb.conversations` ở đây (review dholmes0207, PR app#85): `_start_new_conversation` dời xuống
+    # sau khi `run_agent_loop`/`_llm_answer` đã thành công sạch, cùng nguyên tắc "không để lại record
+    # cho 1 lượt lỗi" đã áp cho `_record_conversation_turn` — trước bản vá, 1 lượt raise
+    # `AgentLoopExhausted`/`ValueError`/`PermissionError` (map 500) vẫn để lại 1 dòng `wb.conversations`
+    # RỖNG đã COMMIT (HTTPException bị `ExceptionMiddleware` của FastAPI/Starlette nuốt TRƯỚC KHI nổi
+    # lên `tenant_context_middleware`, nên khối `pool.connection()` ở đó thoát sạch và COMMIT — verify
+    # thật bằng probe, không chỉ suy luận) — rác không ai chạm tới được vì client chỉ nhận 500, không
+    # bao giờ biết `conversation_id` đó.
+    conversation_id: str | None
     if body.conversation_id is not None:
         conversation_id = _parse_conversation_id(body.conversation_id)
         history = await _load_conversation_history(agent_id, conversation_id)
     else:
-        conversation_id = await _start_new_conversation(agent_id, session.tenant_id)
+        conversation_id = None
         history = []
 
     # `Pool` (không phải `get_request_connection()`) — rủi ro pool self-deadlock CHƯA được giải
@@ -279,8 +289,12 @@ async def chat(agent_id: str, body: ChatRequest) -> ChatResponse:
     answer = str(llm_out.get("answer", ""))
     citations = [str(c) for c in raw_citations] if isinstance(raw_citations, list) else []
 
-    # app#74 — ghi lại lượt này CHỈ SAU KHI mọi thứ ở trên đã thành công sạch (không record 1
-    # lượt lỗi/500 vào lịch sử).
+    # app#74 — tạo `wb.conversations` (nếu là phiên mới) VÀ ghi lại lượt này CHỈ SAU KHI mọi thứ ở
+    # trên đã thành công sạch (không để lại record nào — kể cả dòng conversation cha — cho 1 lượt
+    # lỗi/500). Xem comment dài ở chỗ resolve `conversation_id`/`history` phía trên.
+    if conversation_id is None:
+        conversation_id = await _start_new_conversation(agent_id, session.tenant_id)
+
     await _record_conversation_turn(
         conversation_id=conversation_id,
         tenant_id=session.tenant_id,
