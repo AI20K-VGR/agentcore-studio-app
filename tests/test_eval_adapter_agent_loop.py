@@ -75,6 +75,7 @@ async def test_run_case_no_longer_reads_recipe_dag_for_the_question() -> None:
         [
             'TOOL_CALL: {"tool": "kb_search", "params": {"query": "nghỉ phép?"}}',
             "Cần báo trước 3 ngày [ankor-leave-001#c1].",
+            "CO",  # engine#43 faithfulness-verify
         ]
     )
     runner = _runner(kb, llm, writer)
