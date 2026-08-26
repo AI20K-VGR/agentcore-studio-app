@@ -17,9 +17,10 @@ Không có `golden_set_ref` trong request — route này không chấm golden-se
 user: admin tự test agent đang edit không cần giả lập role nhân viên; việc đó thuộc về tab "Dùng
 thử" sau khi publish, xem `routes/chat.py`).
 
-`graph_lint(recipe)` CÓ chạy trước khi cho chat (khác `routes/chat.py`, nơi đã bỏ hẳn từ app#44 vì
-recipe published không cần kiểm lại) — chặn sớm lỗi cấu trúc DAG cho canvas đang dở, tránh tốn 1
-lượt gọi LLM trên 1 recipe sẽ bị `graph_lint` chặn lúc publish sau này.
+`enforce_agent_shape(recipe)` + `enforce_agent_topology(recipe)` CÓ chạy trước khi cho chat (khác
+`routes/chat.py`, nơi đã bỏ hẳn từ app#44 vì recipe published không cần kiểm lại) — chặn sớm lỗi
+cấu trúc DAG cho canvas đang dở, tránh tốn 1 lượt gọi LLM trên 1 recipe sẽ bị 2 hàm này chặn lúc
+publish sau này (app#78/workbench#48 — trước là 1 `graph_lint(recipe)`, nay tách 2 hàm).
 
 Trace: `run_id` tự sinh trong `run_agent_loop()`, ghi qua `PgTraceWriter` vào `obs.trace_events` —
 độc lập hoàn toàn với `wb.recipes` (không FK/JOIN), đọc lại được ngay bằng `GET /api/runs/{run_id}`
@@ -37,7 +38,7 @@ from studio_engine.agent_loop import AgentLoopExhausted
 from studio_kb.postgres import PgKbSearch
 from studio_workbench import create_recipe
 from studio_workbench.tenant_wall import ResolvedContext
-from studio_workbench.validator import graph_lint
+from studio_workbench.validator import enforce_agent_shape, enforce_agent_topology
 
 from studio_app.authz import fetch_fresh_identity, require_admin
 from studio_app.core._db import get_pool
@@ -101,9 +102,11 @@ async def _run_test_chat(agent_id: str, body: TestChatRequest, session: Resolved
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
-        graph_lint(recipe)
+        # app#78 (workbench#48 breaking rename) — xem cùng comment ở routes/publish.py::_evaluate.
+        enforce_agent_shape(recipe)
+        enforce_agent_topology(recipe)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"recipe không qua graph_lint(): {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"recipe không qua validator: {exc}") from exc
 
     # `Pool` (không phải `get_request_connection()`) — cùng lý do đã giải thích ở `routes/chat.py`/
     # `routes/publish.py` (review `app#17` đợt 4): `get_request_connection()` là connection MIDDLEWARE

@@ -72,8 +72,9 @@ from studio_workbench.tenant_wall import resolve_session
 
 from studio_app.providers.factory import build_tool_dispatch
 
-# DAG cố định 3-node (KB_RETRIEVE -> LLM_STEP -> END), giữ nguyên hình dạng `create_recipe_d4`
-# (workbench#41, đã xoá) từng dựng — `run_agent_loop()` không đọc `recipe.dag` (module docstring,
+# DAG cố định 2-node (KB_RETRIEVE -> LLM_STEP, hình sao — app#78/workbench#48: `END` bị cấm hẳn
+# từ `agent_topology_lint`, trước đây 3-node có `END` giữ nguyên hình dạng `create_recipe_d4`
+# (workbench#41, đã xoá) từng dựng) — `run_agent_loop()` không đọc `recipe.dag` (module docstring,
 # mục app#44), nên node/edge ở đây chỉ tồn tại để thoả `Recipe.dag` (field bắt buộc trên contract).
 # Hằng số module (không inline trong `certified_recipe()`) để test khác (`test_gate2_publish_
 # money_shot.py::_recipe`) import được thay vì chép tay hình dạng này — chép tay thì khẳng định
@@ -89,9 +90,8 @@ _CERTIFIED_NODES = [
         params={"query": "Nhân viên xin nghỉ phép cần báo trước bao lâu?", "top_k": 3},
     ),
     Node(id="n2", type=NodeType.LLM_STEP, params={"temperature": 0.0}),
-    Node(id="n4", type=NodeType.END, params={}),
 ]
-_CERTIFIED_EDGES = [Edge(from_="n1", to="n2"), Edge(from_="n2", to="n4")]
+_CERTIFIED_EDGES = [Edge(from_="n1", to="n2")]
 
 
 def _llm_answer(final_state: dict[str, object]) -> dict[str, object]:

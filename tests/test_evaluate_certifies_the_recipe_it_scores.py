@@ -82,14 +82,15 @@ class _StubEvalHarness:
 
 
 def _minimal_valid_dag() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """`kb-retrieve -> end`, 2 node — tối thiểu để qua được `graph_lint()` bên trong `_evaluate()`,
-    khác hẳn DAG 3-node cố định (`eval_adapter.py::_CERTIFIED_NODES`, workbench#41 — trước đây
-    `create_recipe_d4`) mà `certified_recipe()` tự dựng ở nhánh không tiêm `recipe=` (đúng điểm bài
-    này cần phân biệt: recipe canvas và recipe fallback phải là 2 thứ RÕ RÀNG khác nhau, không
-    trùng tình cờ)."""
+    """`kb-retrieve -> llm-step`, 2 node — tối thiểu để qua được `enforce_agent_shape`/
+    `enforce_agent_topology` bên trong `_evaluate()` (app#78/workbench#48 — trước đây 1
+    `graph_lint()`, cấm `end` giờ và đòi đúng 1 node llm-step), khác hẳn DAG 3-node cố định
+    (`eval_adapter.py::_CERTIFIED_NODES`, workbench#41 — trước đây `create_recipe_d4`) mà
+    `certified_recipe()` tự dựng ở nhánh không tiêm `recipe=` (đúng điểm bài này cần phân biệt:
+    recipe canvas và recipe fallback phải là 2 thứ RÕ RÀNG khác nhau, không trùng tình cờ)."""
     nodes = [
         {"id": "n1", "type": "kb-retrieve", "params": {}},
-        {"id": "n2", "type": "end", "params": {}},
+        {"id": "n2", "type": "llm-step", "params": {}},
     ]
     edges = [{"from": "n1", "to": "n2", "when": None}]
     return nodes, edges
