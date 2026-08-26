@@ -16,6 +16,7 @@ Nhóm 2 là nhóm dễ xanh giả nhất — cùng lớp lỗ đã phải vá 2 
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -671,3 +672,83 @@ async def test_an_already_inactive_admin_does_not_count_as_the_last_one(admin_po
         middleware._request_session.reset(token)  # type: ignore[arg-type]
 
     assert exc_info.value.status_code == 409
+
+
+async def _deactivate_on_its_own_connection(
+    *, system_tenant_id: UUID, caller_email: str, company_id: UUID, user_id: UUID, barrier: asyncio.Barrier
+) -> object:
+    """Chạy `deactivate_company_user` trên MỘT connection riêng, mô phỏng một request độc lập.
+
+    `ContextVar` được sao chép theo từng `Task` trong asyncio, nên hai task đặt `_request_conn`/
+    `_request_session` riêng mà không giẫm lên nhau — đúng cách middleware làm thật.
+
+    `barrier` để hai bên vào route gần như cùng lúc; không có nó, `gather` vẫn có thể chạy tuần tự
+    và bài test xanh giả."""
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        conn_token = middleware._request_conn.set(conn)
+        session_token = _set_session(tenant_id=system_tenant_id, user=caller_email, system_roles=["superadmin"])
+        try:
+            await barrier.wait()
+            return await deactivate_company_user(str(company_id), str(user_id))
+        except HTTPException as exc:
+            return exc
+        finally:
+            middleware._request_session.reset(session_token)  # type: ignore[arg-type]
+            middleware._request_conn.reset(conn_token)
+
+
+async def test_two_concurrent_deactivations_cannot_empty_a_company_of_admins(admin_pool: Pool) -> None:
+    """Review app#77 (TranBaDat2607) — chốt "không để công ty còn 0 admin" là check-rồi-ghi.
+
+    Công ty có admin A và B. Hai request đồng thời vô hiệu hoá A và B: mỗi bên đếm "admin khác
+    người mình đang tắt" và **đều** thấy người kia ⇒ cả hai đi qua. Hai `UPDATE` chạm hai dòng khác
+    nhau nên không đụng row-lock nào ⇒ cả hai commit ⇒ công ty còn 0 admin.
+
+    `test_cannot_deactivate_the_LAST_active_admin_of_a_company` chạy MỘT luồng nên không chạm tới
+    được lớp lỗi này — đó là giới hạn của mọi bài đơn luồng, không phải sơ suất của bài đó. Bài này
+    dựng đúng hai request song song, mỗi request một connection riêng như thật.
+
+    `wait_for` bọc ngoài: nếu khoá đặt sai thứ tự và hai bên deadlock, bài phải ĐỎ trong 20 giây
+    chứ không treo cả suite."""
+    system_tenant_id = await _seed_superadmin(admin_pool, "race")
+    company_id = await _seed_tenant(admin_pool, "ankor-race")
+    admin_a = await _seed_user(admin_pool, company_id, "a@ankor-race.test", ["admin"])
+    admin_b = await _seed_user(admin_pool, company_id, "b@ankor-race.test", ["admin"])
+
+    barrier = asyncio.Barrier(2)
+    caller = f"race-{SUPERADMIN_EMAIL}"
+    results = await asyncio.wait_for(
+        asyncio.gather(
+            _deactivate_on_its_own_connection(
+                system_tenant_id=system_tenant_id,
+                caller_email=caller,
+                company_id=company_id,
+                user_id=admin_a,
+                barrier=barrier,
+            ),
+            _deactivate_on_its_own_connection(
+                system_tenant_id=system_tenant_id,
+                caller_email=caller,
+                company_id=company_id,
+                user_id=admin_b,
+                barrier=barrier,
+            ),
+        ),
+        timeout=20,
+    )
+
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT count(*) FROM core.users WHERE tenant_id = %s AND is_active AND 'admin' = ANY(system_roles)",
+            (str(company_id),),
+        )
+        row = await cur.fetchone()
+    assert row is not None
+    assert row[0] >= 1, "hai request đồng thời đã vét sạch admin của công ty — chốt thua race"
+
+    # Và đúng MỘT bên bị từ chối: cả hai cùng qua là đã hỏng ở trên, cả hai cùng trượt thì chốt siết
+    # quá tay và công ty không tắt nổi admin nào.
+    refused = [r for r in results if isinstance(r, HTTPException)]
+    assert len(refused) == 1, f"phải đúng 1 request bị chặn, thấy {len(refused)}"
+    assert refused[0].status_code == 409

@@ -504,6 +504,30 @@ async def _resolve_company(conn: AsyncConnection[Any], tenant_id: str) -> UUID:
     return UUID(str(row[0]))
 
 
+async def _lock_tenant_admins(conn: AsyncConnection[Any], tenant_id: UUID) -> None:
+    """Khoá mọi dòng admin **đang hoạt động** của một tenant tới hết transaction, trước khi đếm.
+
+    Chốt "không để công ty còn 0 admin" là check-rồi-ghi, và nếu không khoá thì nó **thua race**
+    (review app#77, TranBaDat2607): công ty có admin A và B, hai request đồng thời vô hiệu hoá A và
+    B. Request 1 đếm "admin khác A đang hoạt động" ⇒ thấy B ⇒ 1 ⇒ cho qua. Request 2 đếm "admin
+    khác B" ⇒ thấy A ⇒ 1 ⇒ cũng cho qua. Hai câu `UPDATE` chạm **hai dòng khác nhau** nên không
+    đụng row-lock nào — cả hai commit, công ty còn 0 admin. Đúng bất biến mà chốt này dựng ra để
+    giữ, và một chốt thua race thì không phải chốt.
+
+    `FOR UPDATE` trên chính tập đang đếm, không phải trên dòng bị sửa: dòng bị sửa là A ở request
+    này và B ở request kia, nên khoá theo dòng-bị-sửa không serialize được đúng con số 0. Khoá cả
+    tập thì request thứ hai chờ, rồi **đếm lại** và thấy A đã tắt ⇒ 409 đúng.
+
+    `ORDER BY id` không phải để đẹp: hai transaction lấy khoá theo thứ tự khác nhau trên cùng tập
+    dòng là công thức deadlock. Cùng thứ tự ⇒ một bên chờ, không bên nào chết.
+    """
+    await conn.execute(
+        "SELECT id FROM core.users "
+        "WHERE tenant_id = %s AND is_active AND 'admin' = ANY(system_roles) ORDER BY id FOR UPDATE",
+        (str(tenant_id),),
+    )
+
+
 async def _fetch_user_in_company(conn: AsyncConnection[Any], user_id: str, tenant_id: UUID) -> None:
     """Bản superadmin của `_fetch_user_in_own_tenant` — cùng lý do trả 404 (không phải 403) khi
     `user_id` không thuộc công ty đang thao tác: không xác nhận/phủ nhận id đó có tồn tại ở công ty
@@ -660,17 +684,24 @@ async def update_company(tenant_id: str, body: UpdateCompanyRequest) -> CompanyS
         # (quên map field), trả 400 để nó vỡ ra ngay thay vì "200 nhưng chẳng đổi gì".
         raise HTTPException(status_code=400, detail="Cần ít nhất 1 trong 2 trường: name, is_active.")
 
+    # Hai câu `UPDATE` trong CÙNG một `conn.transaction()` — cùng lý do `create_company` đã chốt:
+    # `HTTPException` bị FastAPI biến thành response NGAY trong `call_next()`, nên nó không bao giờ
+    # propagate tới `async with pool.connection()` của middleware, và transaction ngoài COMMIT bình
+    # thường. Không bọc thì câu chạy trước được commit còn câu sau thì không — hôm nay chưa vỡ vì
+    # `name` là cột UNIQUE duy nhất và luôn chạy trước, nhưng đó là một sự thật về THỨ TỰ HAI DÒNG
+    # CODE, không phải một bất biến (review app#77, TranBaDat2607).
     try:
-        if body.name is not None:
-            await conn.execute(
-                "UPDATE core.tenants SET name = %s WHERE id = %s",
-                (body.name, str(target_tenant_id)),
-            )
-        if body.is_active is not None:
-            await conn.execute(
-                "UPDATE core.tenants SET is_active = %s WHERE id = %s",
-                (body.is_active, str(target_tenant_id)),
-            )
+        async with conn.transaction():
+            if body.name is not None:
+                await conn.execute(
+                    "UPDATE core.tenants SET name = %s WHERE id = %s",
+                    (body.name, str(target_tenant_id)),
+                )
+            if body.is_active is not None:
+                await conn.execute(
+                    "UPDATE core.tenants SET is_active = %s WHERE id = %s",
+                    (body.is_active, str(target_tenant_id)),
+                )
     except psycopg.errors.UniqueViolation as exc:
         raise HTTPException(status_code=409, detail=f"công ty {body.name!r} đã tồn tại") from exc
 
@@ -716,6 +747,9 @@ async def deactivate_company_user(tenant_id: str, user_id: str) -> UserSummary:
     target_tenant_id = await _resolve_company(conn, tenant_id)
     await _fetch_user_in_company(conn, user_id, target_tenant_id)
 
+    # Khoá TRƯỚC khi đếm — xem `_lock_tenant_admins`. Không có bước này, hai request đồng thời vô
+    # hiệu hoá hai admin khác nhau đều thấy "vẫn còn người kia" và cùng đi qua.
+    await _lock_tenant_admins(conn, target_tenant_id)
     cur = await conn.execute(
         "SELECT count(*) FROM core.users "
         "WHERE tenant_id = %s AND is_active AND 'admin' = ANY(system_roles) AND id <> %s",
