@@ -689,6 +689,12 @@ async def _deactivate_on_its_own_connection(
         conn_token = middleware._request_conn.set(conn)
         session_token = _set_session(tenant_id=system_tenant_id, user=caller_email, system_roles=["superadmin"])
         try:
+            # Mở transaction TRƯỚC hàng rào. `psycopg` mở lazily ở câu lệnh đầu tiên, nên nếu để
+            # bước đó rơi vào sau hàng rào thì một task có thể còn đang dựng transaction trong khi
+            # task kia đã đếm xong — hai bên không thật sự chồng nhau, và bài test dễ xanh giả.
+            # Đo được: mutant bỏ khoá chết 5/5 khi chạy riêng nhưng sống sót một lần trong lượt
+            # chạy cả file, đúng do chênh lệch thời điểm này.
+            await conn.execute("SELECT 1")
             await barrier.wait()
             return await deactivate_company_user(str(company_id), str(user_id))
         except HTTPException as exc:
