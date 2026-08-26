@@ -11,17 +11,21 @@ bao giờ UPDATE", nên đếm số lần gọi (1 vs 2) là bằng chứng đ�
 from __future__ import annotations
 
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from uuid import UUID
 
 import pytest
+from psycopg.sql import SQL, Composed
 from studio_contracts import AgentConfig, Dag, KbBinding, Node, NodeType, Recipe, ScorecardThreshold
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-# `scripts/` không phải package trong bất kỳ `src/` layout nào (mypy `strict=true` không resolve
-# được qua sys.path runtime ở trên) — cùng khuôn `# type: ignore[import-untyped]` đã dùng ở
-# `packages/engine/scripts/{run_golden_batch,embed_harness}.py` cho lý do tương tự.
-from backfill_kb_search_whitelist import _backfill_table, _parse_execute_flag  # type: ignore[import-not-found]  # noqa: E402, I001
+# `scripts/` không phải package cài đặt (không nằm trong `src/` layout nào) — import runtime này
+# CẦN `sys.path.insert()` ở trên để pytest chạy được, nhưng mypy (`uv run mypy packages apps`, quét
+# TOÀN BỘ cây file dưới `apps/`) tự thấy `backfill_kb_search_whitelist.py` qua duyệt thư mục, không
+# cần sys.path — review dholmes0207: 1 `# type: ignore[import-not-found]` từng đặt ở đây bị mypy
+# báo THỪA (`unused-ignore`) đúng vì lý do này, đã gỡ.
+from backfill_kb_search_whitelist import _backfill_table, _parse_execute_flag  # noqa: E402, I001
 
 _TENANT = UUID("a0000000-0000-0000-0000-000000000001")
 
@@ -61,23 +65,27 @@ def _recipe_needing_patch() -> Recipe:
 
 
 class _FakeCursor:
-    def __init__(self, rows: list[tuple[object, ...]]) -> None:
+    def __init__(self, rows: list[tuple[object, object, object, object]]) -> None:
         self._rows = rows
 
-    async def fetchall(self) -> list[tuple[object, ...]]:
+    async def fetchall(self) -> list[tuple[object, object, object, object]]:
         return self._rows
 
 
 class _FakeConn:
     """`AsyncConnection` giả — chỉ ghi lại MỖI lần `execute()` được gọi (query + params), không thật
     sự chạm DB nào. Luôn trả cùng 1 hàng SELECT cho mọi lần gọi (đủ dùng: `_backfill_table` chỉ
-    `fetchall()` ngay sau lần gọi ĐẦU TIÊN — lần UPDATE, nếu có, không đọc lại cursor)."""
+    `fetchall()` ngay sau lần gọi ĐẦU TIÊN — lần UPDATE, nếu có, không đọc lại cursor).
 
-    def __init__(self, select_rows: list[tuple[object, ...]]) -> None:
-        self.calls: list[tuple[object, object]] = []
+    Chữ ký `execute()` khớp CHÍNH XÁC `_RowSource` Protocol (`query: SQL | Composed`,
+    `params: Sequence[object] | None`, cả 2 positional-only qua `/`) — không chỉ "đủ rộng để hoạt
+    động", mà đúng bề mặt kiểu review dholmes0207 đòi hỏi (mypy unscoped bắt được nếu lệch)."""
+
+    def __init__(self, select_rows: list[tuple[object, object, object, object]]) -> None:
+        self.calls: list[tuple[SQL | Composed, Sequence[object] | None]] = []
         self._select_rows = select_rows
 
-    async def execute(self, query: object, params: object = None) -> _FakeCursor:
+    async def execute(self, query: SQL | Composed, params: Sequence[object] | None = None, /) -> _FakeCursor:
         self.calls.append((query, params))
         return _FakeCursor(self._select_rows)
 

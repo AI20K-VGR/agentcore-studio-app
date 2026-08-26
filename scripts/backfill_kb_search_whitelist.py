@@ -83,7 +83,15 @@ Giữ nguyên giá trị `recipe_hash` cũ trên các dòng bị vá — cùng �
 `recipe_hash` của dòng cũ không còn re-verify được từ 1 `model_dump` MỚI (vì nội dung đã đổi), nhưng
 `rollback()` mang `history_recipe_hash` đi NGUYÊN VẸN thay vì tính lại nên không vỡ. Bất cứ đường
 nào TỰ tính lại rồi so với `recipe_hash` cũ trên dòng đã vá thì không còn khớp — chấp nhận, grep
-toàn repo lúc viết script này không thấy đường nào làm vậy ngoài chính lúc publish.
+toàn repo lúc viết script này không thấy đường CODE nào làm vậy ngoài chính lúc publish.
+
+**Ngoại lệ — quy trình KIỂM TRA THỦ CÔNG bằng lời, không phải code** (review dholmes0207,
+`packages/workbench/src/studio_workbench/schema.py`'s docstring `wb.recipes`): tài liệu ở đó dạy
+người vận hành tự xác minh 1 dòng bằng cách tính lại
+`publish.recipe_hash(Recipe.model_validate(row["recipe"]))` rồi so với `recipe_hash` đã lưu. Quy
+trình đó THẤT BẠI cho MỌI dòng đã bị script này vá (đúng như phần trên đã nói — không phải bug
+mới), nhưng tài liệu ở `schema.py` không nói nó ngừng đúng sau 1 lần backfill. Người chạy quy trình
+kiểm tra đó trên 1 dòng đã vá sẽ thấy hash "không khớp" và có thể tưởng nhầm là dữ liệu hỏng.
 
 ## RLS
 `wb.recipes`/`wb.recipe_versions` đều `FORCE ROW LEVEL SECURITY` — `studio_owner` (`get_admin_pool`)
@@ -100,9 +108,12 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import Sequence
+from typing import Protocol
 from uuid import UUID
 
-from psycopg import AsyncConnection, sql
+from psycopg import sql
+from psycopg.sql import SQL, Composed
 from pydantic import ValidationError
 from studio_app.core._db import Pool, close_pools, get_admin_pool
 from studio_contracts import Recipe
@@ -112,6 +123,32 @@ from studio_workbench.recipe_ops import with_kb_search_whitelisted
 _TABLES: list[tuple[str, str]] = [("wb", "recipes"), ("wb", "recipe_versions")]
 
 _KNOWN_FLAGS = {"--execute"}
+
+
+class _RowCursor(Protocol):
+    """Đúng phần bề mặt `_backfill_table` chạm tới sau `execute()` — `fetchall()` trên kết quả
+    `SELECT id, agent_id, version, recipe FROM ...` (4 cột/dòng)."""
+
+    async def fetchall(self) -> Sequence[tuple[object, object, object, object]]: ...
+
+
+class _RowSource(Protocol):
+    """Review dholmes0207 (PR backfill script, sau khi 6 finding đầu đã xử) — `_backfill_table`
+    chỉ gọi `execute()`, không cần cả bề mặt `psycopg.AsyncConnection` thật. Khai `Protocol` hẹp
+    đúng thứ dùng thay vì annotate `conn: AsyncConnection`: mypy UNSCOPED (`uv run mypy packages
+    apps`, job `lint` của kit gốc — khác job CI riêng của repo này, chạy SAU khi con trỏ kit đã bump
+    đủ để `AsyncConnection`/`with_kb_search_whitelisted` resolve thật, không còn bị `Any` che) từ
+    chối `_FakeConn` (double trong test) làm `AsyncConnection` thật — structural typing qua
+    `Protocol` giải quyết đúng chỗ, không phải nới kiểu về `Any`/thêm `# type: ignore`.
+
+    `query: SQL | Composed` khớp ĐÚNG (không chỉ "đủ rộng") kiểu `sql.SQL(...)`/
+    `sql.SQL(...).format(...)` thật sự trả về ở dưới. Từng thử `Composable` (lớp cha chung của
+    `SQL`/`Composed`/`Identifier`...) — mypy vẫn từ chối `AsyncConnection` thật thoả Protocol, vì
+    `execute()` thật là 2 `@overload` khai `str | bytes | SQL | Composed` / `Template` cho `query`,
+    không phải `Composable` trần — so khớp Protocol với method có overload đòi type CHÍNH XÁC
+    nằm trong hợp union đó, `Composable` (rộng hơn) vẫn trượt dù về logic là superset hợp lệ."""
+
+    async def execute(self, query: SQL | Composed, params: Sequence[object] | None = ..., /) -> _RowCursor: ...
 
 
 async def _tenant_ids(admin: Pool) -> list[UUID]:
@@ -135,9 +172,7 @@ class _TableStats:
         self.skipped = 0
 
 
-async def _backfill_table(
-    conn: AsyncConnection, schema: str, table: str, tenant_id: UUID, *, execute: bool
-) -> _TableStats:
+async def _backfill_table(conn: _RowSource, schema: str, table: str, tenant_id: UUID, *, execute: bool) -> _TableStats:
     """1 bảng, 1 tenant đã bind `app.tenant_id` qua `SET LOCAL` trên `conn` (caller lo việc bind)."""
     ident = sql.Identifier(schema, table)
     cursor = await conn.execute(sql.SQL("SELECT id, agent_id, version, recipe FROM {}").format(ident))
