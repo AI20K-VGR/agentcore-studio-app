@@ -54,6 +54,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -94,9 +95,25 @@ _MAX_WORDS = 200_000
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
+# "đ"/"Đ" (U+0111/U+0110) không có NFKD decomposition — khác các nguyên âm có dấu (vd "ế" → "e" +
+# dấu kết hợp), Unicode coi đây là MỘT chữ cái gốc riêng, không phải "d" + dấu. Không dịch tay thì
+# `.encode("ascii", "ignore")` bên dưới xoá mất luôn cả phụ âm ("Đà Nẵng" → "a-nang" thay vì
+# "da-nang") thay vì chỉ mất dấu.
+_DIACRITIC_TRANSLATION = str.maketrans("đĐ", "dD")
+
 
 def _slugify(value: str) -> str:
-    slug = _SLUG_RE.sub("-", value.strip().lower()).strip("-")
+    """Hạ dấu tiếng Việt về chữ cái gốc TRƯỚC khi lọc, không phải gộp cả cụm có dấu thành "-".
+
+    Trước bản vá này, `_SLUG_RE` (chỉ giữ `[a-z0-9]`) coi mọi nguyên âm có dấu là ký tự lạ y hệt
+    khoảng trắng — "Nghỉ phép" ra `"ngh-ph-p"` (mất cả "i"/"e") thay vì `"nghi-phep"`. Dùng
+    `unicodedata.normalize("NFKD", ...)` tách nguyên âm có dấu thành chữ cái gốc + dấu kết hợp rồi
+    `encode("ascii", "ignore")` bỏ riêng phần dấu, để `_SLUG_RE` chỉ còn phải lo khoảng trắng/dấu
+    câu thật — không đụng gì tới tập case đã khoá trong `test_upload_doc_id_la_slug_ten_file`
+    (chuỗi thuần ASCII qua `unicodedata.normalize` không đổi)."""
+    decomposed = unicodedata.normalize("NFKD", value.translate(_DIACRITIC_TRANSLATION))
+    ascii_value = decomposed.encode("ascii", "ignore").decode("ascii")
+    slug = _SLUG_RE.sub("-", ascii_value.strip().lower()).strip("-")
     return slug or "doc"
 
 
@@ -276,10 +293,12 @@ async def upload_document(
     # `ON CONFLICT DO UPDATE` đè lẫn nhau (`postgres.py::_UPSERT`) nếu thiếu tiền tố này. Không
     # dùng tên hiển thị công ty (có thể trùng giữa 2 tenant).
     # Hậu tố hash 8-hex của TÊN FILE GỐC (trước `_slugify`) — review app#27 (dholmes0207): 2 tên
-    # file khác nhau (vd "HR-Policy.md" / "hr policy.md", hay tên tiếng Việt có dấu bị `_slugify`
-    # gộp hết thành "-") có thể slugify ra CÙNG chuỗi — hash giữ `chunk_id_prefix` (PK) tách biệt
-    # cho 2 upload khác nhau dù trùng slug. Hash bám theo tên gốc nên cùng 1 file re-upload nguyên
-    # tên vẫn ra đúng `chunk_id_prefix` cũ (idempotent), chỉ tên khác mới tách riêng.
+    # file khác nhau (vd "HR-Policy.md" / "hr policy.md") có thể slugify ra CÙNG chuỗi — hash giữ
+    # `chunk_id_prefix` (PK) tách biệt cho 2 upload khác nhau dù trùng slug. Hash bám theo tên gốc
+    # nên cùng 1 file re-upload nguyên tên vẫn ra đúng `chunk_id_prefix` cũ (idempotent), chỉ tên
+    # khác mới tách riêng. (`_slugify` từng gộp cả cụm có dấu tiếng Việt thành 1 dấu "-" — nay hạ
+    # dấu về chữ cái gốc thay vì xoá cụm, xem docstring `_slugify` — không còn là ví dụ va chạm
+    # dùng được ở đây, nhưng hash vẫn cần cho ca ASCII phía trên.)
     #
     # `doc_id` (cột riêng, KHÔNG phải PK) = `{slug(section_role)}-{slug(stem)}` — khoá con người
     # dùng để xoá theo tài liệu (`KbPipeline.delete_by_doc_id`). PHẢI mang `section_role` — review

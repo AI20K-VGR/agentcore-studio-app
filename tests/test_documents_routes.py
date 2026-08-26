@@ -483,6 +483,18 @@ def test_word_cap_khong_siet_cua_dang_mo() -> None:
     assert documents_module._MAX_WORDS >= 200_000
 
 
+def test_slugify_ha_dau_tieng_viet_ve_chu_cai_goc() -> None:
+    """`_slugify` trước bản vá chỉ giữ `[a-z0-9]`, nên MỖI nguyên âm có dấu (nằm ngoài tập đó) bị
+    gộp chung với khoảng trắng xung quanh thành một dấu `-` — "Nghỉ phép" ra `"ngh-ph-p"` chứ
+    không phải `"nghi-phep"`. Bản vá phải hạ dấu về chữ cái gốc TRƯỚC khi lọc, để mỗi âm tiết vẫn
+    còn nguyên chữ cái của nó, đúng cách một slug tiếng Việt nên đọc được ngược lại là từ gì."""
+    assert documents_module._slugify("Nghỉ phép") == "nghi-phep"
+    # "đ" (U+0111) không có decomposition NFKD — không tự rã ra "d" + dấu như các nguyên âm khác,
+    # nên cần xử lý riêng, không thì bị `.encode("ascii", "ignore")` xoá mất luôn cả phụ âm.
+    assert documents_module._slugify("Chế độ nghỉ phép") == "che-do-nghi-phep"
+    assert documents_module._slugify("Đà Nẵng") == "da-nang"
+
+
 async def test_upload_rejects_corrupt_docx_bang_422_khong_phai_500(admin_pool: Pool) -> None:
     """Đuôi `.docx` nhưng ruột không phải gói OOXML — thao tác thật: bị báo "chỉ nhận
     .md/.txt/.docx" rồi đổi thẳng đuôi `.doc`/`.pdf` thành `.docx`.
