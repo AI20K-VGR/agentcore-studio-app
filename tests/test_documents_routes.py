@@ -94,9 +94,10 @@ async def test_company_admin_uploads_document(admin_pool: Pool) -> None:
     assert result.section_role == "hr"
     assert result.chunk_count == 1
     # `doc_id` (cột `kb.chunks.doc_id`, tách khỏi PK `chunk_id`) = `{slug(section_role)}-{slug(tên
-    # file)}`, KHÔNG còn tenant-hex-prefixed — xem docstring `routes/documents.py` (quyết định
-    # doc_id column, review app#58).
-    assert result.doc_id == "hr-leave"
+    # file)}-{đuôi file}`, KHÔNG còn tenant-hex-prefixed — xem docstring `routes/documents.py`
+    # (quyết định doc_id column, review app#58; đuôi file thêm sau, phát hiện thật trên tenant
+    # Ricons — xem `test_hai_duoi_file_cung_ten_khong_ghi_de_nhau`).
+    assert result.doc_id == "hr-leave-md"
 
     async with admin_pool.connection() as conn:
         # `kb.chunks` có `FORCE ROW LEVEL SECURITY` — cắn cả owner nếu chưa `set_config`
@@ -109,9 +110,9 @@ async def test_company_admin_uploads_document(admin_pool: Pool) -> None:
 
 
 async def test_upload_doc_id_la_slug_ten_file(admin_pool: Pool) -> None:
-    """`doc_id` = `{slug(section_role)}-{slug(stem)}` — hoa/khoảng trắng trong tên file phải bị
-    gộp/hạ chữ (khớp quyết định doc_id column, khác `chunk_id_prefix` vẫn giữ hash để tránh đụng
-    PK)."""
+    """`doc_id` = `{slug(section_role)}-{slug(stem)}-{đuôi file}` — hoa/khoảng trắng trong tên
+    file phải bị gộp/hạ chữ (khớp quyết định doc_id column, khác `chunk_id_prefix` vẫn giữ hash để
+    tránh đụng PK)."""
     tenant_id = await _seed_tenant(admin_pool, "documents-probe-m")
     admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
     await _seed_section(admin_pool, tenant_id, "hr", admin_id)
@@ -127,7 +128,7 @@ async def test_upload_doc_id_la_slug_ten_file(admin_pool: Pool) -> None:
     finally:
         middleware._request_session.reset(token)  # type: ignore[arg-type]
 
-    assert result.doc_id == "hr-bao-cao-q1"
+    assert result.doc_id == "hr-bao-cao-q1-md"
     # `doc_name` KHÔNG qua `_slugify` — giữ nguyên hoa/thường/khoảng trắng của tên file gốc, khác
     # hẳn `doc_id`. Đây là điểm luật hiển thị đòi hỏi: `doc_id` mất thông tin (chữ hoa, khoảng
     # trắng) nên không dùng được để hiện lên UI.
@@ -200,6 +201,46 @@ async def test_reupload_ten_trung_khac_phong_ban_khong_xoa_nham(admin_pool: Pool
         )
         rows = await cur.fetchall()
     assert dict(rows) == {"hr": 1, "finance": 1}, "cả hai tài liệu phải còn sống — không cái nào bị xoá nhầm"
+
+
+async def test_hai_duoi_file_cung_ten_khong_ghi_de_nhau(admin_pool: Pool) -> None:
+    """2 file GỐC khác nhau, CÙNG `section_role`, CÙNG stem (`Path.stem` bỏ đuôi trước khi vào
+    `doc_id`), khác đuôi (`.md` vs `.txt`) — trước bản vá này, `doc_id` không mang đuôi file nên
+    2 file đụng `doc_id`, file sau ghi đè êm file trước qua `delete_by_doc_id` (tái hiện đúng ca
+    thật: `quy chế lương thưởng - hr.docx` và `quy chế lương thưởng - hr.md` cùng tồn tại trên đĩa
+    nhưng chỉ 1 trong 2 sống sót trong `kb.chunks`). `doc_id` giờ mang thêm đuôi file
+    (`{slug(role)}-{slug(stem)}-{đuôi}`) nên 2 file này phải là 2 tài liệu ĐỘC LẬP, không cái nào
+    xoá cái kia."""
+    tenant_id = await _seed_tenant(admin_pool, "documents-probe-q")
+    admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+    await _seed_section(admin_pool, tenant_id, "hr", admin_id)
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
+    try:
+        async with _simulate_request_connection():
+            md_result = await upload_document(
+                file=_md_upload_file("quy che luong thuong.md", b"## Muc luong\nQuy dinh muc luong co ban."),
+                section_role="hr",
+                tenant_id=None,
+            )
+            txt_result = await upload_document(
+                file=_md_upload_file("quy che luong thuong.txt", b"Quy dinh muc thuong quy cua cong ty."),
+                section_role="hr",
+                tenant_id=None,
+            )
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert md_result.doc_id != txt_result.doc_id
+
+    async with admin_pool.connection() as conn:
+        await conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(tenant_id),))
+        cur = await conn.execute(
+            "SELECT doc_id, count(*) FROM kb.chunks WHERE tenant_id = %s GROUP BY doc_id",
+            (str(tenant_id),),
+        )
+        rows = dict(await cur.fetchall())
+    assert rows == {md_result.doc_id: 1, txt_result.doc_id: 1}, "cả hai đuôi file phải còn sống — không cái nào bị đè"
 
 
 async def test_reupload_cung_doc_id_xoa_orphan_chunk(admin_pool: Pool) -> None:
@@ -481,6 +522,18 @@ def test_word_cap_khong_siet_cua_dang_mo() -> None:
     ở văn xuôi thật — chọn 200.000 nằm trên mức văn xuôi thật, và ca suy biến 1-ký-tự-mỗi-từ
     không phải tài liệu người ta upload."""
     assert documents_module._MAX_WORDS >= 200_000
+
+
+def test_slugify_ha_dau_tieng_viet_ve_chu_cai_goc() -> None:
+    """`_slugify` trước bản vá chỉ giữ `[a-z0-9]`, nên MỖI nguyên âm có dấu (nằm ngoài tập đó) bị
+    gộp chung với khoảng trắng xung quanh thành một dấu `-` — "Nghỉ phép" ra `"ngh-ph-p"` chứ
+    không phải `"nghi-phep"`. Bản vá phải hạ dấu về chữ cái gốc TRƯỚC khi lọc, để mỗi âm tiết vẫn
+    còn nguyên chữ cái của nó, đúng cách một slug tiếng Việt nên đọc được ngược lại là từ gì."""
+    assert documents_module._slugify("Nghỉ phép") == "nghi-phep"
+    # "đ" (U+0111) không có decomposition NFKD — không tự rã ra "d" + dấu như các nguyên âm khác,
+    # nên cần xử lý riêng, không thì bị `.encode("ascii", "ignore")` xoá mất luôn cả phụ âm.
+    assert documents_module._slugify("Chế độ nghỉ phép") == "che-do-nghi-phep"
+    assert documents_module._slugify("Đà Nẵng") == "da-nang"
 
 
 async def test_upload_rejects_corrupt_docx_bang_422_khong_phai_500(admin_pool: Pool) -> None:
