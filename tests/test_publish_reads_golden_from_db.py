@@ -133,6 +133,19 @@ async def _bind(conn: Any, tenant_id: UUID) -> None:
     await conn.execute(sql.SQL("SET LOCAL app.tenant_id = {}").format(sql.Literal(str(tenant_id))))
 
 
+async def _seed_tenant_row(conn: Any, tenant_id: UUID, name: str) -> None:
+    """`core.tenants` phải có dòng cho tenant của phiên.
+
+    `_evaluate` giờ đọc `core.tenants.name` để dựng bảng tra tenant cho `EvalHarness` — trước bản
+    vá đó nó dùng fixture `TENANT_IDS` (chỉ 2 tenant demo), nên mọi tenant thật ném `KeyError`.
+    Bài này vốn chỉ seed `eval.golden_sets` mà bỏ qua `core.tenants`; ở production thì tenant của
+    phiên LUÔN có dòng ở đó (JWT phân giải qua chính bảng này), nên seed cho khớp thực tế."""
+    await conn.execute(
+        "INSERT INTO core.tenants (id, name) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING",
+        (str(tenant_id), name),
+    )
+
+
 async def test_bo_case_di_vao_harness_den_tu_db_chu_khong_phai_file(
     admin_pool: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -145,6 +158,7 @@ async def test_bo_case_di_vao_harness_den_tu_db_chu_khong_phai_file(
 
     async with admin_pool.connection() as conn, conn.transaction():
         await _bind(conn, ANKOR_ID)
+        await _seed_tenant_row(conn, ANKOR_ID, "ankor")
         await write_golden_set(conn, hai_case, ANKOR_ID)
 
         token = middleware._request_conn.set(conn)
@@ -248,6 +262,7 @@ async def test_moi_tenant_doc_bo_cua_rieng_minh(
     async def _chay(tenant_id: UUID, case_id: str) -> list[str]:
         async with admin_pool.connection() as conn, conn.transaction():
             await _bind(conn, tenant_id)
+            await _seed_tenant_row(conn, tenant_id, "ankor" if tenant_id == ANKOR_ID else "borea")
             await write_golden_set(conn, GoldenSet(golden_set_ref=ref, cases=[_case(case_id)]), tenant_id)
             token = middleware._request_conn.set(conn)
             try:

@@ -81,6 +81,11 @@ class _StubEvalHarness:
         )
 
 
+async def _fake_tenant_name(tenant_id: object) -> str:  # noqa: ARG001
+    """Tên tenant giả cho bài không dựng connection request-scope."""
+    return "ankor"
+
+
 def _minimal_valid_dag() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """`kb-retrieve -> llm-step`, 2 node — tối thiểu để qua được `enforce_agent_shape`/
     `enforce_agent_topology` bên trong `_evaluate()` (app#78/workbench#48 — trước đây 1
@@ -129,6 +134,10 @@ async def test_evaluate_injects_the_canvas_recipe_it_returns_into_the_runner(
     del pool  # chỉ để trigger skip-nếu-thiếu-DSN đúng quy ước chung của suite, không tự query
     monkeypatch.setattr(publish_module, "EngineAgentRunner", _SpyEngineAgentRunner)
     monkeypatch.setattr(publish_module, "_load_golden_set", _fake_load_golden_set)
+    # `_evaluate` giờ đọc `core.tenants.name` để dựng bảng tra tenant cho `EvalHarness` (trước là
+    # fixture `TENANT_IDS` chỉ có 2 tenant demo, nên mọi tenant thật ném `KeyError`). Bài này stub
+    # tầng DB, nên stub luôn chỗ đọc mới — cùng lý do `_load_golden_set` đã được stub ngay trên.
+    monkeypatch.setattr(publish_module, "_tenant_name", _fake_tenant_name)
     monkeypatch.setattr(publish_module, "EvalHarness", _StubEvalHarness)
 
     nodes, edges = _minimal_valid_dag()

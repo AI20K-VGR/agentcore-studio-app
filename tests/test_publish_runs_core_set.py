@@ -70,6 +70,11 @@ class _StubEvalHarness:
         )
 
 
+async def _fake_tenant_name(tenant_id: object) -> str:  # noqa: ARG001
+    """Tên tenant giả cho bài không dựng connection request-scope."""
+    return "ankor"
+
+
 def _settings(tmp_path: Path) -> Settings:
     return Settings(
         database_url="postgresql://unused/unused",
@@ -111,6 +116,10 @@ async def _capture_run_kwargs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     monkeypatch.setattr(publish_module, "get_pool", _sentinel_pool)
     monkeypatch.setattr(publish_module, "EngineAgentRunner", _SpyRunner)
     monkeypatch.setattr(publish_module, "_load_golden_set", _fake_load_golden_set)
+    # `_evaluate` giờ đọc `core.tenants.name` để dựng bảng tra tenant cho `EvalHarness` (trước là
+    # fixture `TENANT_IDS` chỉ có 2 tenant demo, nên mọi tenant thật ném `KeyError`). Bài này stub
+    # tầng DB, nên stub luôn chỗ đọc mới — cùng lý do `_load_golden_set` đã được stub ngay trên.
+    monkeypatch.setattr(publish_module, "_tenant_name", _fake_tenant_name)
     monkeypatch.setattr(publish_module, "EvalHarness", _StubEvalHarness)
     monkeypatch.setattr(publish_module, "get_settings", lambda: _settings(tmp_path))
 

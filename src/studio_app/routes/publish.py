@@ -31,17 +31,31 @@ recipe được băm giờ CHÍNH LÀ recipe được harness chạy qua từng 
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, ValidationError
-from studio_contracts import Edge, Node, Recipe, Scorecard
+from studio_contracts import Edge, Node, NodeType, Recipe, Scorecard
 from studio_engine.agent_loop import AgentLoopExhausted
+from studio_evalhub.eval_job_store import (
+    create_eval_job,
+    fail_eval_job,
+    finish_eval_job,
+    read_eval_job,
+    record_job_progress,
+    sweep_stale_jobs,
+)
 from studio_evalhub.golden_case import GoldenSet
 from studio_evalhub.golden_store import GoldenSetNotFound, GoldenSetScopeError, read_golden_set
 from studio_evalhub.harness import EvalHarness
 from studio_evalhub.judge import LLMJudge
+from studio_evalhub.no_kb_golden import NO_KB_TENANT_LABEL, no_kb_golden_set
+from studio_evalhub.scorecard_store import read_pending_scorecard, write_pending_scorecard
 from studio_kb.doc_factory import TENANT_IDS
 from studio_kb.postgres import PgKbSearch
 from studio_workbench import create_recipe
@@ -49,8 +63,10 @@ from studio_workbench.publish import publish, recipe_hash
 from studio_workbench.tenant_wall import ResolvedContext
 from studio_workbench.validator import enforce_agent_shape, enforce_agent_topology
 
+from studio_app import middleware
 from studio_app.authz import fetch_fresh_identity, require_admin
 from studio_app.core._db import get_pool
+from studio_app.core.golden_autogen import auto_golden_set_ref
 from studio_app.eval_adapter import EngineAgentRunner
 from studio_app.middleware import get_request_connection, get_request_session
 from studio_app.obs.trace_writer import PgTraceWriter
@@ -58,6 +74,10 @@ from studio_app.providers.factory import build_embedding, build_llm
 from studio_app.settings import get_settings
 
 router = APIRouter(prefix="/api/agents", tags=["publish"])
+
+jobs_router = APIRouter(prefix="/api/eval-jobs", tags=["publish"])
+"""Router RIÊNG: mã job không thuộc namespace của một agent nào — nó là mã của một LƯỢT CHẤM,
+và tra nó không cần biết agent nào trước."""
 
 
 class PublishRequest(BaseModel):
@@ -86,6 +106,71 @@ class PublishRequest(BaseModel):
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     # `tenant_id` CỐ Ý KHÔNG có field ở đây — cùng lý do T1 IDOR đã khoá ở `RunRequest` gốc
     # (`test_routes_runs.py`, trước app#44): tenant luôn tới từ `get_request_session()`.
+
+
+async def _tenant_name(tenant_id: UUID) -> str:
+    """Tên tenant từ `core.tenants` — thứ `GoldenCase.tenant` mang.
+
+    Trước bản vá này route dựng bảng tra bằng `dict(TENANT_IDS)` (`studio_kb.doc_factory`), một
+    **fixture Sprint 1 chỉ có 2 tenant demo** (`ankor`/`borea`) mà chính docstring của nó dán nhãn
+    *"KHÔNG phải cách phân giải thật"*. `EvalHarness` tra bằng `tenant_ids[case.tenant]`, còn
+    `GoldenCase.tenant` được `golden_autogen.regenerate_for_section` điền bằng `core.tenants.name`
+    THẬT — nên mọi tenant không tên `ankor`/`borea` làm cổng ném `KeyError` thô, không phải 400 có
+    thông điệp. Đo trên DB demo: `core.tenants.name` là `['Acme Demo', 'Ankor', '__system__']`,
+    không tên nào tra được. Đường upload đã đọc `core.tenants` đúng (`documents.py::_tenant_slug`),
+    chỉ đường chấm điểm còn dùng fixture."""
+    cur = await get_request_connection().execute("SELECT name FROM core.tenants WHERE id = %s", (tenant_id,))
+    row = await cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"tenant {tenant_id} không có trong core.tenants")
+    return str(row[0])
+
+
+async def _resolve_golden_set(recipe: Recipe, tenant_id: UUID) -> GoldenSet:
+    """Bộ golden dùng để chấm agent CÓ gắn KB — ba nấc, dừng ở nấc đầu tiên cho ra kết quả.
+
+    **Nấc 1 — canvas khai.** `params["section_roles"]` của node `kb-retrieve` là chỗ người dựng
+    agent NÓI nó gắn kho nào; suy ref bằng `auto_golden_set_ref` (đúng tên
+    `golden_autogen.regenerate_for_section` đã sinh lúc upload). Đây là đường đúng và là đường duy
+    nhất không mơ hồ khi tenant có nhiều kho.
+
+    **Nấc 2 — `recipe.golden_set_ref`.** Hành vi cũ, giữ nguyên cho mọi caller đang khai ref tường
+    minh (test, bộ seed `callisto-*`, bộ người viết nạp qua `POST /api/admin/golden-sets`).
+
+    **Nấc 3 — cầu tạm, và CHỈ khi câu trả lời là duy nhất.** Node `kb-retrieve` hôm nay có
+    `fields: []` (`apps/web/src/recipe/contract.ts` — *"chỉ còn là 1 biểu tượng đánh dấu"*) nên nấc
+    1 luôn rỗng, và canvas gửi `golden_set_ref` mặc định cứng `"callisto-2.0-golden-30-v1"` — một
+    bộ demo tenant thật không có, nên nấc 2 ném `GoldenSetNotFound` và **mọi lần bấm Chấm điểm đều
+    400**. Khi đó lấy các phòng ban thật sự có chunk: đúng một ⇒ dùng nó; nhiều hơn ⇒ 400 nêu đích
+    danh lựa chọn, KHÔNG đoán. Đoán ở đây là chấm agent bằng bộ của phòng ban khác rồi trả về một
+    Scorecard trông hợp lệ — đúng lớp "chứng nhận sai đối tượng".
+
+    Nấc 3 biến mất khi canvas có ô chọn phòng ban cho node KB; lúc đó nấc 1 luôn trả lời được.
+    """
+    declared: list[str] = []
+    for node in recipe.dag.nodes:
+        if node.type is not NodeType.KB_RETRIEVE:
+            continue
+        # `Node.params` là `dict[str, object]` tự do (contract), nên phải tự thu hẹp kiểu — một
+        # `section_roles: "hr"` (chuỗi, không phải list) sẽ tách thành 2 ký tự nếu lặp thẳng.
+        raw = node.params.get("section_roles")
+        if isinstance(raw, list):
+            declared.extend(str(role) for role in raw)
+    if declared:
+        return await _load_golden_set(auto_golden_set_ref(sorted(set(declared))[0]), tenant_id)
+
+    try:
+        return await _load_golden_set(recipe.golden_set_ref, tenant_id)
+    except HTTPException as exc:
+        if exc.status_code != 400:
+            raise
+        cur = await get_request_connection().execute(
+            "SELECT DISTINCT section_role FROM kb.chunks ORDER BY section_role"
+        )
+        available = [str(row[0]) for row in await cur.fetchall()]
+        if len(available) != 1:
+            raise
+        return await _load_golden_set(auto_golden_set_ref(available[0]), tenant_id)
 
 
 async def _load_golden_set(ref: str, tenant_id: UUID) -> GoldenSet:
@@ -118,13 +203,12 @@ async def _load_golden_set(ref: str, tenant_id: UUID) -> GoldenSet:
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
 
-async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContext) -> tuple[Recipe, Scorecard]:
-    """Dựng recipe từ canvas + chạy `golden_set_ref` qua `EvalHarness.run(core_only=True)` thật —
-    tập **Core**, không phải cả bộ (xem chú thích tại lời gọi bên dưới). Dùng chung
-    cho cả `/evaluate` (chỉ xem điểm, KHÔNG ghi DB) lẫn `/publish` (chấm rồi ghi DB nếu đạt). Mỗi
-    lần gọi route nào cũng chấm LẠI TỪ ĐẦU — route `/publish` không tin bất kỳ Scorecard nào UI đã
-    thấy trước đó qua `/evaluate` (tag vs fence: UI chỉ gợi ý nút sáng/tắt, server luôn tự verify
-    lại, không bao giờ nhận thẳng verdict client tự khai)."""
+async def _build_recipe(agent_id: str, body: PublishRequest, session: ResolvedContext) -> Recipe:
+    """Dựng + validate `Recipe` từ canvas. Tách khỏi `_evaluate` để `/publish` tính được
+    `recipe_hash` mà KHÔNG phải chạy cả bộ golden — đó là chỗ tra điểm tạm (`scorecard_store`).
+
+    Không chạm DB, không gọi LLM: chỉ `create_recipe` + 2 lint. Nên gọi nó hai lần (một ở đây, một
+    trong `_evaluate` khi phải chấm thật) rẻ và không có tác dụng phụ nào."""
     if body.agent_id != agent_id:
         raise HTTPException(
             status_code=400,
@@ -161,11 +245,43 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"recipe không qua validator: {exc}") from exc
 
+    return recipe
+
+
+async def _prepare_evaluation(
+    agent_id: str, body: PublishRequest, session: ResolvedContext
+) -> tuple[Recipe, GoldenSet, dict[str, UUID]]:
+    """Phần **chạm DB** của một lượt chấm: dựng recipe, chọn bộ golden, dựng bảng tra tenant.
+
+    Tách khỏi `_score` (review AIE-1, app#91) vì hai nửa có nhu cầu kết nối HOÀN TOÀN khác nhau:
+    nửa này cần connection request-scope cho vài câu đọc ngắn, còn nửa kia chạy 5-10 phút mà
+    **không chạm tới nó lần nào** — `EvalHarness` đi qua `PgKbSearch`/`PgTraceWriter` vốn tự lấy
+    connection từ pool và tự `_bind_tenant`.
+
+    Gộp hai nửa trong một `_tenant_scoped_connection` là giữ 1 trong 8 connection của pool
+    (`core/_db.py`, `max_size=8`) mở suốt lượt chấm, trong khi nó ngồi không — đúng thứ docstring
+    `_tenant_scoped_connection` nói nó tồn tại để tránh."""
+    recipe = await _build_recipe(agent_id, body, session)
+
     # `session.tenant_id`, KHÔNG phải `recipe.tenant_id` — dù hai giá trị này bằng nhau ở đây
     # (`create_recipe(tenant_id=session.tenant_id)` ngay trên). Đọc từ recipe sẽ là lần đầu tiên
     # trong route này một quyết định phạm vi lấy từ đối tượng do client dựng nên; hôm nay vô hại,
     # nhưng nó dựng sẵn đúng khuôn mà INV-1 tồn tại để cấm. Phiên khai tenant, recipe thì không.
-    golden = await _load_golden_set(recipe.golden_set_ref, session.tenant_id)
+    # Recipe KHÔNG có node `kb-retrieve` thì không trích dẫn được gì, nên bộ thường luôn cho
+    # `citation_accuracy = 0.0` và loại agent đó không bao giờ publish được. Chấm nó bằng bộ dựng
+    # sẵn `builtin-no-kb-v1` — mọi case nhánh trả-lời, `expected` là câu nói-không-biết, nên cả hai
+    # trục đo được mà không nới chốt nào (xem docstring `studio_evalhub.no_kb_golden`). Bộ đó KHÔNG
+    # nằm trong `eval.golden_sets`; nó là hằng số trong mã nên không đi qua `_load_golden_set`.
+    has_kb_node = any(node.type is NodeType.KB_RETRIEVE for node in recipe.dag.nodes)
+    if has_kb_node:
+        # `golden_set_ref` SUY từ phòng ban đã gắn, KHÔNG đọc `recipe.golden_set_ref`: field đó mang
+        # mặc định cứng `"callisto-2.0-golden-30-v1"` (`PublishRequest`) — một bộ demo mà tenant
+        # thật không có, nên mọi lần bấm Chấm điểm đều 400 `GoldenSetNotFound`. Bộ đúng là bộ
+        # `golden_autogen.regenerate_for_section` đã sinh sẵn lúc upload, tên theo đúng quy ước
+        # `auto_golden_set_ref` — nối hai đầu đó lại là toàn bộ nội dung của đoạn này.
+        golden = await _resolve_golden_set(recipe, session.tenant_id)
+    else:
+        golden = no_kb_golden_set()
 
     # `Pool` (không phải `get_request_connection()`) — rủi ro pool self-deadlock CHƯA được giải
     # quyết ở route này, xem giải thích đầy đủ + lý do ở `routes/runs.py` (review `app#17` đợt 4,
@@ -174,6 +290,32 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
     # `get_request_connection()` riêng cho ghi publish cuối cùng (`publish(recipe, scorecard,
     # conn=get_request_connection())` dưới) — đúng, đó KHÔNG cộng thêm connection nào (tái dùng
     # connection middleware đã giữ), khác hẳn `get_pool()` ở đây.
+
+    # `TENANT_IDS` giữ lại cho bộ seed sẵn (`callisto-*`) vốn khai `tenant="ankor"`; tên tenant
+    # THẬT thêm vào sau nên nó thắng khi trùng. Xem `_tenant_name` cho lỗi `KeyError` mà vế thứ hai
+    # vá. Bộ dựng sẵn mang nhãn hằng số `__no_kb_agent__` — ánh xạ nó về tenant của PHIÊN để case
+    # chạy dưới đúng công ty đang publish, không phải một tenant demo nào.
+    tenant_ids: dict[str, UUID] = dict(TENANT_IDS)
+    tenant_ids[await _tenant_name(session.tenant_id)] = session.tenant_id
+    if not has_kb_node:
+        tenant_ids[NO_KB_TENANT_LABEL] = session.tenant_id
+
+    return recipe, golden, tenant_ids
+
+
+async def _score(
+    recipe: Recipe,
+    golden: GoldenSet,
+    tenant_ids: dict[str, UUID],
+    *,
+    on_progress: Callable[[int, int], Awaitable[None]] | None = None,
+) -> Scorecard:
+    """Phần **tốn thời gian**: chạy bộ Core qua `EvalHarness` thật.
+
+    KHÔNG chạm connection request-scope. Mọi truy cập DB ở đây đi qua `pool` riêng
+    (`PgKbSearch`/`PgTraceWriter`), và chúng tự bind `app.tenant_id` trên connection của chính
+    mình (`studio_kb.postgres._bind_tenant`) — nên hàng rào tenant không phụ thuộc vào việc caller
+    có đang giữ một connection đã bind hay không."""
     pool = await get_pool()
     settings = get_settings()
     embedding = build_embedding()
@@ -198,11 +340,13 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
         recipe=recipe,
     )
 
-    tenant_ids: dict[str, UUID] = dict(TENANT_IDS)
     try:
         scorecard = await EvalHarness().run(
             recipe.agent_id,
-            recipe.golden_set_ref,
+            # `golden.golden_set_ref`, KHÔNG phải `recipe.golden_set_ref`: hai giá trị bằng nhau ở
+            # nhánh có KB, nhưng nhánh không-KB chấm bằng bộ dựng sẵn — khai ref của recipe ở đây
+            # sẽ cho ra một Scorecard nói nó được chấm bằng một bộ nó chưa từng chạy.
+            golden.golden_set_ref,
             golden_set=golden,
             runner=runner,
             tenant_ids=tenant_ids,
@@ -244,6 +388,8 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
             # chạy, và hash ở đây sẽ chứng nhận nhầm đối tượng dù bản thân phép so ở `publish()`
             # vẫn "khớp" một cách vô nghĩa).
             recipe_hash=recipe_hash(recipe),
+            # Chỉ đường chạy nền truyền móc này; đường đồng bộ để `None` và không đổi gì.
+            on_progress=on_progress,
             # `apps/studio#20` — nhánh judge từng bị bỏ IM LẶNG: `EvalHarness.run` nhận `judge=`
             # từ D18 (`kit#118`) nhưng đường production chưa bao giờ truyền, nên
             # `if judge is not None and …` (`harness.py`) không bao giờ đúng. Không lỗi, không
@@ -296,7 +442,22 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
         # `except Exception` chung: giữ MỌI exception KHÁC (bug thật, lỗi lập trình) lộ nguyên dạng
         # thay vì bị nuốt thành 500 vô danh.
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
-    return recipe, scorecard
+    return scorecard
+
+
+async def _evaluate(
+    agent_id: str,
+    body: PublishRequest,
+    session: ResolvedContext,
+    *,
+    on_progress: Callable[[int, int], Awaitable[None]] | None = None,
+) -> tuple[Recipe, Scorecard]:
+    """Dựng recipe + chấm, dùng cho đường ĐỒNG BỘ (`/evaluate`, `/publish`).
+
+    Ở đường đó, middleware đã giữ connection suốt request nên gộp hai nửa lại không tốn thêm gì.
+    Đường chạy nền thì gọi `_prepare_evaluation`/`_score` riêng — xem `_run_eval_job`."""
+    recipe, golden, tenant_ids = await _prepare_evaluation(agent_id, body, session)
+    return recipe, await _score(recipe, golden, tenant_ids, on_progress=on_progress)
 
 
 @router.post("/{agent_id}/evaluate")
@@ -318,6 +479,12 @@ async def evaluate_agent(agent_id: str, body: PublishRequest) -> dict[str, objec
     require_admin(identity.system_roles)
 
     recipe, scorecard = await _evaluate(agent_id, body, session)
+
+    # Ghi lại điểm để `/publish` khỏi chấm lại từ đầu (`scorecard_store`). Client KHÔNG cầm gì —
+    # nó chỉ gửi lại recipe, server tự băm và tự tra, nên `verdict` không bao giờ đi qua tay client.
+    # `recipe_version` để `NULL`: đây là điểm tạm, không phải chứng nhận của một version đã publish.
+    await write_pending_scorecard(get_request_connection(), scorecard, session.tenant_id)
+
     return {
         "agent_id": recipe.agent_id,
         "tenant_id": str(recipe.tenant_id),
@@ -336,7 +503,20 @@ async def publish_agent(agent_id: str, body: PublishRequest) -> dict[str, object
     identity = await fetch_fresh_identity(get_request_connection(), session.user)
     require_admin(identity.system_roles)
 
-    recipe, scorecard = await _evaluate(agent_id, body, session)
+    # Tái dùng điểm của lượt Chấm điểm nếu recipe KHÔNG đổi — khoá bằng `recipe_hash`, thứ server
+    # tự tính từ recipe client vừa gửi. Sửa một ký tự trên canvas là hash đổi, tra không ra, chấm
+    # lại. Không tìm thấy thì chạy nguyên đường cũ, nên caller gọi thẳng `/publish` (test, script)
+    # không đổi hành vi một dòng nào.
+    #
+    # Vì sao an toàn dù `/evaluate` là đường client gọi được: client không gửi Scorecard, không gửi
+    # verdict, không gửi cả hash — nó chỉ gửi recipe. Mọi thứ quyết định cổng đều do server tính
+    # hoặc đọc từ DB dưới RLS của chính tenant đó.
+    recipe = await _build_recipe(agent_id, body, session)
+    cached = await read_pending_scorecard(get_request_connection(), recipe.agent_id, recipe_hash(recipe))
+    if cached is None:
+        recipe, scorecard = await _evaluate(agent_id, body, session)
+    else:
+        scorecard = cached
 
     try:
         await publish(recipe, scorecard, conn=get_request_connection())
@@ -357,3 +537,156 @@ async def publish_agent(agent_id: str, body: PublishRequest) -> dict[str, object
         "status": "published",
         "scorecard": scorecard.model_dump(mode="json"),
     }
+
+
+# ---------------------------------------------------------------------------------------------
+# Chấm điểm chạy nền (`kit` — việc 5). Xem `studio_evalhub.eval_job_store` cho lý do và hình dạng.
+# ---------------------------------------------------------------------------------------------
+
+_STALE_EVAL_JOB_SECONDS = 120
+"""Job `running` im lặng quá lâu ⇒ coi như tiến trình đã chết giữa chừng.
+
+Ngưỡng đo *"lâu không cập nhật"*, không phải *"chạy đã lâu"* (`sweep_stale_jobs`), nên một lượt chấm
+100 case chạy 8 phút vẫn an toàn miễn nó còn báo tiến độ sau mỗi case."""
+
+
+_BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
+"""Giữ tham chiếu tới task đang chạy.
+
+`asyncio.create_task` chỉ giữ **weak reference**: không giữ ở đâu cả thì GC thu task giữa chừng và
+lượt chấm biến mất không dấu vết. Đây là cái bẫy `asyncio` tự ghi trong tài liệu của chính nó."""
+
+
+@asynccontextmanager
+async def _tenant_scoped_connection(tenant_id: UUID) -> AsyncIterator[Any]:
+    """Kết nối riêng cho task nền, đã bind `app.tenant_id`.
+
+    Task nền chạy SAU khi request kết thúc, nên `get_request_connection()` không dùng được —
+    connection đó đã đóng. Nó phải tự lấy từ pool và **tự cầm hàng rào tenant**, thay vì được
+    `tenant_context_middleware` cầm hộ. Đây là chỗ dễ rò tenant nhất của cả việc này.
+
+    `SET LOCAL` trong một transaction ngắn chứ không `set_config(..., false)` ở mức session: giá
+    trị mức session **sống sót** khi connection trả về pool, nên một task chết giữa chừng để lại
+    một connection còn bind tenant cho request kế tiếp nhặt được. `SET LOCAL` tự hết hiệu lực khi
+    transaction đóng — không phụ thuộc vào việc ta có nhớ dọn hay không.
+
+    Hệ quả: mỗi bước DB của task là một transaction ngắn RIÊNG, không phải một transaction dài ôm
+    cả lượt chấm. Đó là chủ đích — giữ một transaction mở suốt 5-10 phút là giữ khoá và làm phình
+    bảng, và lượt chấm không cần tính nguyên tử giữa các bước.
+    """
+    pool = await get_pool()
+    async with pool.connection() as conn, conn.transaction():
+        await conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(tenant_id),))
+        token = middleware._request_conn.set(conn)
+        try:
+            yield conn
+        finally:
+            middleware._request_conn.reset(token)
+
+
+async def _run_eval_job(job_id: UUID, agent_id: str, body: PublishRequest, session: ResolvedContext) -> None:
+    """Chạy trọn một lượt chấm ngoài vòng đời request, rồi ghi kết quả vào đúng chỗ `/publish` tra.
+
+    Không ném ra ngoài: task nền không có ai bắt, nên mọi lỗi phải thành `status='failed'` kèm
+    thông điệp — một job treo `running` mãi là thứ người dùng ngồi đợi một cách vô vọng."""
+
+    async def _on_progress(done: int, total: int) -> None:
+        async with _tenant_scoped_connection(session.tenant_id) as conn:
+            await record_job_progress(conn, job_id, done, total)
+
+    try:
+        # BA giai đoạn, KHÔNG phải một khối: connection request-scope chỉ mở ở hai đầu.
+        #
+        # Gộp cả ba vào một `_tenant_scoped_connection` (bản trước) giữ 1 trong 8 connection của
+        # pool (`core/_db.py`, `max_size=8`) mở suốt 5-10 phút trong khi nó NGỒI KHÔNG — `_score`
+        # không chạm tới nó lần nào, mọi truy cập DB ở đó đi qua pool riêng của `PgKbSearch`/
+        # `PgTraceWriter` và tự bind tenant. Vài job nền chạy song song là đủ làm cạn pool cho mọi
+        # request HTTP thường (review AIE-1, app#91). Và nó tự mâu thuẫn với docstring của chính
+        # `_tenant_scoped_connection`.
+        async with _tenant_scoped_connection(session.tenant_id) as conn:
+            recipe, golden, tenant_ids = await _prepare_evaluation(agent_id, body, session)
+
+        scorecard = await _score(recipe, golden, tenant_ids, on_progress=_on_progress)
+
+        async with _tenant_scoped_connection(session.tenant_id) as conn:
+            await write_pending_scorecard(conn, scorecard, session.tenant_id)
+            await finish_eval_job(conn, job_id)
+    except Exception as exc:  # noqa: BLE001 — xem docstring: không ai bắt hộ task nền
+        detail = exc.detail if isinstance(exc, HTTPException) else f"{type(exc).__name__}: {exc}"
+        with contextlib.suppress(Exception):
+            async with _tenant_scoped_connection(session.tenant_id) as conn:
+                await fail_eval_job(conn, job_id, str(detail))
+
+
+@router.post("/{agent_id}/evaluate-async", status_code=202)
+async def evaluate_agent_async(agent_id: str, body: PublishRequest) -> dict[str, object]:
+    """Khởi động một lượt Chấm điểm chạy nền, trả **ngay** mã job.
+
+    Khác `/evaluate` (đồng bộ, giữ request mở suốt lượt chấm): route này nhả kết nối ngay, nên bộ
+    100 case chạy 5-10 phút không còn là một request treo. `/evaluate` giữ nguyên cho bộ nhỏ và cho
+    caller đang có.
+
+    Recipe được dựng + lint **đồng bộ** ở đây, trước khi tạo job: recipe hỏng phải ra 400 ngay lúc
+    bấm, không phải một job `failed` mà người dùng đợi rồi mới biết. Chỉ phần TỐN THỜI GIAN mới đi
+    xuống nền.
+    """
+    session = get_request_session()
+    identity = await fetch_fresh_identity(get_request_connection(), session.user)
+    require_admin(identity.system_roles)
+
+    recipe = await _build_recipe(agent_id, body, session)
+    job_id = await create_eval_job(get_request_connection(), session.tenant_id, recipe.agent_id, recipe_hash(recipe))
+
+    task = asyncio.create_task(_run_eval_job(job_id, agent_id, body, session))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+    return {"job_id": str(job_id), "status": "running", "agent_id": recipe.agent_id}
+
+
+@jobs_router.get("/{job_id}")
+async def read_eval_job_status(job_id: UUID) -> dict[str, object]:
+    """Trạng thái + tiến độ của một lượt chấm nền; kèm Scorecard khi đã xong.
+
+    Scorecard **không** lưu trên job — nó nằm ở `eval.scorecards` (`scorecard_store`), đúng chỗ
+    `/publish` tra. Route này ghép hai thứ đó lại bằng `(agent_id, recipe_hash)` có sẵn trên job,
+    nên không có nguồn sự thật thứ hai cho cùng một verdict.
+    """
+    session = get_request_session()
+    identity = await fetch_fresh_identity(get_request_connection(), session.user)
+    require_admin(identity.system_roles)
+
+    conn = get_request_connection()
+
+    # Dọn job treo NGAY TRONG đường đọc, không phải bằng một lượt quét lúc khởi động.
+    #
+    # Tiến trình chết giữa lượt chấm để lại job `running` mà không ai chuyển sang `failed` — người
+    # dùng mở lại trang và ngồi đợi một thứ đã không còn chạy. Lượt quét lúc boot giải được ca đó
+    # nhưng phải đi XUYÊN tenant, mà `eval.eval_jobs` bật `FORCE ROW LEVEL SECURITY`: chủ bảng cũng
+    # bị lọc, và `SET LOCAL row_security = off` KHÔNG vượt được (Postgres trả `InsufficientPrivilege`
+    # kèm gợi ý `ALTER TABLE NO FORCE` — đo được, không phải suy luận). Muốn quét xuyên tenant phải
+    # nới hàng rào hoặc lặp qua từng tenant, cả hai đều đắt hơn thứ nó mua.
+    #
+    # Ở đây thì miễn phí: route này đã chạy dưới RLS của đúng tenant sở hữu job, nên `sweep` tự giới
+    # hạn đúng phạm vi. Và nó chạy ĐÚNG LÚC có người nhìn — job treo mà không ai tra thì không phiền
+    # ai.
+    await sweep_stale_jobs(conn, stale_after_seconds=_STALE_EVAL_JOB_SECONDS)
+
+    job = await read_eval_job(conn, job_id)
+    if job is None:
+        # RLS đã lọc job của tenant khác thành `None`, nên 404 ở đây là MỘT nhánh cho cả "không có"
+        # lẫn "của công ty khác" — không rò tin tồn-tại-hay-không qua status code khác nhau.
+        raise HTTPException(status_code=404, detail=f"không có lượt chấm nào mang mã {job_id}")
+
+    payload: dict[str, object] = {
+        "job_id": str(job.job_id),
+        "agent_id": job.agent_id,
+        "status": job.status,
+        "done": job.done,
+        "total": job.total,
+        "detail": job.detail,
+    }
+    if job.status == "done":
+        scorecard = await read_pending_scorecard(conn, job.agent_id, job.recipe_hash)
+        payload["scorecard"] = None if scorecard is None else scorecard.model_dump(mode="json")
+    return payload
