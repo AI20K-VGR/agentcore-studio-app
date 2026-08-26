@@ -11,6 +11,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+from studio_app import middleware
 from studio_app.core._db import close_pools, get_pool
 from studio_app.routes import publish as publish_module
 from studio_app.routes.publish import PublishRequest, _run_eval_job, _tenant_scoped_connection
@@ -54,6 +55,20 @@ def _card(recipe_hash: str) -> Scorecard:
     )
 
 
+async def _fake_prepare(agent_id: str, body: Any, session: Any) -> Any:
+    """Stub nửa CHẠM DB. `_run_eval_job` giờ gọi `_prepare_evaluation` + `_score` riêng thay vì
+    `_evaluate` — tách ra để giai đoạn tốn thời gian không giữ connection request-scope
+    (review AIE-1, app#91)."""
+    recipe = await publish_module._build_recipe(agent_id, body, session)
+    return recipe, object(), {}
+
+
+def _stub_eval(monkeypatch: pytest.MonkeyPatch, score: Any) -> None:
+    """Thay cả hai nửa: nửa DB bằng `_fake_prepare`, nửa chấm bằng `score` của từng bài."""
+    monkeypatch.setattr(publish_module, "_prepare_evaluation", _fake_prepare)
+    monkeypatch.setattr(publish_module, "_score", score)
+
+
 async def test_binding_tenant_khong_song_sot_sang_connection_sau(pool: Any) -> None:
     """Bài quan trọng nhất: `app.tenant_id` KHÔNG được sót lại khi connection về pool.
 
@@ -82,17 +97,16 @@ async def test_task_nen_ghi_diem_va_danh_dau_xong(pool: Any, monkeypatch: pytest
     `(agent_id, recipe_hash)`. Bài này ghim cả hai vế của phép ghép đó."""
     recipe_hashes: list[str] = []
 
-    async def _fake_evaluate(agent_id: str, body: Any, session: Any, *, on_progress: Any = None) -> Any:
+    async def _fake_score(recipe: Any, golden: Any, tenant_ids: Any, *, on_progress: Any = None) -> Any:
         if on_progress is not None:
             await on_progress(1, 3)
-        recipe = await publish_module._build_recipe(agent_id, body, session)
         from studio_workbench.publish import recipe_hash
 
         rhash = recipe_hash(recipe)
         recipe_hashes.append(rhash)
-        return recipe, _card(rhash)
+        return _card(rhash)
 
-    monkeypatch.setattr(publish_module, "_evaluate", _fake_evaluate)
+    _stub_eval(monkeypatch, _fake_score)
 
     async with pool.connection() as conn, conn.transaction():
         await conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(ANKOR_ID),))
@@ -116,10 +130,10 @@ async def test_task_nen_hong_thi_danh_dau_failed_chu_khong_treo(pool: Any, monke
 
     Task nền không có ai bắt exception hộ — một job treo mãi là người dùng ngồi đợi vô vọng."""
 
-    async def _no_evaluate(agent_id: str, body: Any, session: Any, *, on_progress: Any = None) -> Any:
+    async def _no_score(recipe: Any, golden: Any, tenant_ids: Any, *, on_progress: Any = None) -> Any:
         raise RuntimeError("bộ golden chưa nạp")
 
-    monkeypatch.setattr(publish_module, "_evaluate", _no_evaluate)
+    _stub_eval(monkeypatch, _no_score)
 
     async with pool.connection() as conn, conn.transaction():
         await conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(ANKOR_ID),))
@@ -141,13 +155,12 @@ async def test_task_nen_chay_duoi_dung_tenant_cua_phien(pool: Any, monkeypatch: 
     Ghi nhầm tenant ở đây là điểm của công ty A xuất hiện trong danh sách của công ty B — và RLS
     không cứu được vì chính task tự chọn giá trị bind."""
 
-    async def _fake_evaluate(agent_id: str, body: Any, session: Any, *, on_progress: Any = None) -> Any:
-        recipe = await publish_module._build_recipe(agent_id, body, session)
+    async def _fake_score(recipe: Any, golden: Any, tenant_ids: Any, *, on_progress: Any = None) -> Any:
         from studio_workbench.publish import recipe_hash
 
-        return recipe, _card(recipe_hash(recipe))
+        return _card(recipe_hash(recipe))
 
-    monkeypatch.setattr(publish_module, "_evaluate", _fake_evaluate)
+    _stub_eval(monkeypatch, _fake_score)
 
     async with pool.connection() as conn, conn.transaction():
         await conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(BOREA_ID),))
@@ -174,3 +187,46 @@ async def test_task_nen_chay_duoi_dung_tenant_cua_phien(pool: Any, monkeypatch: 
         await conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(ANKOR_ID),))
         assert await read_eval_job(conn, job_id) is None, "job của công ty khác lọt sang tenant này"
         assert await read_pending_scorecard(conn, "agent-nen", rhash) is None, "điểm của công ty khác lọt sang"
+
+
+async def test_khong_giu_connection_request_scope_trong_luc_cham(pool: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Giai đoạn TỐN THỜI GIAN không được giữ connection request-scope nào.
+
+    Bản trước bọc cả `_evaluate` trong một `_tenant_scoped_connection`, nên 1 trong 8 connection
+    của pool (`core/_db.py`, `max_size=8`) bị giữ mở suốt 5-10 phút trong khi nó **ngồi không** —
+    `_score` không chạm tới nó lần nào. Vài job nền song song là đủ làm cạn pool cho mọi request
+    HTTP thường (review AIE-1, app#91).
+
+    Bài này đo trực tiếp: trong lúc `_score` chạy, `middleware._request_conn` phải TRỐNG. Không
+    đếm connection của pool — con số đó còn lẫn cả connection `PgKbSearch`/`PgTraceWriter` tự lấy,
+    và chúng thì đúng ra phải có."""
+    thay_conn_luc_cham: list[object] = []
+
+    async def _fake_score(recipe: Any, golden: Any, tenant_ids: Any, *, on_progress: Any = None) -> Any:
+        # Chụp lại trạng thái contextvar ĐÚNG LÚC giai đoạn tốn thời gian đang chạy.
+        thay_conn_luc_cham.append(middleware._request_conn.get(None))
+        if on_progress is not None:
+            await on_progress(1, 1)
+        from studio_workbench.publish import recipe_hash
+
+        return _card(recipe_hash(recipe))
+
+    _stub_eval(monkeypatch, _fake_score)
+
+    async with pool.connection() as conn, conn.transaction():
+        await conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(ANKOR_ID),))
+        job_id = await create_eval_job(conn, ANKOR_ID, "agent-nen", "h1")
+
+    await _run_eval_job(job_id, "agent-nen", _body(), _session())
+
+    assert thay_conn_luc_cham == [None], (
+        f"giai đoạn chấm vẫn giữ connection request-scope: {thay_conn_luc_cham!r} — "
+        "nó ngồi không suốt lượt chấm và ăn 1 trong 8 slot của pool"
+    )
+
+    # Và vẫn phải hoàn tất bình thường: tách connection không được làm rơi kết quả.
+    async with pool.connection() as conn, conn.transaction():
+        await conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(ANKOR_ID),))
+        job = await read_eval_job(conn, job_id)
+    assert job is not None and job.status == "done"
+    assert (job.done, job.total) == (1, 1), "tiến độ vẫn phải ghi được qua connection ngắn riêng"

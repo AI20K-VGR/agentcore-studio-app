@@ -248,19 +248,19 @@ async def _build_recipe(agent_id: str, body: PublishRequest, session: ResolvedCo
     return recipe
 
 
-async def _evaluate(
-    agent_id: str,
-    body: PublishRequest,
-    session: ResolvedContext,
-    *,
-    on_progress: Callable[[int, int], Awaitable[None]] | None = None,
-) -> tuple[Recipe, Scorecard]:
-    """Dựng recipe từ canvas + chạy `golden_set_ref` qua `EvalHarness.run(core_only=True)` thật —
-    tập **Core**, không phải cả bộ (xem chú thích tại lời gọi bên dưới). Dùng chung cho cả
-    `/evaluate` (chỉ xem điểm) lẫn `/publish` (khi chưa có điểm tạm nào khớp `recipe_hash`).
+async def _prepare_evaluation(
+    agent_id: str, body: PublishRequest, session: ResolvedContext
+) -> tuple[Recipe, GoldenSet, dict[str, UUID]]:
+    """Phần **chạm DB** của một lượt chấm: dựng recipe, chọn bộ golden, dựng bảng tra tenant.
 
-    Server vẫn KHÔNG BAO GIỜ nhận verdict client tự khai — điểm tái dùng được là điểm chính server
-    đã ghi ở lượt `/evaluate` trước, tra bằng `recipe_hash` server tự tính (`scorecard_store`)."""
+    Tách khỏi `_score` (review AIE-1, app#91) vì hai nửa có nhu cầu kết nối HOÀN TOÀN khác nhau:
+    nửa này cần connection request-scope cho vài câu đọc ngắn, còn nửa kia chạy 5-10 phút mà
+    **không chạm tới nó lần nào** — `EvalHarness` đi qua `PgKbSearch`/`PgTraceWriter` vốn tự lấy
+    connection từ pool và tự `_bind_tenant`.
+
+    Gộp hai nửa trong một `_tenant_scoped_connection` là giữ 1 trong 8 connection của pool
+    (`core/_db.py`, `max_size=8`) mở suốt lượt chấm, trong khi nó ngồi không — đúng thứ docstring
+    `_tenant_scoped_connection` nói nó tồn tại để tránh."""
     recipe = await _build_recipe(agent_id, body, session)
 
     # `session.tenant_id`, KHÔNG phải `recipe.tenant_id` — dù hai giá trị này bằng nhau ở đây
@@ -290,6 +290,32 @@ async def _evaluate(
     # `get_request_connection()` riêng cho ghi publish cuối cùng (`publish(recipe, scorecard,
     # conn=get_request_connection())` dưới) — đúng, đó KHÔNG cộng thêm connection nào (tái dùng
     # connection middleware đã giữ), khác hẳn `get_pool()` ở đây.
+
+    # `TENANT_IDS` giữ lại cho bộ seed sẵn (`callisto-*`) vốn khai `tenant="ankor"`; tên tenant
+    # THẬT thêm vào sau nên nó thắng khi trùng. Xem `_tenant_name` cho lỗi `KeyError` mà vế thứ hai
+    # vá. Bộ dựng sẵn mang nhãn hằng số `__no_kb_agent__` — ánh xạ nó về tenant của PHIÊN để case
+    # chạy dưới đúng công ty đang publish, không phải một tenant demo nào.
+    tenant_ids: dict[str, UUID] = dict(TENANT_IDS)
+    tenant_ids[await _tenant_name(session.tenant_id)] = session.tenant_id
+    if not has_kb_node:
+        tenant_ids[NO_KB_TENANT_LABEL] = session.tenant_id
+
+    return recipe, golden, tenant_ids
+
+
+async def _score(
+    recipe: Recipe,
+    golden: GoldenSet,
+    tenant_ids: dict[str, UUID],
+    *,
+    on_progress: Callable[[int, int], Awaitable[None]] | None = None,
+) -> Scorecard:
+    """Phần **tốn thời gian**: chạy bộ Core qua `EvalHarness` thật.
+
+    KHÔNG chạm connection request-scope. Mọi truy cập DB ở đây đi qua `pool` riêng
+    (`PgKbSearch`/`PgTraceWriter`), và chúng tự bind `app.tenant_id` trên connection của chính
+    mình (`studio_kb.postgres._bind_tenant`) — nên hàng rào tenant không phụ thuộc vào việc caller
+    có đang giữ một connection đã bind hay không."""
     pool = await get_pool()
     settings = get_settings()
     embedding = build_embedding()
@@ -314,14 +340,6 @@ async def _evaluate(
         recipe=recipe,
     )
 
-    # `TENANT_IDS` giữ lại cho bộ seed sẵn (`callisto-*`) vốn khai `tenant="ankor"`; tên tenant
-    # THẬT thêm vào sau nên nó thắng khi trùng. Xem `_tenant_name` cho lỗi `KeyError` mà vế thứ hai
-    # vá. Bộ dựng sẵn mang nhãn hằng số `__no_kb_agent__` — ánh xạ nó về tenant của PHIÊN để case
-    # chạy dưới đúng công ty đang publish, không phải một tenant demo nào.
-    tenant_ids: dict[str, UUID] = dict(TENANT_IDS)
-    tenant_ids[await _tenant_name(session.tenant_id)] = session.tenant_id
-    if not has_kb_node:
-        tenant_ids[NO_KB_TENANT_LABEL] = session.tenant_id
     try:
         scorecard = await EvalHarness().run(
             recipe.agent_id,
@@ -424,7 +442,22 @@ async def _evaluate(
         # `except Exception` chung: giữ MỌI exception KHÁC (bug thật, lỗi lập trình) lộ nguyên dạng
         # thay vì bị nuốt thành 500 vô danh.
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
-    return recipe, scorecard
+    return scorecard
+
+
+async def _evaluate(
+    agent_id: str,
+    body: PublishRequest,
+    session: ResolvedContext,
+    *,
+    on_progress: Callable[[int, int], Awaitable[None]] | None = None,
+) -> tuple[Recipe, Scorecard]:
+    """Dựng recipe + chấm, dùng cho đường ĐỒNG BỘ (`/evaluate`, `/publish`).
+
+    Ở đường đó, middleware đã giữ connection suốt request nên gộp hai nửa lại không tốn thêm gì.
+    Đường chạy nền thì gọi `_prepare_evaluation`/`_score` riêng — xem `_run_eval_job`."""
+    recipe, golden, tenant_ids = await _prepare_evaluation(agent_id, body, session)
+    return recipe, await _score(recipe, golden, tenant_ids, on_progress=on_progress)
 
 
 @router.post("/{agent_id}/evaluate")
@@ -562,8 +595,20 @@ async def _run_eval_job(job_id: UUID, agent_id: str, body: PublishRequest, sessi
             await record_job_progress(conn, job_id, done, total)
 
     try:
+        # BA giai đoạn, KHÔNG phải một khối: connection request-scope chỉ mở ở hai đầu.
+        #
+        # Gộp cả ba vào một `_tenant_scoped_connection` (bản trước) giữ 1 trong 8 connection của
+        # pool (`core/_db.py`, `max_size=8`) mở suốt 5-10 phút trong khi nó NGỒI KHÔNG — `_score`
+        # không chạm tới nó lần nào, mọi truy cập DB ở đó đi qua pool riêng của `PgKbSearch`/
+        # `PgTraceWriter` và tự bind tenant. Vài job nền chạy song song là đủ làm cạn pool cho mọi
+        # request HTTP thường (review AIE-1, app#91). Và nó tự mâu thuẫn với docstring của chính
+        # `_tenant_scoped_connection`.
         async with _tenant_scoped_connection(session.tenant_id) as conn:
-            _, scorecard = await _evaluate(agent_id, body, session, on_progress=_on_progress)
+            recipe, golden, tenant_ids = await _prepare_evaluation(agent_id, body, session)
+
+        scorecard = await _score(recipe, golden, tenant_ids, on_progress=_on_progress)
+
+        async with _tenant_scoped_connection(session.tenant_id) as conn:
             await write_pending_scorecard(conn, scorecard, session.tenant_id)
             await finish_eval_job(conn, job_id)
     except Exception as exc:  # noqa: BLE001 — xem docstring: không ai bắt hộ task nền
