@@ -691,3 +691,91 @@ async def update_company(tenant_id: str, body: UpdateCompanyRequest) -> CompanyS
         user_count=row[4],
         section_count=row[5],
     )
+
+
+@router.post("/companies/{tenant_id}/users/{user_id}/deactivate", response_model=UserSummary)
+async def deactivate_company_user(tenant_id: str, user_id: str) -> UserSummary:
+    """Vô hiệu hoá một tài khoản trong công ty — bản superadmin của `deactivate_user`.
+
+    Cần riêng vì `deactivate_user` là `require_admin` + scope tenant NGƯỜI GỌI, nên superadmin
+    (đứng ở `__system__`) nhận 404 cho mọi user của công ty thật. Ca dùng là chính ca cả nhóm route
+    này sinh ra để giải: admin công ty nghỉ việc và công ty không còn ai đủ quyền thu tài khoản của
+    họ. Đặt lại mật khẩu không thay được việc này — nó mở lại tài khoản, không đóng.
+
+    Không cần làm gì thêm để cắt phiên đang mở: `authz.fetch_fresh_identity` đã 403 khi
+    `is_active = false`, nên JWT cũ chết ngay ở request kế tiếp (bài học đã vá một lần cho
+    `deactivate_user`, xem docstring route đó).
+
+    KHÔNG cho vô hiệu hoá admin **cuối cùng còn hoạt động** của một công ty. Bỏ chốt này thì chính
+    nhóm route dựng ra để gỡ ca "công ty mất admin" lại trở thành cách nhanh nhất tạo ra nó — và
+    lần đó thì không route nào gỡ được, vì `add_company_admin` cần superadmin nhớ ra mà gọi."""
+    session = get_request_session()
+    conn = get_request_connection()
+    identity = await fetch_fresh_identity(conn, session.user)
+    require_superadmin(identity.system_roles)
+    target_tenant_id = await _resolve_company(conn, tenant_id)
+    await _fetch_user_in_company(conn, user_id, target_tenant_id)
+
+    cur = await conn.execute(
+        "SELECT count(*) FROM core.users "
+        "WHERE tenant_id = %s AND is_active AND 'admin' = ANY(system_roles) AND id <> %s",
+        (str(target_tenant_id), user_id),
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    other_active_admins = row[0]
+
+    cur = await conn.execute("SELECT system_roles, is_active FROM core.users WHERE id = %s", (user_id,))
+    target = await cur.fetchone()
+    assert target is not None
+    is_admin = "admin" in list(target[0])
+    if is_admin and target[1] and other_active_admins == 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Đây là quản trị viên đang hoạt động cuối cùng của công ty — vô hiệu hoá sẽ khoá "
+                "cứng công ty khỏi mọi thao tác quản trị. Thêm một admin khác trước."
+            ),
+        )
+
+    cur = await conn.execute(
+        "UPDATE core.users SET is_active = false WHERE id = %s "
+        "RETURNING id, email, system_roles, is_active, created_at",
+        (user_id,),
+    )
+    updated = await cur.fetchone()
+    assert updated is not None
+    return UserSummary(
+        user_id=str(updated[0]),
+        email=updated[1],
+        system_roles=list(updated[2]),
+        is_active=updated[3],
+        created_at=updated[4].isoformat(),
+    )
+
+
+@router.post("/companies/{tenant_id}/users/{user_id}/reactivate", response_model=UserSummary)
+async def reactivate_company_user(tenant_id: str, user_id: str) -> UserSummary:
+    """Đối xứng với `deactivate_company_user` — không có nó thì thao tác trên là một chiều, và
+    superadmin bấm nhầm sẽ phải sửa DB tay (cùng lý do `reactivate_user` tồn tại cạnh
+    `deactivate_user`)."""
+    session = get_request_session()
+    conn = get_request_connection()
+    identity = await fetch_fresh_identity(conn, session.user)
+    require_superadmin(identity.system_roles)
+    target_tenant_id = await _resolve_company(conn, tenant_id)
+    await _fetch_user_in_company(conn, user_id, target_tenant_id)
+
+    cur = await conn.execute(
+        "UPDATE core.users SET is_active = true WHERE id = %s RETURNING id, email, system_roles, is_active, created_at",
+        (user_id,),
+    )
+    updated = await cur.fetchone()
+    assert updated is not None
+    return UserSummary(
+        user_id=str(updated[0]),
+        email=updated[1],
+        system_roles=list(updated[2]),
+        is_active=updated[3],
+        created_at=updated[4].isoformat(),
+    )

@@ -34,8 +34,10 @@ from studio_app.routes.admin import (
     ResetPasswordRequest,
     UpdateCompanyRequest,
     add_company_admin,
+    deactivate_company_user,
     list_companies,
     list_company_users,
+    reactivate_company_user,
     reset_company_user_password,
     update_company,
 )
@@ -555,3 +557,117 @@ async def test_reset_password_cannot_target_a_user_of_another_company(admin_pool
         middleware._request_session.reset(token)  # type: ignore[arg-type]
 
     assert exc_info.value.status_code == 404
+
+
+async def test_superadmin_deactivates_a_user_of_a_company_they_do_not_belong_to(admin_pool: Pool) -> None:
+    """`deactivate_user` (route cũ) scope tenant NGƯỜI GỌI nên superadmin nhận 404 cho mọi user của
+    công ty thật. Ca dùng: admin công ty nghỉ việc, công ty không còn ai thu tài khoản của họ."""
+    system_tenant_id = await _seed_superadmin(admin_pool, "deact")
+    company_id = await _seed_tenant(admin_pool, "ankor-deact")
+    await _seed_user(admin_pool, company_id, "boss@ankor-deact.test", ["admin"])
+    leaver_id = await _seed_user(admin_pool, company_id, "nghi-viec@ankor-deact.test", ["hr"])
+
+    token = _set_session(tenant_id=system_tenant_id, user=f"deact-{SUPERADMIN_EMAIL}", system_roles=["superadmin"])
+    try:
+        async with _simulate_request_connection():
+            result = await deactivate_company_user(str(company_id), str(leaver_id))
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert result.is_active is False
+
+    # Phiên đang mở phải chết ngay, không đợi JWT hết hạn — `fetch_fresh_identity` là cửa mọi route
+    # admin/sections/agents/runs/publish đi qua.
+    async with admin_pool.connection() as conn:
+        with pytest.raises(HTTPException) as exc_info:
+            await fetch_fresh_identity(conn, "nghi-viec@ankor-deact.test")
+    assert exc_info.value.status_code == 403
+
+
+async def test_deactivate_then_reactivate_restores_the_account(admin_pool: Pool) -> None:
+    """Đối chứng bắt buộc — thiếu nó, một bản cài đặt chỉ-ghi-`false` vẫn xanh bài trên."""
+    system_tenant_id = await _seed_superadmin(admin_pool, "react")
+    company_id = await _seed_tenant(admin_pool, "ankor-react")
+    await _seed_user(admin_pool, company_id, "boss@ankor-react.test", ["admin"])
+    user_id = await _seed_user(admin_pool, company_id, "nv@ankor-react.test", ["hr"])
+
+    token = _set_session(tenant_id=system_tenant_id, user=f"react-{SUPERADMIN_EMAIL}", system_roles=["superadmin"])
+    try:
+        async with _simulate_request_connection():
+            await deactivate_company_user(str(company_id), str(user_id))
+        async with _simulate_request_connection():
+            result = await reactivate_company_user(str(company_id), str(user_id))
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert result.is_active is True
+    async with admin_pool.connection() as conn:
+        identity = await fetch_fresh_identity(conn, "nv@ankor-react.test")
+    assert identity.system_roles == ["hr"]
+
+
+async def test_cannot_deactivate_the_LAST_active_admin_of_a_company(admin_pool: Pool) -> None:
+    """Chốt quan trọng nhất của cặp route này.
+
+    Không có nó, chính nhóm route dựng ra để gỡ ca "công ty mất admin" lại trở thành cách nhanh
+    nhất tạo ra nó — và ca đó không tự gỡ được: `add_company_admin` cần superadmin nhớ ra mà gọi."""
+    system_tenant_id = await _seed_superadmin(admin_pool, "last")
+    company_id = await _seed_tenant(admin_pool, "ankor-last-admin")
+    sole_admin = await _seed_user(admin_pool, company_id, "admin-duy-nhat@ankor-last.test", ["admin"])
+    await _seed_user(admin_pool, company_id, "nhan-vien@ankor-last.test", ["hr"])
+
+    token = _set_session(tenant_id=system_tenant_id, user=f"last-{SUPERADMIN_EMAIL}", system_roles=["superadmin"])
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            async with _simulate_request_connection():
+                await deactivate_company_user(str(company_id), str(sole_admin))
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert exc_info.value.status_code == 409
+
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("SELECT is_active FROM core.users WHERE id = %s", (str(sole_admin),))
+        row = await cur.fetchone()
+    assert row is not None and row[0] is True, "admin cuối cùng bị vô hiệu hoá dù route đã ném 409"
+
+
+async def test_can_deactivate_an_admin_when_another_active_admin_remains(admin_pool: Pool) -> None:
+    """Vế đối chứng của bài trên: chốt chỉ chặn admin **cuối cùng**, không chặn mọi admin. Thiếu
+    bài này, một bản vá quá tay (cấm vô hiệu hoá mọi admin) vẫn xanh."""
+    system_tenant_id = await _seed_superadmin(admin_pool, "two")
+    company_id = await _seed_tenant(admin_pool, "ankor-two-admins")
+    first_admin = await _seed_user(admin_pool, company_id, "admin1@ankor-two.test", ["admin"])
+    await _seed_user(admin_pool, company_id, "admin2@ankor-two.test", ["admin"])
+
+    token = _set_session(tenant_id=system_tenant_id, user=f"two-{SUPERADMIN_EMAIL}", system_roles=["superadmin"])
+    try:
+        async with _simulate_request_connection():
+            result = await deactivate_company_user(str(company_id), str(first_admin))
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert result.is_active is False
+
+
+async def test_an_already_inactive_admin_does_not_count_as_the_last_one(admin_pool: Pool) -> None:
+    """Phép đếm phải tính admin **đang hoạt động**, không phải mọi admin.
+
+    Công ty có 2 admin nhưng 1 đã bị vô hiệu hoá ⇒ người còn lại LÀ người cuối cùng, phải chặn.
+    Đếm nhầm sang `count(*)` không lọc `is_active` sẽ cho qua và khoá cứng công ty."""
+    system_tenant_id = await _seed_superadmin(admin_pool, "ghost")
+    company_id = await _seed_tenant(admin_pool, "ankor-ghost-admin")
+    working_admin = await _seed_user(admin_pool, company_id, "dang-lam@ankor-ghost.test", ["admin"])
+    retired_admin = await _seed_user(admin_pool, company_id, "da-nghi@ankor-ghost.test", ["admin"])
+    async with admin_pool.connection() as conn:
+        await conn.execute("UPDATE core.users SET is_active = false WHERE id = %s", (str(retired_admin),))
+
+    token = _set_session(tenant_id=system_tenant_id, user=f"ghost-{SUPERADMIN_EMAIL}", system_roles=["superadmin"])
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            async with _simulate_request_connection():
+                await deactivate_company_user(str(company_id), str(working_admin))
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert exc_info.value.status_code == 409
