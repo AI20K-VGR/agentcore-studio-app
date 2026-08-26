@@ -114,11 +114,14 @@ async def _capture_run_kwargs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     monkeypatch.setattr(publish_module, "EvalHarness", _StubEvalHarness)
     monkeypatch.setattr(publish_module, "get_settings", lambda: _settings(tmp_path))
 
+    # app#78 (workbench#48): star topology mới cấm "end" và đòi đúng 1 node llm-step —
+    # kb-retrieve -> llm-step (hub-spoke) là hình tối thiểu pass cả `enforce_agent_shape`/
+    # `enforce_agent_topology`.
     body = PublishRequest(
         agent_id="agent-core-wiring",
         system_prompt="Answer from KB only.",
         tool_whitelist=[],
-        nodes=[{"id": "n1", "type": "kb-retrieve", "params": {}}, {"id": "n2", "type": "end", "params": {}}],
+        nodes=[{"id": "n1", "type": "kb-retrieve", "params": {}}, {"id": "n2", "type": "llm-step", "params": {}}],
         edges=[{"from": "n1", "to": "n2", "when": None}],
     )
     session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@acme.com", system_roles=["admin"])

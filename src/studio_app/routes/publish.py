@@ -47,7 +47,7 @@ from studio_kb.postgres import PgKbSearch
 from studio_workbench import create_recipe
 from studio_workbench.publish import publish, recipe_hash
 from studio_workbench.tenant_wall import ResolvedContext
-from studio_workbench.validator import graph_lint
+from studio_workbench.validator import enforce_agent_shape, enforce_agent_topology
 
 from studio_app.authz import fetch_fresh_identity, require_admin
 from studio_app.core._db import get_pool
@@ -152,9 +152,14 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
-        graph_lint(recipe)
+        # app#78 (workbench#48 breaking rename): `graph_lint()` bị xoá, thay bằng 2 hàm tách rời —
+        # `enforce_agent_shape` (agent_config/kb_binding/golden_set_ref) + `enforce_agent_topology`
+        # (recipe.dag, hình sao). Gọi tuần tự cả 2, cùng 1 try/except — đúng pattern nội bộ
+        # `packages/workbench`'s own `publish()` đã dùng (commit 9b23520), ValueError nổi lên đây bắt.
+        enforce_agent_shape(recipe)
+        enforce_agent_topology(recipe)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"recipe không qua graph_lint(): {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"recipe không qua validator: {exc}") from exc
 
     # `session.tenant_id`, KHÔNG phải `recipe.tenant_id` — dù hai giá trị này bằng nhau ở đây
     # (`create_recipe(tenant_id=session.tenant_id)` ngay trên). Đọc từ recipe sẽ là lần đầu tiên
@@ -185,9 +190,10 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
         # nhau về `agent_config`/`dag`/`kb_binding` (đo được: recipe được chấm còn có 1 node
         # `tool-call` admin chưa từng vẽ) — cổng đối chiếu hash ở `publish()` khi đó so hash CANVAS
         # với chính nó, không so được với thứ THẬT SỰ đã chạy, nên luôn khớp một cách vô nghĩa.
-        # `graph_lint(recipe)` đã chạy Ở TRÊN, ngay sau khi `create_recipe(...)` dựng xong
-        # recipe (neo bằng TÊN lệnh gọi, không phải số dòng — số dòng đã trôi thật ngay trong PR
-        # này, review app#26 🟡) — đúng tiền điều kiện `GRAPH-LINT-CONTRACT`
+        # `enforce_agent_shape(recipe)` + `enforce_agent_topology(recipe)` đã chạy Ở TRÊN, ngay sau
+        # khi `create_recipe(...)` dựng xong recipe (neo bằng TÊN lệnh gọi, không phải số dòng — số
+        # dòng đã trôi thật ngay trong PR này, review app#26 🟡; app#78 đổi từ `graph_lint(recipe)`
+        # cũ sang 2 hàm này, workbench#48) — đúng tiền điều kiện `GRAPH-LINT-CONTRACT`
         # mà `run_case` (eval_adapter.py) đòi hỏi cho nhánh `recipe=` được tiêm.
         recipe=recipe,
     )
@@ -230,8 +236,9 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
             core_min_answer=1,
             # DEC-03 hoàn thiện tại `studio_workbench.publish.recipe_hash()` — đây là mắt xích
             # DUY NHẤT còn thiếu của đường ống (evalhub đã mở `recipe_hash=` từ D20/`DEC-D20-02`,
-            # chỉ chưa có caller nào tính+truyền giá trị thật). Băm ĐÚNG `recipe` vừa graph_lint
-            # sạch ở trên — Scorecard trả về giờ chứng nhận đúng recipe SẼ publish, KHÔNG phải một
+            # chỉ chưa có caller nào tính+truyền giá trị thật). Băm ĐÚNG `recipe` vừa qua
+            # `enforce_agent_shape`/`enforce_agent_topology` sạch ở trên — Scorecard trả về giờ
+            # chứng nhận đúng recipe SẼ publish, KHÔNG phải một
             # recipe khác được dựng lại sau đó, CHỈ ĐÚNG vì `runner` ở trên được tiêm `recipe=recipe`
             # (review app#26 ⛔ — thiếu dòng đó thì `certified_recipe()` tự dựng recipe khác để
             # chạy, và hash ở đây sẽ chứng nhận nhầm đối tượng dù bản thân phép so ở `publish()`
@@ -334,8 +341,9 @@ async def publish_agent(agent_id: str, body: PublishRequest) -> dict[str, object
     try:
         await publish(recipe, scorecard, conn=get_request_connection())
     except ValueError as exc:
-        # `publish()` raise ValueError cho CẢ 4 nhánh chặn: graph_lint nội bộ của nó (đã kiểm ở
-        # trên nên khó trúng lại), `recipe_hash is None`, `recipe_hash` LỆCH với recipe đang publish
+        # `publish()` raise ValueError cho CẢ 4 nhánh chặn: `enforce_agent_shape`/
+        # `enforce_agent_topology` nội bộ của nó (app#78/workbench#48 — đã kiểm ở trên nên khó
+        # trúng lại), `recipe_hash is None`, `recipe_hash` LỆCH với recipe đang publish
         # (`workbench#27`, review app#26 ⛔), và `gate.verdict == 'FAIL'`. 409, không 400: đây
         # không phải lỗi INPUT của client, mà là "recipe hợp lệ nhưng CHƯA ĐỦ ĐIỀU KIỆN xuất bản".
         raise HTTPException(

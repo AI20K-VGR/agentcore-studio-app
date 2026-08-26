@@ -74,12 +74,14 @@ def _body(**overrides: object) -> _TestChatRequest:
         "agent_id": "agent-test-chat",
         "system_prompt": "Tra cứu quy trình và bảo mật Callisto.",
         "tool_whitelist": [],
+        # app#78 (workbench#48): star topology mới cấm hẳn node type "end" — 2-node
+        # kb-retrieve -> llm-step (hub-spoke, đúng 1 llm-step) là hình tối thiểu pass cả
+        # `enforce_agent_shape`/`enforce_agent_topology`.
         "nodes": [
             {"id": "n1", "type": "kb-retrieve", "params": {}},
             {"id": "n2", "type": "llm-step", "params": {"temperature": 0.0}},
-            {"id": "n4", "type": "end", "params": {}},
         ],
-        "edges": [{"from": "n1", "to": "n2"}, {"from": "n2", "to": "n4"}],
+        "edges": [{"from": "n1", "to": "n2"}],
         "message": "nghỉ phép cần báo trước bao lâu?",
     }
     base.update(overrides)
@@ -109,9 +111,10 @@ async def test_run_test_chat_rejects_invalid_node(monkeypatch: pytest.MonkeyPatc
     assert exc_info.value.status_code == 400
 
 
-async def test_run_test_chat_rejects_graph_lint_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_run_test_chat_rejects_agent_topology_lint_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(test_chat_module, "get_pool", _fake_get_pool)
-    # 1 node kb-retrieve lơ lửng, không nối gì — graph_lint từ chối (thiếu edge/end reachability).
+    # app#78 (workbench#48): 1 node kb-retrieve lơ lửng, không nối gì, 0 node llm-step —
+    # `enforce_agent_topology` từ chối (`dag.exactly_one_llm_node`: cần đúng 1, tìm thấy 0).
     body = _body(
         nodes=[{"id": "n1", "type": "kb-retrieve", "params": {}}],
         edges=[],

@@ -103,11 +103,14 @@ def _settings(tmp_path: Path) -> Settings:
 
 
 def _body() -> PublishRequest:
+    # app#78 (workbench#48): star topology mới cấm "end" và đòi đúng 1 node llm-step —
+    # kb-retrieve -> llm-step (hub-spoke) là hình tối thiểu pass cả `enforce_agent_shape`/
+    # `enforce_agent_topology`.
     return PublishRequest(
         agent_id="agent-golden-from-db",
         system_prompt="x",
         tool_whitelist=[],
-        nodes=[{"id": "n1", "type": "kb-retrieve", "params": {}}, {"id": "n2", "type": "end", "params": {}}],
+        nodes=[{"id": "n1", "type": "kb-retrieve", "params": {}}, {"id": "n2", "type": "llm-step", "params": {}}],
         edges=[{"from": "n1", "to": "n2"}],
     )
 

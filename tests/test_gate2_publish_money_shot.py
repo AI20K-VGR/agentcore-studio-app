@@ -9,7 +9,8 @@
 phải số dòng — số dòng trôi mỗi lần file đó đổi, và đã từng trôi thật ở chính docstring này, xem
 review `app#26` 🟡):
 
-    1. graph_lint(recipe)                              raise ValueError(… lỗi graph-lint …)
+    1. enforce_agent_shape(recipe) + enforce_agent_topology(recipe)  raise ValueError(… lỗi lint …)
+       (app#78/workbench#48 — trước đây 1 `graph_lint(recipe)`, nay tách 2 hàm)
     2. scorecard.recipe_hash is None                    raise ValueError(… "recipe_hash" …)
     3. scorecard.recipe_hash != recipe_hash(recipe)     raise ValueError(… "chứng nhận một recipe KHÁC" …)
     4. scorecard.gate.verdict == "FAIL"                 await _reassert_last_published(…) rồi
@@ -79,7 +80,8 @@ def _recipe(agent_id: str) -> Recipe:
     dựng ở nhánh không tiêm `recipe=` (workbench#41 — `create_recipe_d4` đã bị xoá). Import thay vì
     chép tay: khẳng định "cùng DAG với đường thật" được `import` ép buộc, không chỉ là lời hứa
     trong docstring — ngày `certified_recipe()` đổi DAG, bài này tự động đổi theo, không cần ai
-    nhớ sửa 2 chỗ. Nhờ vậy bài này đi qua `graph_lint` y như đường thật."""
+    nhớ sửa 2 chỗ. Nhờ vậy bài này đi qua `enforce_agent_shape`/`enforce_agent_topology` y như đường
+    thật (app#78/workbench#48 — trước đây `graph_lint`)."""
     return create_recipe(
         agent_id=agent_id,
         tenant_id=ANKOR_ID,
