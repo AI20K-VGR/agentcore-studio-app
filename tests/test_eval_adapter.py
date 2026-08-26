@@ -124,7 +124,10 @@ async def test_run_case_maps_llm_output_to_agent_answer() -> None:
 
     app#44: `kb_search` không còn chạy vô điều kiện (khác DAG cũ) — LLM double phải TỰ phát
     `TOOL_CALL: kb_search` (lượt 1) rồi trả lời trích dẫn (lượt 2), `_MultiTurnScriptedLLM` thay
-    `_ScriptedLLM` một câu. Event sequence giờ `["llm-step","kb-retrieve","llm-step"]` — không còn
+    `_ScriptedLLM` một câu. Event sequence giờ `["llm-step","kb-retrieve","llm-step","llm-step"]` —
+    lượt cuối tách 2 event vì engine#43 (citation-faithfulness verify) tự thêm 1 lệnh `llm.complete()`
+    + `TraceEvent` (`node_type=LLM_STEP`) TRƯỚC event của chính câu trả lời, chạy mỗi khi câu trả lời
+    có ≥1 citation (script thêm `"CO"` — pass faithfulness, giữ nguyên citation). Không còn
     `tool-call`/`end` cố định (đó là 2 trong 6 `NodeType` của DAG cũ, vòng lặp mới chỉ phát 3:
     `LLM_STEP`/`KB_RETRIEVE`/`TOOL_CALL`, và `TOOL_CALL` chỉ khi model gọi 1 tool KHÁC `kb_search`)."""
     kb = _RecordingKbSearch([_item("ankor-leave-001#c1"), _item("ankor-leave-001#c2")])
@@ -133,6 +136,7 @@ async def test_run_case_maps_llm_output_to_agent_answer() -> None:
         [
             'TOOL_CALL: {"tool": "kb_search", "params": {"query": "nghỉ phép?"}}',
             "Cần báo trước 3 ngày làm việc [ankor-leave-001#c1].",
+            "CO",  # engine#43 faithfulness-verify — chunk có thật, pass check, giữ citation
         ]
     )
     runner = _runner(kb, llm, writer)
@@ -144,7 +148,7 @@ async def test_run_case_maps_llm_output_to_agent_answer() -> None:
     assert case_run.answer.answer == "Cần báo trước 3 ngày làm việc [ankor-leave-001#c1]."
     assert case_run.answer.citations == ["ankor-leave-001#c1"]
     assert case_run.answer.refused is False
-    assert [e.node_type.value for e in case_run.events] == ["llm-step", "kb-retrieve", "llm-step"]
+    assert [e.node_type.value for e in case_run.events] == ["llm-step", "kb-retrieve", "llm-step", "llm-step"]
 
 
 async def test_run_case_threads_tenant_uuid_and_roles() -> None:
@@ -157,6 +161,7 @@ async def test_run_case_threads_tenant_uuid_and_roles() -> None:
         [
             'TOOL_CALL: {"tool": "kb_search", "params": {"query": "duyệt chi?"}}',
             "Tối đa 20 triệu đồng [ankor-expense-001#c2].",
+            "CO",  # engine#43 faithfulness-verify
         ]
     )
     runner = _runner(kb, llm, writer)
@@ -262,11 +267,16 @@ async def test_run_case_events_passthrough_from_trace() -> None:
     """KHÓA A3: CaseRun.events == events đã emit qua trace_writer, nguyên vẹn cùng thứ tự —
     đây là nguồn chấm citation của evalhub, adapter không được tự chế/lọc.
 
-    app#44: 3 event (`llm-step`,`kb-retrieve`,`llm-step`) — không còn 4 node DAG cố định."""
+    app#44: 4 event (`llm-step`,`kb-retrieve`,`llm-step`,`llm-step`) — không còn 4 node DAG cố định.
+    Event thứ 4 là engine#43's citation-faithfulness verify call (chạy vì câu trả lời có citation)."""
     kb = _RecordingKbSearch([_item("ankor-leave-001#c1")])
     writer = _CollectingTraceWriter()
     llm = _MultiTurnScriptedLLM(
-        ['TOOL_CALL: {"tool": "kb_search", "params": {"query": "q?"}}', "ok [ankor-leave-001#c1]"]
+        [
+            'TOOL_CALL: {"tool": "kb_search", "params": {"query": "q?"}}',
+            "ok [ankor-leave-001#c1]",
+            "CO",  # engine#43 faithfulness-verify
+        ]
     )
     runner = _runner(kb, llm, writer)
 
@@ -275,7 +285,7 @@ async def test_run_case_events_passthrough_from_trace() -> None:
     )
 
     assert case_run.events == writer.events
-    assert len(case_run.events) == 3
+    assert len(case_run.events) == 4
 
 
 @pytest.mark.parametrize(
@@ -298,7 +308,13 @@ async def test_run_case_surfaces_engine_refusal_faithfully(final_answer_text: st
     hợp đồng của adapter (map trung thực, không tự chế/nuốt cờ) mà KHÔNG pin luật refusal của engine
     — luật đó thuộc engine và có test riêng bên đó."""
     query, roles = "nghỉ phép?", ["public"]
-    scripted_responses = ['TOOL_CALL: {"tool": "kb_search", "params": {"query": "nghỉ phép?"}}', final_answer_text]
+    # engine#43 faithfulness-verify — chạy khi câu trả lời có citation, không chạy khi rỗng (nhánh
+    # `_REFUSAL` không tiêu thụ phần tử thứ 3 này, `_MultiTurnScriptedLLM` cho phép dư kịch bản).
+    scripted_responses = [
+        'TOOL_CALL: {"tool": "kb_search", "params": {"query": "nghỉ phép?"}}',
+        final_answer_text,
+        "CO",
+    ]
 
     # (1) Sự thật gốc — engine tự quyết.
     # `session_context` dựng bằng CHÍNH `resolve_session` mà adapter dùng, cùng dict đầu vào: so hai
@@ -553,9 +569,10 @@ async def test_prompt_carries_retrieved_chunk_ids() -> None:
         agent_id="a", query="nghỉ phép báo trước bao lâu?", tenant_id=TENANT_ID, section_roles=["public"]
     )
 
-    # app#44: 2 lượt — lượt 1 (chưa search) phát TOOL_CALL, lượt 2 (đã có observation) đọc chunk.
-    # Khác DAG cũ (1 lượt, chunk đã có sẵn trước khi llm-step chạy).
-    assert len(llm.prompts_seen) == 2, "llm.complete() phải được gọi đúng 2 lượt (tool-call rồi final-answer)"
+    # app#44: 3 lượt — lượt 1 (chưa search) phát TOOL_CALL, lượt 2 (đã có observation) đọc chunk,
+    # lượt 3 là engine#43's citation-faithfulness verify (chạy vì câu trả lời lượt 2 có citation) —
+    # `ExtractiveFakeLLM.complete()` ghi MỌI prompt nhận được vào `prompts_seen` kể cả lượt verify.
+    assert len(llm.prompts_seen) == 3, "llm.complete() phải được gọi đúng 3 lượt (tool-call, final-answer, verify)"
     assert "nghỉ phép báo trước bao lâu?" in llm.prompts_seen[0], "lượt 1 phải mang câu hỏi (chưa có chunk)"
     prompt = llm.prompts_seen[1]
     assert "[ankor-leave-001#c1]\nBáo trước 3 ngày làm việc." in prompt
@@ -704,7 +721,11 @@ async def test_run_case_kb_search_always_available_even_without_injected_recipe(
     kb = _RecordingKbSearch([_item("ankor-leave-001#c1")])
     writer = _CollectingTraceWriter()
     llm = _MultiTurnScriptedLLM(
-        ['TOOL_CALL: {"tool": "kb_search", "params": {"query": "q?"}}', "ok [ankor-leave-001#c1]"]
+        [
+            'TOOL_CALL: {"tool": "kb_search", "params": {"query": "q?"}}',
+            "ok [ankor-leave-001#c1]",
+            "CO",  # engine#43 faithfulness-verify
+        ]
     )
     runner = _runner(kb, llm, writer)
 
