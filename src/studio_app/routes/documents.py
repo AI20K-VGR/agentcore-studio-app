@@ -24,10 +24,17 @@ route này validate `section_role` qua `fetch_tenant_section_names` — đúng h
 dùng cho `as_roles` — thay vì 1 vocab cố định.
 
 **`doc_id` (cột `kb.chunks.doc_id`, tách khỏi vai trò PK của `chunk_id`) = `{slug(section_role)}-
-{slug(stem)}`** — vd `("hr", "Bao Cao Q1.docx")` → `"hr-bao-cao-q1"`. Route xoá TOÀN BỘ chunk cũ
-cùng `doc_id` (`KbPipeline.delete_by_doc_id`) TRƯỚC khi ghi chunk mới, nên re-upload không còn để
-lại `chunk_id` mồ côi (đóng giới hạn cũ từng ghi ở đây — bản có ÍT chunk hơn bản trước không còn
-sót dòng thừa).
+{slug(stem)}-{đuôi file}`** — vd `("hr", "Bao Cao Q1.docx")` → `"hr-bao-cao-q1-docx"`. Route xoá
+TOÀN BỘ chunk cũ cùng `doc_id` (`KbPipeline.delete_by_doc_id`) TRƯỚC khi ghi chunk mới, nên
+re-upload không còn để lại `chunk_id` mồ côi (đóng giới hạn cũ từng ghi ở đây — bản có ÍT chunk
+hơn bản trước không còn sót dòng thừa).
+
+`đuôi file` nằm trong khoá — phát hiện thật trên dữ liệu tenant Ricons: `"quy chế lương thưởng -
+hr.docx"` và `"quy chế lương thưởng - hr.md"` là 2 tài liệu GỐC khác nhau (khác định dạng, khác
+nội dung ruột) nhưng CÙNG `section_role`, CÙNG `stem` sau khi `Path.stem` bỏ đuôi — thiếu đuôi
+trong khoá thì 2 file này đụng `doc_id`, file upload sau ghi đè êm file trước qua
+`delete_by_doc_id` mà không ai biết. `SUPPORTED_SUFFIXES` đã chặn đuôi lạ trước khi tới đây nên
+giá trị này luôn là `"md"`/`"txt"`/`"docx"`.
 
 `section_role` BẮT BUỘC nằm trong khoá — review app#58 (dholmes0207): bản trước chỉ dùng
 `slug(stem)`, nên 2 tài liệu CÙNG TÊN FILE ở 2 phòng ban khác nhau (khác `section_role`, tức khác
@@ -36,12 +43,15 @@ ranh giới phân quyền đọc — `fetch_tenant_section_names`/`as_roles` ở
 được: upload `leave.md` vào `hr` rồi `finance` xoá mất bản `hr` — không lỗi, không cảnh báo.
 
 **Rủi ro đã biết, chấp nhận CÓ CHỦ ĐÍCH (không chặn):** 2 file GỐC khác nhau, CÙNG `section_role`,
-có thể slugify tên ra CÙNG `doc_id` (vd `"Doc 123.md"` và `"doc-123.md"` đều ra `"doc-123"`) — route
-không phân biệt được với một re-upload hợp lệ, nên file sau **ghi đè êm** file trước (không có
-UNIQUE constraint, không 409). Không dựng bảng đăng ký tên gốc để chặn cứng — `kb.chunks` là
-1-dòng-1-chunk nên nhiều dòng của cùng 1 doc BẮT BUỘC chia sẻ 1 `doc_id`; UNIQUE(tenant_id, doc_id)
-trực tiếp trên bảng này là sai kỹ thuật, và một bảng đăng ký riêng nằm ngoài phạm vi yêu cầu hiện
-tại. Khác ca chéo phòng ban ở trên: đây LÀ cùng một ranh giới phân quyền, nên đánh đổi hợp lý.
+CÙNG đuôi file, có thể slugify tên ra CÙNG `doc_id` (vd `"Doc 123.md"` và `"doc-123.md"` đều ra
+`"doc-123-md"`) — route không phân biệt được với một re-upload hợp lệ, nên file sau **ghi đè êm**
+file trước (không có UNIQUE constraint, không 409). Không dựng bảng đăng ký tên gốc để chặn cứng —
+`kb.chunks` là 1-dòng-1-chunk nên nhiều dòng của cùng 1 doc BẮT BUỘC chia sẻ 1 `doc_id`;
+UNIQUE(tenant_id, doc_id) trực tiếp trên bảng này là sai kỹ thuật, và một bảng đăng ký riêng nằm
+ngoài phạm vi yêu cầu hiện tại. Khác ca chéo phòng ban ở trên: đây LÀ cùng một ranh giới phân
+quyền, nên đánh đổi hợp lý. Khác ca chéo-đuôi-file đã đóng ở trên: đây LÀ cùng một định dạng, chỉ
+khác cách gõ tên — 2 file GÕ TÊN khác nhau ra cùng chuỗi vẫn có thể là 1 người dùng lỡ tay đặt tên
+khác đi cho cùng 1 tài liệu, không phải 2 tài liệu độc lập như ca khác đuôi file.
 
 **`doc_name` (cột `kb.chunks.doc_name`) = `stem` NGUYÊN VĂN, KHÔNG qua `_slugify`** — vd
 `("hr", "Bao Cao Q1.docx")` → `"Bao Cao Q1"`. Tách riêng khỏi `doc_id` vì luật hiển thị: dữ liệu
@@ -315,9 +325,17 @@ async def upload_document(
     # đúng như người upload đặt tên — luật hiển thị cấm đưa thẳng `doc_id`/`chunk_id` (dữ liệu nội
     # bộ, đã slugify/hash) lên UI.
     stem = Path(file.filename).stem
+    # `suffix` — đuôi file KHÔNG dấu chấm, hạ thường (`SUPPORTED_SUFFIXES` đã chặn ở trên nên đây
+    # luôn là "md"/"txt"/"docx", không rỗng, không lạ). Vào `doc_id` để đóng đúng ca va chạm phát
+    # hiện thật trên dữ liệu Ricons: "quy chế lương thưởng - hr.docx" và "... - hr.md" CÙNG
+    # `section_role`, CÙNG `stem` (đuôi bị `Path.stem` bỏ trước khi vào slug) — không có `suffix`,
+    # 2 file GỐC khác định dạng này đụng `doc_id`, file sau ghi đè êm file trước qua
+    # `delete_by_doc_id`, y hệt ca "Doc 123.md"/"doc-123.md" đã biết ở trên nhưng đây là 2 tài liệu
+    # khác nhau về NỘI DUNG lẫn ĐỊNH DẠNG, không phải 2 cách gõ cùng 1 tên.
+    suffix = Path(file.filename).suffix.lstrip(".").lower()
     name_hash = hashlib.sha256(file.filename.encode("utf-8")).hexdigest()[:8]
     chunk_id_prefix = f"{tenant_uuid.hex}-{_slugify(section_role)}-{_slugify(stem)}-{name_hash}"
-    doc_id = f"{_slugify(section_role)}-{_slugify(stem)}"
+    doc_id = f"{_slugify(section_role)}-{_slugify(stem)}-{suffix}"
 
     chunks = cut_window(text, chunk_id_prefix, tenant_uuid, section_role)
     if not chunks:
