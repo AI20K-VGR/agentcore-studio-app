@@ -203,6 +203,55 @@ async def test_reupload_ten_trung_khac_phong_ban_khong_xoa_nham(admin_pool: Pool
     assert dict(rows) == {"hr": 1, "finance": 1}, "cả hai tài liệu phải còn sống — không cái nào bị xoá nhầm"
 
 
+async def test_reupload_don_duoc_chunk_legacy_doc_id_khong_co_duoi(admin_pool: Pool) -> None:
+    """Review Dozyboy (PR#84 changes-requested): `doc_id` đổi công thức (thêm đuôi file) không có
+    đường migrate cho chunk đã ghi TỪ TRƯỚC bản vá — chunk đó vẫn mang `doc_id` dạng cũ (không
+    đuôi). Nếu route chỉ xoá theo `doc_id` MỚI, lần re-upload ĐẦU TIÊN sau deploy sẽ không xoá
+    trúng chunk cũ — mồ côi vĩnh viễn, `list_documents` hiện 2 dòng cho cùng 1 tài liệu.
+
+    Test này giả lập đúng tình huống: tự ghi thẳng 1 chunk `doc_id="hr-leave"` (dạng cũ, không
+    đuôi — khớp tay công thức TRƯỚC bản vá suffix) vào `kb.chunks`, không qua route (route giờ
+    không thể tự tạo ra `doc_id` dạng cũ nữa). Rồi upload `leave.md` — chunk legacy phải biến
+    mất, chỉ còn đúng 1 chunk mang `doc_id` MỚI."""
+    from studio_app.providers.factory import CallistoStubEmbedding
+    from studio_kb.doc_factory_core import Chunk
+    from studio_kb.pipeline import KbPipeline
+
+    tenant_id = await _seed_tenant(admin_pool, "documents-probe-legacy")
+    admin_id = await _seed_user(admin_pool, tenant_id, "admin@acme.com", ["admin"])
+    await _seed_section(admin_pool, tenant_id, "hr", admin_id)
+
+    pipeline = KbPipeline(admin_pool, CallistoStubEmbedding())
+    legacy_chunk = Chunk(
+        chunk_id="legacy-leave#c1",
+        text="Noi dung tu truoc ban va doc_id them duoi file.",
+        tenant_id=tenant_id,
+        section_role="hr",
+        doc_id="hr-leave",  # dạng cũ (PRE bản vá đuôi file) — khớp slug("hr") + slug("leave")
+        doc_name="leave",
+    )
+    await pipeline.index([legacy_chunk], await pipeline.embed_invoke([legacy_chunk]))
+
+    token = _set_session(tenant_id=tenant_id, user="admin@acme.com", system_roles=["admin"])
+    try:
+        async with _simulate_request_connection():
+            result = await upload_document(
+                file=_md_upload_file("leave.md", _VALID_MD),
+                section_role="hr",
+                tenant_id=None,
+            )
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert result.doc_id == "hr-leave-md"
+
+    async with admin_pool.connection() as conn:
+        await conn.execute("SELECT set_config('app.tenant_id', %s, true)", (str(tenant_id),))
+        cur = await conn.execute("SELECT doc_id FROM kb.chunks WHERE tenant_id = %s ORDER BY doc_id", (str(tenant_id),))
+        rows = [r[0] for r in await cur.fetchall()]
+    assert rows == ["hr-leave-md"], "chunk legacy (doc_id cũ, không đuôi) phải bị dọn — không mồ côi"
+
+
 async def test_hai_duoi_file_cung_ten_khong_ghi_de_nhau(admin_pool: Pool) -> None:
     """2 file GỐC khác nhau, CÙNG `section_role`, CÙNG stem (`Path.stem` bỏ đuôi trước khi vào
     `doc_id`), khác đuôi (`.md` vs `.txt`) — trước bản vá này, `doc_id` không mang đuôi file nên
