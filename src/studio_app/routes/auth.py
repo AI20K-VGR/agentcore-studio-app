@@ -91,6 +91,13 @@ class LoginResponse(BaseModel):
     đề."""
     user: str
     system_roles: list[str]
+    must_change_password: bool = False
+    """Admin vừa đặt lại mật khẩu HỘ tài khoản này (`routes/admin.py::reset_employee_password`) —
+    UI phải đưa thẳng người dùng tới màn đổi mật khẩu trước khi cho vào phần khác.
+
+    Cần thiết vì đường tạo tài khoản hiện tại để admin tự nghĩ mật khẩu rồi nhắn cho nhân viên: nếu
+    không buộc đổi, admin biết mật khẩu của mọi người trong công ty vô thời hạn (quyết định D1,
+    app#76). Cờ tắt khi chính chủ tự đổi qua `change_own_password` bên dưới."""
     """CỐ Ý không có `password`/`password_hash` ở bất kỳ đâu trong response — xem
     `test_admin_routes.py::test_password_hash_never_leaks_in_any_admin_response`."""
 
@@ -146,7 +153,8 @@ async def login(body: LoginRequest, request: Request) -> LoginResponse:
 
     conn = get_request_connection()
     cur = await conn.execute(
-        "SELECT u.tenant_id, u.password_hash, u.system_roles, u.is_active, t.name, t.is_active "
+        "SELECT u.tenant_id, u.password_hash, u.system_roles, u.is_active, t.name, t.is_active, "
+        "u.must_change_password "
         "FROM core.users u JOIN core.tenants t ON t.id = u.tenant_id WHERE u.email = %s",
         (body.email,),
     )
@@ -169,7 +177,13 @@ async def login(body: LoginRequest, request: Request) -> LoginResponse:
     if row is None or not password_ok or not row[3] or not row[5]:
         raise HTTPException(status_code=401, detail="Email hoặc mật khẩu không đúng.")
 
-    tenant_id, _password_hash, roles, _is_active, tenant_name, _tenant_is_active = row
+    tenant_id, _password_hash, roles, _is_active, tenant_name, _tenant_is_active, must_change_password = row
+
+    # Ghi `last_login_at` SAU khi đã xác thực xong, không trước (app#76). Ghi sớm — kể cả cho lần
+    # đăng nhập sai — biến cột này thành oracle: kẻ dò chỉ cần so mốc trước/sau là biết email nào
+    # tồn tại, phá đúng nguyên tắc mà mọi nhánh thất bại ở trên đang giữ (cùng 401, cùng thông
+    # điệp, cùng chi phí bcrypt).
+    await conn.execute("UPDATE core.users SET last_login_at = now() WHERE email = %s", (body.email,))
     effective_roles = list(roles)
     if "admin" in effective_roles:
         # Admin công ty = quyền cao nhất TRONG tenant đó — mặc định thấy MỌI nội dung KB, không
@@ -202,6 +216,7 @@ async def login(body: LoginRequest, request: Request) -> LoginResponse:
         tenant_name=tenant_name,
         user=resolved.user,
         system_roles=resolved.system_roles,
+        must_change_password=must_change_password,
     )
 
 
@@ -275,7 +290,11 @@ async def change_own_password(body: ChangePasswordRequest) -> dict[str, str]:
     # `authz.fetch_fresh_identity` so với `iat` của MỌI JWT gọi vào sau đó để hết hiệu lực JWT ký
     # từ trước lần đổi này (review app#21 🔶, xem `core/schema.py`).
     await conn.execute(
-        "UPDATE core.users SET password_hash = %s, password_changed_at = now() WHERE email = %s",
+        # Tắt `must_change_password` ở ĐÂY, cùng câu ghi hash — đây là đúng nghĩa "chính chủ đã tự
+        # đổi", tức lý do bật cờ (admin biết mật khẩu vì tự gõ hộ) đã hết. Tách thành câu riêng sẽ
+        # có cửa sổ mà mật khẩu đã đổi nhưng cờ còn bật, và người dùng bị hỏi đổi lần nữa.
+        "UPDATE core.users SET password_hash = %s, password_changed_at = now(), "
+        "must_change_password = false WHERE email = %s",
         (new_hash, session.user),
     )
     return {"detail": "Đã đổi mật khẩu."}

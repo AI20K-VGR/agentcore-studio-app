@@ -311,7 +311,33 @@ class UserSummary(BaseModel):
     system_roles: list[str]
     is_active: bool
     created_at: str
+    display_name: str | None = None
+    """Tên người đọc được. `None` = chưa khai — chỗ hiển thị lùi về `email`, KHÔNG bịa ra một tên.
+    Không bắt buộc vì bắt buộc sẽ chặn đường tạo hàng loạt và làm hỏng mọi tài khoản đã tồn tại
+    (quyết định D3, app#76)."""
+    last_login_at: str | None = None
+    """`None` = **chưa từng đăng nhập**, khác hẳn "đăng nhập lâu rồi". Đây là hai trạng thái mà chỗ
+    đọc phải phân biệt: một tài khoản vừa tạo chưa ai dùng, so với một tài khoản bỏ hoang."""
     """CỐ Ý không có `password`/`password_hash` — xem `test_admin_routes.py`."""
+
+
+# Một danh sách cột, một hàm dựng — trước app#76 có SÁU chỗ tự viết lại cùng câu SELECT và cùng
+# phép ánh xạ tuple→model. Thêm một cột nghĩa là sửa đúng sáu chỗ, và bỏ sót một chỗ thì route đó
+# âm thầm trả `None` cho một field CÓ giá trị thật — không lỗi ở đâu cả, chỉ là UI thiếu dữ liệu.
+_USER_COLUMNS = "id, email, system_roles, is_active, created_at, display_name, last_login_at"
+
+
+def _to_user_summary(row: tuple[Any, ...]) -> UserSummary:
+    """Ánh xạ một dòng `_USER_COLUMNS` sang `UserSummary`. Thứ tự cột phải khớp `_USER_COLUMNS`."""
+    return UserSummary(
+        user_id=str(row[0]),
+        email=row[1],
+        system_roles=list(row[2]),
+        is_active=row[3],
+        created_at=row[4].isoformat(),
+        display_name=row[5],
+        last_login_at=row[6].isoformat() if row[6] is not None else None,
+    )
 
 
 @router.get("/users", response_model=list[UserSummary])
@@ -325,21 +351,28 @@ async def list_users() -> list[UserSummary]:
     require_admin(identity.system_roles)
 
     cur = await conn.execute(
-        "SELECT id, email, system_roles, is_active, created_at FROM core.users "
-        "WHERE tenant_id = %s ORDER BY created_at DESC",
+        "SELECT " + _USER_COLUMNS + " FROM core.users WHERE tenant_id = %s ORDER BY created_at DESC",
         (str(identity.tenant_id),),
     )
     rows = await cur.fetchall()
-    return [
-        UserSummary(
-            user_id=str(row[0]),
-            email=row[1],
-            system_roles=list(row[2]),
-            is_active=row[3],
-            created_at=row[4].isoformat(),
-        )
-        for row in rows
-    ]
+    return [_to_user_summary(row) for row in rows]
+
+
+async def _valid_role_vocab(conn: AsyncConnection[Any], tenant_id: UUID) -> set[str]:
+    """Từ vựng role hợp lệ của một tenant: `core.sections` của chính nó, trừ `RESERVED_ROLE_NAMES`,
+    hợp với `{"admin"}`.
+
+    Trừ `RESERVED_ROLE_NAMES` TRƯỚC khi hợp với `{"admin"}` — tầng 2 của bản vá app#21 ⛔ (tầng 1:
+    `reject_reserved_section_name` chặn tạo/đổi tên section trùng role hệ thống). Cần tầng này
+    RIÊNG vì DB có thể đã có sẵn 1 dòng `core.sections` tên `"superadmin"` từ TRƯỚC khi tầng 1 tồn
+    tại — không trừ ở đây thì dòng cũ đó vẫn âm thầm cấp quyền gán superadmin cho mọi company-admin
+    của tenant đó, bất kể validator mới đã chặn được record MỚI.
+
+    Gom về một hàm ở app#76: cùng 8 dòng này từng nằm chép tay ở `create_user` và
+    `update_user_roles`, và route thứ ba cần nó sẽ chép lần thứ ba."""
+    cur = await conn.execute("SELECT name FROM core.sections WHERE tenant_id = %s", (str(tenant_id),))
+    section_names = {row[0] for row in await cur.fetchall()}
+    return (section_names - RESERVED_ROLE_NAMES) | {"admin"}
 
 
 async def _fetch_user_in_own_tenant(conn: AsyncConnection[Any], user_id: str, tenant_id: UUID) -> None:
@@ -355,13 +388,26 @@ async def _fetch_user_in_own_tenant(conn: AsyncConnection[Any], user_id: str, te
 
 
 class UpdateUserRolesRequest(BaseModel):
-    system_roles: list[str]
+    """Cả ba field đều TUỲ CHỌN — `None` = *không đụng tới*, khác hẳn "đặt về rỗng".
+
+    `system_roles` từng là field bắt buộc duy nhất; nới thành tuỳ chọn không phá client cũ (chúng
+    vẫn gửi đúng field đó), và mở đường cho hai field mới của app#76."""
+
+    system_roles: list[str] | None = None
+    email: str | None = None
+    display_name: str | None = None
+
+    _normalize_email = field_validator("email")(normalize_email)
 
 
 @router.patch("/users/{user_id}", response_model=UserSummary)
 async def update_user_roles(user_id: str, body: UpdateUserRolesRequest) -> UserSummary:
-    """Admin-only, đổi `system_roles` của 1 nhân viên TRONG CHÍNH tenant mình — cùng validate vocab động
-    theo `core.sections` như `create_user` (không tin riêng UI chặn).
+    """Admin-only, sửa `system_roles` / `email` / `display_name` của 1 nhân viên TRONG CHÍNH tenant
+    mình — cùng validate vocab động theo `core.sections` như `create_user` (không tin riêng UI chặn).
+
+    Sửa email là đường thoát cho ca gõ nhầm lúc tạo: `core.users.email` UNIQUE **toàn hệ thống**,
+    nên tài khoản mang email sai vừa vô dụng vừa chiếm mất địa chỉ đúng — không sửa được thì không
+    có cách nào lấy lại địa chỉ đó.
 
     KHÔNG cho tự sửa role của CHÍNH tài khoản đang đăng nhập (cùng lý do `deactivate_user` chặn tự
     vô hiệu hoá chính mình) — admin duy nhất của công ty lỡ tay bỏ `"admin"` khỏi chính roles của
@@ -373,40 +419,50 @@ async def update_user_roles(user_id: str, body: UpdateUserRolesRequest) -> UserS
     require_admin(identity.system_roles)
     await _fetch_user_in_own_tenant(conn, user_id, identity.tenant_id)
 
-    if user_id == str(identity.id):
+    if body.system_roles is None and body.email is None and body.display_name is None:
+        # `PATCH {}` gần như luôn là bug phía client (quên map field) — vỡ ra ngay còn hơn "200
+        # nhưng chẳng đổi gì".
+        raise HTTPException(status_code=400, detail="Cần ít nhất 1 trong 3 trường: system_roles, email, display_name.")
+
+    is_self = user_id == str(identity.id)
+    if is_self and body.system_roles is not None:
         raise HTTPException(status_code=400, detail="Không thể tự sửa role của chính tài khoản đang đăng nhập.")
+    if is_self and body.email is not None:
+        # Email là định danh đăng nhập: gõ nhầm là tự khoá mình ra ngoài, và không ai TRONG công ty
+        # gỡ được (superadmin phải cấp tài khoản admin mới).
+        raise HTTPException(status_code=400, detail="Không thể tự đổi email của chính tài khoản đang đăng nhập.")
 
-    cur = await conn.execute(
-        "SELECT name FROM core.sections WHERE tenant_id = %s",
-        (str(identity.tenant_id),),
-    )
-    section_names = {row[0] for row in await cur.fetchall()}
-    # Trừ `RESERVED_ROLE_NAMES` khỏi `section_names` TRƯỚC khi hợp với `{"admin"}` — tầng 2 của
-    # bản vá app#21 ⛔ (tầng 1: `reject_reserved_section_name` chặn tạo/đổi tên section trùng role
-    # hệ thống). Cần tầng này RIÊNG vì DB có thể đã có sẵn 1 dòng `core.sections` tên `"superadmin"`
-    # từ TRƯỚC khi tầng 1 tồn tại — không trừ ở đây thì dòng cũ đó vẫn âm thầm cấp quyền tạo/gán
-    # superadmin cho mọi company-admin của tenant đó, bất kể validator mới đã chặn được record MỚI.
-    valid_role_vocab = (section_names - RESERVED_ROLE_NAMES) | {"admin"}
+    if body.system_roles is not None:
+        valid_role_vocab = await _valid_role_vocab(conn, identity.tenant_id)
+        invalid_roles = set(body.system_roles) - valid_role_vocab
+        if invalid_roles:
+            raise HTTPException(
+                status_code=400,
+                detail=f"role {sorted(invalid_roles)} không hợp lệ — chỉ chấp nhận {sorted(valid_role_vocab)}",
+            )
+        if not body.system_roles:
+            raise HTTPException(status_code=400, detail="roles không được rỗng.")
+        await conn.execute("UPDATE core.users SET system_roles = %s WHERE id = %s", (body.system_roles, user_id))
 
-    invalid_roles = set(body.system_roles) - valid_role_vocab
-    if invalid_roles:
-        raise HTTPException(
-            status_code=400,
-            detail=f"role {sorted(invalid_roles)} không hợp lệ — chỉ chấp nhận {sorted(valid_role_vocab)}",
+    if body.display_name is not None:
+        # Chuỗi rỗng = XOÁ tên, hiển thị lùi về email. Ca thật (gõ nhầm tên rồi muốn bỏ hẳn), và
+        # không có nó thì tên đã đặt là vĩnh viễn.
+        await conn.execute(
+            "UPDATE core.users SET display_name = %s WHERE id = %s",
+            (body.display_name.strip() or None, user_id),
         )
-    if not body.system_roles:
-        raise HTTPException(status_code=400, detail="roles không được rỗng.")
 
-    cur = await conn.execute(
-        "UPDATE core.users SET system_roles = %s WHERE id = %s "
-        "RETURNING id, email, system_roles, is_active, created_at",
-        (body.system_roles, user_id),
-    )
+    if body.email is not None:
+        try:
+            async with conn.transaction():
+                await conn.execute("UPDATE core.users SET email = %s WHERE id = %s", (body.email, user_id))
+        except psycopg.errors.UniqueViolation as exc:
+            raise HTTPException(status_code=409, detail=f"email {body.email!r} đã tồn tại") from exc
+
+    cur = await conn.execute("SELECT " + _USER_COLUMNS + " FROM core.users WHERE id = %s", (user_id,))
     row = await cur.fetchone()
     assert row is not None
-    return UserSummary(
-        user_id=str(row[0]), email=row[1], system_roles=list(row[2]), is_active=row[3], created_at=row[4].isoformat()
-    )
+    return _to_user_summary(row)
 
 
 @router.delete("/users/{user_id}", status_code=204)
@@ -448,14 +504,163 @@ async def reactivate_user(user_id: str) -> UserSummary:
     await _fetch_user_in_own_tenant(conn, user_id, identity.tenant_id)
 
     cur = await conn.execute(
-        "UPDATE core.users SET is_active = true WHERE id = %s RETURNING id, email, system_roles, is_active, created_at",
+        "UPDATE core.users SET is_active = true WHERE id = %s RETURNING " + _USER_COLUMNS + "",
         (user_id,),
     )
     row = await cur.fetchone()
     assert row is not None
-    return UserSummary(
-        user_id=str(row[0]), email=row[1], system_roles=list(row[2]), is_active=row[3], created_at=row[4].isoformat()
+    return _to_user_summary(row)
+
+
+# ---------------------------------------------------------------------------
+# app#76 — admin công ty VẬN HÀNH đội ngũ của chính mình.
+#
+# Trước nhóm route này, admin tạo được tài khoản nhưng gần như không sửa được gì sau đó: nhân viên
+# quên mật khẩu thì phải nhờ superadmin (người vận hành nền tảng, KHÔNG thuộc công ty) — một việc
+# nội bộ phải leo ra ngoài; gõ sai email lúc tạo thì tài khoản hỏng vĩnh viễn vì `core.users.email`
+# UNIQUE toàn hệ thống nên địa chỉ đúng cũng bị chiếm chỗ.
+#
+# Tất cả đều `require_admin` + `_fetch_user_in_own_tenant`: hàng rào công ty ở đây KHÔNG được lỏng
+# hơn `update_user_roles`/`deactivate_user` chỉ vì thao tác nghe nhẹ hơn.
+# ---------------------------------------------------------------------------
+
+
+class ResetEmployeePasswordRequest(BaseModel):
+    new_password: str = Field(min_length=8)
+
+    _validate_password = field_validator("new_password")(reject_oversized_password)
+
+
+@router.post("/users/{user_id}/reset-password", status_code=204)
+async def reset_employee_password(user_id: str, body: ResetEmployeePasswordRequest) -> None:
+    """Admin đặt lại mật khẩu cho một nhân viên TRONG CHÍNH công ty mình.
+
+    `routes/auth.py::change_own_password` bắt buộc `old_password`, nên chính người quên mật khẩu
+    không dùng được nó — đây là đường duy nhất còn lại, và trước app#76 nó chỉ tồn tại ở cấp
+    superadmin (`reset_company_user_password`), tức một việc nội bộ của công ty phải nhờ người
+    ngoài công ty.
+
+    **Chặn tự đặt lại mật khẩu của CHÍNH MÌNH** — không phải thừa. `change_own_password` đòi
+    `old_password` chính là để một JWT bị đánh cắp không đổi được mật khẩu (kẻ trộm có token nhưng
+    không có mật khẩu cũ, `routes/auth.py` ghi rõ lý do). Cho admin tự gọi route này là mở lại đúng
+    cửa đó: token đánh cắp của một admin sẽ đổi được mật khẩu mà không cần biết gì thêm.
+
+    Ghi `password_changed_at = now()` cùng lúc ghi hash mới — thiếu nó thì mọi JWT cấp TRƯỚC lần
+    reset vẫn sống tới hết `jwt_expire_minutes` (mặc định 480 phút), mà reset thường xảy ra đúng lúc
+    nghi tài khoản bị chiếm.
+
+    Bật `must_change_password` (quyết định D1): admin gõ mật khẩu hộ rồi nhắn cho nhân viên, nên
+    admin biết mật khẩu đó. Cờ này buộc chính chủ đổi ở lần đăng nhập kế tiếp, đóng khoảng đó lại
+    mà không cần hạ tầng gửi mail."""
+    session = get_request_session()
+    conn = get_request_connection()
+    identity = await fetch_fresh_identity(conn, session.user)
+    require_admin(identity.system_roles)
+    await _fetch_user_in_own_tenant(conn, user_id, identity.tenant_id)
+
+    if user_id == str(identity.id):
+        raise HTTPException(
+            status_code=400,
+            detail="Không thể tự đặt lại mật khẩu của chính mình — dùng PATCH /api/auth/password (cần mật khẩu cũ).",
+        )
+
+    password_hash = await run_in_threadpool(hash_password, body.new_password)
+    await conn.execute(
+        "UPDATE core.users SET password_hash = %s, password_changed_at = now(), "
+        "must_change_password = true WHERE id = %s",
+        (password_hash, user_id),
     )
+
+
+@router.post("/users/{user_id}/grant-admin", response_model=UserSummary)
+async def grant_admin(user_id: str) -> UserSummary:
+    """Phong quyền quản trị cho một nhân viên trong công ty.
+
+    Route riêng, KHÔNG phải một ô tick nằm lẫn giữa các phòng ban ở `PATCH /users/{id}` (quyết định
+    D2, app#76): phong admin khác loại với gán một phòng ban — người được phong quản được toàn bộ
+    tài khoản của công ty — nên nó xứng đáng một hành động tường minh mà giao diện hỏi lại được.
+
+    Server vốn ĐÃ cho company-admin gán `"admin"` qua `create_user`/`update_user_roles` (cố ý, xem
+    docstring 2 route đó), chỉ là giao diện ẩn lựa chọn đó đi và bảo *"vẫn làm được thẳng qua API"*
+    — mà admin công ty là người non-tech, họ không gọi API."""
+    session = get_request_session()
+    conn = get_request_connection()
+    identity = await fetch_fresh_identity(conn, session.user)
+    require_admin(identity.system_roles)
+    await _fetch_user_in_own_tenant(conn, user_id, identity.tenant_id)
+
+    cur = await conn.execute(
+        "UPDATE core.users SET system_roles = array_append(system_roles, 'admin') "
+        "WHERE id = %s AND NOT ('admin' = ANY(system_roles)) RETURNING " + _USER_COLUMNS + "",
+        (user_id,),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        # Đã là admin sẵn — trả trạng thái hiện tại thay vì 409: kết quả người gọi muốn đã đúng,
+        # và `array_append` không điều kiện sẽ nhét `"admin"` hai lần vào mảng.
+        cur = await conn.execute("SELECT " + _USER_COLUMNS + " FROM core.users WHERE id = %s", (user_id,))
+        row = await cur.fetchone()
+        assert row is not None
+    return _to_user_summary(row)
+
+
+@router.post("/users/{user_id}/revoke-admin", response_model=UserSummary)
+async def revoke_admin(user_id: str) -> UserSummary:
+    """Thu quyền quản trị. Hai chốt, và chốt thứ hai chỉ có nghĩa dưới **đồng thời**:
+
+    1. Không thu quyền của chính mình.
+    2. Không để công ty còn 0 admin đang hoạt động (409), sau khi đã khoá tập admin của tenant.
+
+    Chốt 2 tôi từng **gỡ đi** ở bản đầu, với lập luận: người gọi luôn là một admin đang hoạt động
+    của chính tenant đó, nên khi `user_id != identity.id` thì luôn còn ít nhất một admin — chính
+    người gọi. Mutant xoá hẳn nhánh đó sống sót 41 bài, và tôi coi đó là bằng chứng nó chết.
+
+    Lập luận sai vì nó **đơn luồng**, và bộ mutation cũng đơn luồng nên không phản bác được. Admin A
+    và B thu quyền của nhau đồng thời: cả hai qua chốt 1 (A≠B, B≠A), hai câu `UPDATE` chạm hai dòng
+    khác nhau nên không đụng row-lock nào, cả hai commit ⇒ công ty còn 0 admin. Đúng lớp race mà
+    review app#77 chỉ ra ở `deactivate_company_user`, chỉ khác cửa vào.
+
+    Với `_lock_tenant_admins`, chốt 2 trở thành thật: request thứ hai chờ, đếm lại, thấy người kia
+    đã mất quyền ⇒ 409."""
+    session = get_request_session()
+    conn = get_request_connection()
+    identity = await fetch_fresh_identity(conn, session.user)
+    require_admin(identity.system_roles)
+    await _fetch_user_in_own_tenant(conn, user_id, identity.tenant_id)
+
+    if user_id == str(identity.id):
+        raise HTTPException(status_code=400, detail="Không thể tự thu quyền quản trị của chính mình.")
+
+    # Khoá TRƯỚC khi đếm — xem `_lock_tenant_admins`. Không có bước này thì hai admin thu quyền của
+    # nhau đồng thời sẽ cùng đi qua và công ty còn 0 admin.
+    await _lock_tenant_admins(conn, identity.tenant_id)
+    cur = await conn.execute(
+        "SELECT count(*) FROM core.users "
+        "WHERE tenant_id = %s AND is_active AND 'admin' = ANY(system_roles) AND id <> %s",
+        (str(identity.tenant_id), user_id),
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    if row[0] == 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Đây là quản trị viên đang hoạt động cuối cùng của công ty — thu quyền sẽ khoá "
+            "cứng mọi thao tác quản trị. Phong cho người khác trước.",
+        )
+
+    cur = await conn.execute(
+        "UPDATE core.users SET system_roles = array_remove(system_roles, 'admin') WHERE id = %s "
+        "RETURNING " + _USER_COLUMNS + "",
+        (user_id,),
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    if not list(row[2]):
+        raise HTTPException(
+            status_code=409,
+            detail="Thu quyền sẽ để tài khoản không còn role nào — gán ít nhất một phòng ban trước.",
+        )
+    return _to_user_summary(row)
 
 
 # ---------------------------------------------------------------------------
@@ -515,8 +720,8 @@ async def _lock_tenant_admins(conn: AsyncConnection[Any], tenant_id: UUID) -> No
     giữ, và một chốt thua race thì không phải chốt.
 
     `FOR UPDATE` trên chính tập đang đếm, không phải trên dòng bị sửa: dòng bị sửa là A ở request
-    này và B ở request kia, nên khoá theo dòng-bị-sửa không serialize được đúng con số 0. Khoá cả
-    tập thì request thứ hai chờ, rồi **đếm lại** và thấy A đã tắt ⇒ 409 đúng.
+    này và B ở request kia, nên khoá theo dòng-bị-sửa serialize được đúng con số 0. Khoá cả tập thì
+    request thứ hai chờ, rồi **đếm lại** và thấy A đã tắt ⇒ 409 đúng.
 
     `ORDER BY id` không phải để đẹp: hai transaction lấy khoá theo thứ tự khác nhau trên cùng tập
     dòng là công thức deadlock. Cùng thứ tự ⇒ một bên chờ, không bên nào chết.
@@ -557,21 +762,11 @@ async def list_company_users(tenant_id: str) -> list[UserSummary]:
     target_tenant_id = await _resolve_company(conn, tenant_id)
 
     cur = await conn.execute(
-        "SELECT id, email, system_roles, is_active, created_at FROM core.users "
-        "WHERE tenant_id = %s ORDER BY created_at DESC",
+        "SELECT " + _USER_COLUMNS + " FROM core.users WHERE tenant_id = %s ORDER BY created_at DESC",
         (str(target_tenant_id),),
     )
     rows = await cur.fetchall()
-    return [
-        UserSummary(
-            user_id=str(row[0]),
-            email=row[1],
-            system_roles=list(row[2]),
-            is_active=row[3],
-            created_at=row[4].isoformat(),
-        )
-        for row in rows
-    ]
+    return [_to_user_summary(row) for row in rows]
 
 
 class AddCompanyAdminRequest(BaseModel):
@@ -773,19 +968,12 @@ async def deactivate_company_user(tenant_id: str, user_id: str) -> UserSummary:
         )
 
     cur = await conn.execute(
-        "UPDATE core.users SET is_active = false WHERE id = %s "
-        "RETURNING id, email, system_roles, is_active, created_at",
+        "UPDATE core.users SET is_active = false WHERE id = %s RETURNING " + _USER_COLUMNS + "",
         (user_id,),
     )
     updated = await cur.fetchone()
     assert updated is not None
-    return UserSummary(
-        user_id=str(updated[0]),
-        email=updated[1],
-        system_roles=list(updated[2]),
-        is_active=updated[3],
-        created_at=updated[4].isoformat(),
-    )
+    return _to_user_summary(updated)
 
 
 @router.post("/companies/{tenant_id}/users/{user_id}/reactivate", response_model=UserSummary)
@@ -801,15 +989,9 @@ async def reactivate_company_user(tenant_id: str, user_id: str) -> UserSummary:
     await _fetch_user_in_company(conn, user_id, target_tenant_id)
 
     cur = await conn.execute(
-        "UPDATE core.users SET is_active = true WHERE id = %s RETURNING id, email, system_roles, is_active, created_at",
+        "UPDATE core.users SET is_active = true WHERE id = %s RETURNING " + _USER_COLUMNS + "",
         (user_id,),
     )
     updated = await cur.fetchone()
     assert updated is not None
-    return UserSummary(
-        user_id=str(updated[0]),
-        email=updated[1],
-        system_roles=list(updated[2]),
-        is_active=updated[3],
-        created_at=updated[4].isoformat(),
-    )
+    return _to_user_summary(updated)

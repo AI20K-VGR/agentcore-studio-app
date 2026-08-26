@@ -107,6 +107,28 @@ ALTER TABLE core.users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAU
 -- nhưng trước bản vá này JWT cũ vẫn sống nguyên tới hết `jwt_expire_minutes`, mặc định 480 phút).
 ALTER TABLE core.users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMPTZ NULL;
 
+-- app#76 — ba cột cho việc vận hành đội ngũ. `ALTER ... IF NOT EXISTS` chứ không chỉ sửa
+-- `CREATE TABLE` ở trên: câu đó là no-op trên bảng đã có, nên thiếu 3 dòng này thì máy đồng đội/DB
+-- đã chạy sẵn không bao giờ có cột (cùng khuôn `is_active`/`password_changed_at` phía trên).
+--
+-- `display_name` NULL được, KHÔNG NOT NULL: bắt buộc sẽ chặn đường tạo hàng loạt (người dán danh
+-- sách không phải lúc nào cũng có tên) và làm hỏng mọi tài khoản đã tồn tại. Chỗ hiển thị lùi về
+-- `email` khi cột này rỗng.
+ALTER TABLE core.users ADD COLUMN IF NOT EXISTS display_name TEXT NULL;
+
+-- `NULL` = "chưa từng đăng nhập kể từ khi cột này tồn tại" — KHÁC "đăng nhập lâu rồi", nên chỗ đọc
+-- phải phân biệt hai ca thay vì hiện một mốc bịa. `routes/auth.py::login` ghi `now()` vào đây SAU
+-- khi xác thực thành công, không phải trước: ghi sớm biến cột này thành oracle cho biết email nào
+-- tồn tại, phá đúng nguyên tắc chống dò email mà `login` đang giữ (cùng 401, cùng thông điệp, cùng
+-- chi phí bcrypt cho mọi nhánh thất bại).
+ALTER TABLE core.users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ NULL;
+
+-- Bật khi admin đặt lại mật khẩu HỘ một tài khoản (`reset_employee_password`), tắt khi chính chủ
+-- tự đổi (`change_own_password`). Lý do cột này tồn tại: đường tạo tài khoản hiện tại để admin tự
+-- nghĩ mật khẩu rồi nhắn cho nhân viên, nên admin biết mật khẩu của mọi người trong công ty. Cờ
+-- này là thứ rẻ nhất đóng khoảng đó lại mà không cần hạ tầng gửi mail (quyết định D1, app#76).
+ALTER TABLE core.users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false;
+
 -- Cache vector production cho `GatewayEmbedding` (app#30, QĐ-2 — Postgres, KHÔNG file-based:
 -- settings.py:37-51 ghi lại ba hiện thân của cùng lớp bug đường-dẫn-file). Đường ĐỌC
 -- (packages/kb/src/studio_kb/postgres.py:213 `embed([query])`) là 1 text/call, không batch được
