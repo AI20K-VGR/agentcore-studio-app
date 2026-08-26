@@ -36,12 +36,13 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, ValidationError
-from studio_contracts import Edge, Node, Recipe, Scorecard
+from studio_contracts import Edge, Node, NodeType, Recipe, Scorecard
 from studio_engine.agent_loop import AgentLoopExhausted
 from studio_evalhub.golden_case import GoldenSet
 from studio_evalhub.golden_store import GoldenSetNotFound, GoldenSetScopeError, read_golden_set
 from studio_evalhub.harness import EvalHarness
 from studio_evalhub.judge import LLMJudge
+from studio_evalhub.no_kb_golden import NO_KB_TENANT_LABEL, no_kb_golden_set
 from studio_kb.doc_factory import TENANT_IDS
 from studio_kb.postgres import PgKbSearch
 from studio_workbench import create_recipe
@@ -86,6 +87,24 @@ class PublishRequest(BaseModel):
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     # `tenant_id` CỐ Ý KHÔNG có field ở đây — cùng lý do T1 IDOR đã khoá ở `RunRequest` gốc
     # (`test_routes_runs.py`, trước app#44): tenant luôn tới từ `get_request_session()`.
+
+
+async def _tenant_name(tenant_id: UUID) -> str:
+    """Tên tenant từ `core.tenants` — thứ `GoldenCase.tenant` mang.
+
+    Trước bản vá này route dựng bảng tra bằng `dict(TENANT_IDS)` (`studio_kb.doc_factory`), một
+    **fixture Sprint 1 chỉ có 2 tenant demo** (`ankor`/`borea`) mà chính docstring của nó dán nhãn
+    *"KHÔNG phải cách phân giải thật"*. `EvalHarness` tra bằng `tenant_ids[case.tenant]`, còn
+    `GoldenCase.tenant` được `golden_autogen.regenerate_for_section` điền bằng `core.tenants.name`
+    THẬT — nên mọi tenant không tên `ankor`/`borea` làm cổng ném `KeyError` thô, không phải 400 có
+    thông điệp. Đo trên DB demo: `core.tenants.name` là `['Acme Demo', 'Ankor', '__system__']`,
+    không tên nào tra được. Đường upload đã đọc `core.tenants` đúng (`documents.py::_tenant_slug`),
+    chỉ đường chấm điểm còn dùng fixture."""
+    cur = await get_request_connection().execute("SELECT name FROM core.tenants WHERE id = %s", (tenant_id,))
+    row = await cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"tenant {tenant_id} không có trong core.tenants")
+    return str(row[0])
 
 
 async def _load_golden_set(ref: str, tenant_id: UUID) -> GoldenSet:
@@ -165,7 +184,13 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
     # (`create_recipe(tenant_id=session.tenant_id)` ngay trên). Đọc từ recipe sẽ là lần đầu tiên
     # trong route này một quyết định phạm vi lấy từ đối tượng do client dựng nên; hôm nay vô hại,
     # nhưng nó dựng sẵn đúng khuôn mà INV-1 tồn tại để cấm. Phiên khai tenant, recipe thì không.
-    golden = await _load_golden_set(recipe.golden_set_ref, session.tenant_id)
+    # Recipe KHÔNG có node `kb-retrieve` thì không trích dẫn được gì, nên bộ thường luôn cho
+    # `citation_accuracy = 0.0` và loại agent đó không bao giờ publish được. Chấm nó bằng bộ dựng
+    # sẵn `builtin-no-kb-v1` — mọi case nhánh trả-lời, `expected` là câu nói-không-biết, nên cả hai
+    # trục đo được mà không nới chốt nào (xem docstring `studio_evalhub.no_kb_golden`). Bộ đó KHÔNG
+    # nằm trong `eval.golden_sets`; nó là hằng số trong mã nên không đi qua `_load_golden_set`.
+    has_kb_node = any(node.type is NodeType.KB_RETRIEVE for node in recipe.dag.nodes)
+    golden = await _load_golden_set(recipe.golden_set_ref, session.tenant_id) if has_kb_node else no_kb_golden_set()
 
     # `Pool` (không phải `get_request_connection()`) — rủi ro pool self-deadlock CHƯA được giải
     # quyết ở route này, xem giải thích đầy đủ + lý do ở `routes/runs.py` (review `app#17` đợt 4,
@@ -198,11 +223,21 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
         recipe=recipe,
     )
 
+    # `TENANT_IDS` giữ lại cho bộ seed sẵn (`callisto-*`) vốn khai `tenant="ankor"`; tên tenant
+    # THẬT thêm vào sau nên nó thắng khi trùng. Xem `_tenant_name` cho lỗi `KeyError` mà vế thứ hai
+    # vá. Bộ dựng sẵn mang nhãn hằng số `__no_kb_agent__` — ánh xạ nó về tenant của PHIÊN để case
+    # chạy dưới đúng công ty đang publish, không phải một tenant demo nào.
     tenant_ids: dict[str, UUID] = dict(TENANT_IDS)
+    tenant_ids[await _tenant_name(session.tenant_id)] = session.tenant_id
+    if not has_kb_node:
+        tenant_ids[NO_KB_TENANT_LABEL] = session.tenant_id
     try:
         scorecard = await EvalHarness().run(
             recipe.agent_id,
-            recipe.golden_set_ref,
+            # `golden.golden_set_ref`, KHÔNG phải `recipe.golden_set_ref`: hai giá trị bằng nhau ở
+            # nhánh có KB, nhưng nhánh không-KB chấm bằng bộ dựng sẵn — khai ref của recipe ở đây
+            # sẽ cho ra một Scorecard nói nó được chấm bằng một bộ nó chưa từng chạy.
+            golden.golden_set_ref,
             golden_set=golden,
             runner=runner,
             tenant_ids=tenant_ids,
