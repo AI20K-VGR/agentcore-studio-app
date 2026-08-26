@@ -350,18 +350,6 @@ async def upload_document(
     # mới sẵn sàng ghi — nhưng KHÔNG atomic với `index` bên dưới (2 giao dịch riêng, đúng seam
     # 5-method của `KbPipeline`): xoá thành công rồi `index` lỗi giữa chừng vẫn có thể để tenant
     # tạm thời mất doc này, biết và chấp nhận cho phạm vi hiện tại.
-    #
-    # Fallback `legacy_doc_id` (review Dozyboy, PR#84 changes-requested) — CHUYỂN TIẾP, xoá được
-    # khi đuôi đã hết nốt tenant thật đang có: đổi công thức `doc_id` (thêm `suffix`) không có
-    # migration cho chunk ghi TỪ TRƯỚC bản vá này — chúng vẫn mang `doc_id` dạng cũ
-    # (`{slug(role)}-{slug(stem)}`, không đuôi). Không xoá thêm phát này thì lần re-upload ĐẦU
-    # TIÊN sau deploy chỉ xoá theo `doc_id` MỚI (có đuôi) → không khớp dòng cũ → mồ côi vĩnh viễn,
-    # đúng ca reviewer tái hiện được trên chính dữ liệu Ricons. `kb.chunks` không lưu đuôi file gốc
-    # ở cột nào (`doc_name` đã bỏ đuôi từ trước PR này) nên không suy ngược lại `legacy_doc_id`
-    # được từ dữ liệu hiện có — phải tính lại đúng công thức CŨ ở đây. An toàn gọi cả khi không có
-    # dòng nào khớp (trả 0, không raise) — best-effort, không phải gate.
-    legacy_doc_id = f"{_slugify(section_role)}-{_slugify(stem)}"
-    await pipeline.delete_by_doc_id(tenant_uuid, legacy_doc_id)
     await pipeline.delete_by_doc_id(tenant_uuid, doc_id)
     await pipeline.index(chunks, embeddings)
 
