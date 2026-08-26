@@ -43,6 +43,7 @@ from studio_evalhub.golden_store import GoldenSetNotFound, GoldenSetScopeError, 
 from studio_evalhub.harness import EvalHarness
 from studio_evalhub.judge import LLMJudge
 from studio_evalhub.no_kb_golden import NO_KB_TENANT_LABEL, no_kb_golden_set
+from studio_evalhub.scorecard_store import read_pending_scorecard, write_pending_scorecard
 from studio_kb.doc_factory import TENANT_IDS
 from studio_kb.postgres import PgKbSearch
 from studio_workbench import create_recipe
@@ -185,13 +186,12 @@ async def _load_golden_set(ref: str, tenant_id: UUID) -> GoldenSet:
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
 
-async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContext) -> tuple[Recipe, Scorecard]:
-    """Dựng recipe từ canvas + chạy `golden_set_ref` qua `EvalHarness.run(core_only=True)` thật —
-    tập **Core**, không phải cả bộ (xem chú thích tại lời gọi bên dưới). Dùng chung
-    cho cả `/evaluate` (chỉ xem điểm, KHÔNG ghi DB) lẫn `/publish` (chấm rồi ghi DB nếu đạt). Mỗi
-    lần gọi route nào cũng chấm LẠI TỪ ĐẦU — route `/publish` không tin bất kỳ Scorecard nào UI đã
-    thấy trước đó qua `/evaluate` (tag vs fence: UI chỉ gợi ý nút sáng/tắt, server luôn tự verify
-    lại, không bao giờ nhận thẳng verdict client tự khai)."""
+async def _build_recipe(agent_id: str, body: PublishRequest, session: ResolvedContext) -> Recipe:
+    """Dựng + validate `Recipe` từ canvas. Tách khỏi `_evaluate` để `/publish` tính được
+    `recipe_hash` mà KHÔNG phải chạy cả bộ golden — đó là chỗ tra điểm tạm (`scorecard_store`).
+
+    Không chạm DB, không gọi LLM: chỉ `create_recipe` + 2 lint. Nên gọi nó hai lần (một ở đây, một
+    trong `_evaluate` khi phải chấm thật) rẻ và không có tác dụng phụ nào."""
     if body.agent_id != agent_id:
         raise HTTPException(
             status_code=400,
@@ -227,6 +227,18 @@ async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContex
         enforce_agent_topology(recipe)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"recipe không qua validator: {exc}") from exc
+
+    return recipe
+
+
+async def _evaluate(agent_id: str, body: PublishRequest, session: ResolvedContext) -> tuple[Recipe, Scorecard]:
+    """Dựng recipe từ canvas + chạy `golden_set_ref` qua `EvalHarness.run(core_only=True)` thật —
+    tập **Core**, không phải cả bộ (xem chú thích tại lời gọi bên dưới). Dùng chung cho cả
+    `/evaluate` (chỉ xem điểm) lẫn `/publish` (khi chưa có điểm tạm nào khớp `recipe_hash`).
+
+    Server vẫn KHÔNG BAO GIỜ nhận verdict client tự khai — điểm tái dùng được là điểm chính server
+    đã ghi ở lượt `/evaluate` trước, tra bằng `recipe_hash` server tự tính (`scorecard_store`)."""
+    recipe = await _build_recipe(agent_id, body, session)
 
     # `session.tenant_id`, KHÔNG phải `recipe.tenant_id` — dù hai giá trị này bằng nhau ở đây
     # (`create_recipe(tenant_id=session.tenant_id)` ngay trên). Đọc từ recipe sẽ là lần đầu tiên
@@ -409,6 +421,12 @@ async def evaluate_agent(agent_id: str, body: PublishRequest) -> dict[str, objec
     require_admin(identity.system_roles)
 
     recipe, scorecard = await _evaluate(agent_id, body, session)
+
+    # Ghi lại điểm để `/publish` khỏi chấm lại từ đầu (`scorecard_store`). Client KHÔNG cầm gì —
+    # nó chỉ gửi lại recipe, server tự băm và tự tra, nên `verdict` không bao giờ đi qua tay client.
+    # `recipe_version` để `NULL`: đây là điểm tạm, không phải chứng nhận của một version đã publish.
+    await write_pending_scorecard(get_request_connection(), scorecard, session.tenant_id)
+
     return {
         "agent_id": recipe.agent_id,
         "tenant_id": str(recipe.tenant_id),
@@ -427,7 +445,20 @@ async def publish_agent(agent_id: str, body: PublishRequest) -> dict[str, object
     identity = await fetch_fresh_identity(get_request_connection(), session.user)
     require_admin(identity.system_roles)
 
-    recipe, scorecard = await _evaluate(agent_id, body, session)
+    # Tái dùng điểm của lượt Chấm điểm nếu recipe KHÔNG đổi — khoá bằng `recipe_hash`, thứ server
+    # tự tính từ recipe client vừa gửi. Sửa một ký tự trên canvas là hash đổi, tra không ra, chấm
+    # lại. Không tìm thấy thì chạy nguyên đường cũ, nên caller gọi thẳng `/publish` (test, script)
+    # không đổi hành vi một dòng nào.
+    #
+    # Vì sao an toàn dù `/evaluate` là đường client gọi được: client không gửi Scorecard, không gửi
+    # verdict, không gửi cả hash — nó chỉ gửi recipe. Mọi thứ quyết định cổng đều do server tính
+    # hoặc đọc từ DB dưới RLS của chính tenant đó.
+    recipe = await _build_recipe(agent_id, body, session)
+    cached = await read_pending_scorecard(get_request_connection(), recipe.agent_id, recipe_hash(recipe))
+    if cached is None:
+        recipe, scorecard = await _evaluate(agent_id, body, session)
+    else:
+        scorecard = cached
 
     try:
         await publish(recipe, scorecard, conn=get_request_connection())

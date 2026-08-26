@@ -60,6 +60,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
+from studio_evalhub.scorecard_store import drop_pending_scorecards
 from studio_kb.chunk_window import cut_window
 from studio_kb.extract import SUPPORTED_SUFFIXES, UnsupportedFormatError, extract_text
 from studio_kb.pipeline import KbPipeline
@@ -341,6 +342,15 @@ async def upload_document(
             tenant_slug=await _tenant_slug(conn, tenant_uuid),
             section_role=section_role,
         )
+        # Kho tài liệu vừa đổi ⇒ mọi điểm Chấm-điểm-chưa-publish của tenant này thôi nói về kho
+        # hiện tại. `recipe_hash` KHÔNG bắt được ca này (recipe giữ nguyên, chỉ nội dung kho đổi),
+        # nên phải huỷ tường minh — nếu không, `/publish` tái dùng một điểm đo trên corpus cũ.
+        # Chỉ chạm dòng `recipe_version IS NULL`; chứng nhận của version đã publish giữ nguyên.
+        #
+        # TRONG `borrowed_tenant_scope`, không phải sau: hàm này dựa hẳn vào RLS để chọn tenant
+        # (không có `WHERE tenant_id`), nên đặt ngoài khối là superadmin nạp hộ công ty A lại xoá
+        # điểm tạm của chính mình — cùng cái bẫy docstring `borrowed_tenant_scope` mô tả.
+        await drop_pending_scorecards(conn)
 
     return UploadDocumentResponse(
         doc_id=doc_id,

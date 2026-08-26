@@ -16,6 +16,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+from fastapi import HTTPException
 from studio_app.routes import publish as publish_module
 from studio_app.routes.publish import PublishRequest, _evaluate
 from studio_app.settings import LlmProvider, Settings
@@ -198,3 +199,164 @@ async def test_undeclared_role_falls_back_to_the_recipe_ref(monkeypatch: pytest.
     "luôn suy, bỏ qua ref"."""
     await _run(monkeypatch, tmp_path, with_kb_node=True)
     assert _REQUESTED_REFS == ["callisto-2.0-golden-30-v1"]
+
+
+async def test_publish_reuses_the_pending_scorecard_instead_of_rescoring(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bấm Chấm điểm rồi bấm Publish ⇒ bộ golden chạy ĐÚNG MỘT LẦN.
+
+    Trước bản vá, `/publish` gọi lại `_evaluate()` nguyên vẹn: bộ 100 case × tới 20 lượt LLM mỗi
+    case chạy hai lần cho cùng một recipe. Bài này ghim rằng lượt Publish tra điểm cũ thay vì chấm
+    lại — và tra bằng `recipe_hash` **server tự tính**, không phải giá trị nào client gửi."""
+    from studio_app.routes.publish import publish_agent
+    from studio_workbench.publish import recipe_hash
+
+    evaluate_calls: list[str] = []
+    hashes_looked_up: list[str] = []
+
+    async def _spy_evaluate(agent_id: str, body: PublishRequest, session: ResolvedContext) -> Any:
+        evaluate_calls.append(agent_id)
+        raise AssertionError("không được chấm lại khi đã có điểm tạm khớp hash")
+
+    async def _fake_read(conn: object, agent_id: str, rhash: str) -> Scorecard:  # noqa: ARG001
+        hashes_looked_up.append(rhash)
+        return Scorecard(
+            agent_id=agent_id,
+            golden_set_ref="bo-thu",
+            results=[CaseResult(case_id="c1", expected="x", actual="x", success=True, citation_accuracy=1.0)],
+            aggregate=Aggregate(success_rate=1.0, citation_accuracy=1.0, n_scored_citation=1),
+            gate=Gate(threshold=GateThreshold(success=0.9, citation_accuracy=0.95), verdict="PASS"),
+            recipe_hash=rhash,
+        )
+
+    published: list[str] = []
+
+    async def _fake_publish(recipe: Any, scorecard: Any, conn: object) -> None:  # noqa: ARG001
+        published.append(recipe.agent_id)
+
+    async def _fake_identity(conn: object, user: str) -> Any:  # noqa: ARG001
+        return ResolvedContext(tenant_id=ANKOR_ID, user=user, system_roles=["admin"])
+
+    session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@ankor.vn", system_roles=["admin"])
+    monkeypatch.setattr(publish_module, "get_request_session", lambda: session)
+    monkeypatch.setattr(publish_module, "get_request_connection", lambda: object())
+    monkeypatch.setattr(publish_module, "fetch_fresh_identity", _fake_identity)
+    monkeypatch.setattr(publish_module, "require_admin", lambda roles: None)
+    monkeypatch.setattr(publish_module, "read_pending_scorecard", _fake_read)
+    monkeypatch.setattr(publish_module, "publish", _fake_publish)
+    monkeypatch.setattr(publish_module, "_evaluate", _spy_evaluate)
+
+    body = PublishRequest(
+        agent_id="agent-no-kb",
+        system_prompt="p",
+        tool_whitelist=[],
+        nodes=[{"id": "n2", "type": "llm-step", "params": {}}],
+        edges=[],
+    )
+    await publish_agent("agent-no-kb", body)
+
+    assert evaluate_calls == [], "Publish đã chấm lại thay vì tra điểm cũ"
+    assert published == ["agent-no-kb"]
+
+    expected_hash = recipe_hash(await publish_module._build_recipe("agent-no-kb", body, session))
+    assert hashes_looked_up == [expected_hash], "phải tra bằng hash server tự tính từ recipe"
+
+
+async def test_publish_still_scores_when_no_pending_scorecard_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vế bất đối xứng: không có điểm nào khớp hash ⇒ chạy nguyên đường cũ.
+
+    Thiếu bài này thì bài trên không phân biệt được với một `/publish` đã thôi chấm hoàn toàn — tức
+    một đường xuất bản không qua cổng nào."""
+    from studio_app.routes.publish import publish_agent
+
+    evaluate_calls: list[str] = []
+
+    async def _spy_evaluate(agent_id: str, body: PublishRequest, session: ResolvedContext) -> Any:
+        evaluate_calls.append(agent_id)
+        raise HTTPException(status_code=418, detail="đã gọi tới đường chấm thật")
+
+    async def _fake_read(conn: object, agent_id: str, rhash: str) -> None:  # noqa: ARG001
+        return None
+
+    async def _fake_identity(conn: object, user: str) -> Any:  # noqa: ARG001
+        return ResolvedContext(tenant_id=ANKOR_ID, user=user, system_roles=["admin"])
+
+    session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@ankor.vn", system_roles=["admin"])
+    monkeypatch.setattr(publish_module, "get_request_session", lambda: session)
+    monkeypatch.setattr(publish_module, "get_request_connection", lambda: object())
+    monkeypatch.setattr(publish_module, "fetch_fresh_identity", _fake_identity)
+    monkeypatch.setattr(publish_module, "require_admin", lambda roles: None)
+    monkeypatch.setattr(publish_module, "read_pending_scorecard", _fake_read)
+    monkeypatch.setattr(publish_module, "_evaluate", _spy_evaluate)
+
+    body = PublishRequest(
+        agent_id="agent-no-kb",
+        system_prompt="p",
+        tool_whitelist=[],
+        nodes=[{"id": "n2", "type": "llm-step", "params": {}}],
+        edges=[],
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await publish_agent("agent-no-kb", body)
+    assert exc_info.value.status_code == 418
+    assert evaluate_calls == ["agent-no-kb"]
+
+
+async def test_evaluate_writes_the_pending_scorecard_it_just_computed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`/evaluate` phải GHI LẠI điểm — nếu không, `/publish` không bao giờ tra ra và cơ chế tái
+    dùng thành mã chết trong khi mọi bài khác vẫn xanh (đo được: mutant bỏ lời gọi này sống sót
+    qua cả 10 bài trước khi có bài này).
+
+    Và phải ghi ĐÚNG Scorecard vừa tính, không phải một bản dựng lại — `recipe_hash` trên đó là
+    thứ `/publish` dùng làm khoá tra."""
+    from studio_app.routes.publish import evaluate_agent
+
+    written: list[Any] = []
+
+    async def _fake_write(conn: object, scorecard: Any, tenant_id: object) -> None:  # noqa: ARG001
+        written.append((scorecard, tenant_id))
+
+    async def _fake_identity(conn: object, user: str) -> Any:  # noqa: ARG001
+        return ResolvedContext(tenant_id=ANKOR_ID, user=user, system_roles=["admin"])
+
+    session = ResolvedContext(tenant_id=ANKOR_ID, user="admin@ankor.vn", system_roles=["admin"])
+
+    async def _sentinel_pool() -> _SentinelPool:
+        return _SentinelPool()
+
+    _REQUESTED_REFS.clear()
+    monkeypatch.setattr(publish_module, "get_pool", _sentinel_pool)
+    monkeypatch.setattr(publish_module, "EngineAgentRunner", _SpyRunner)
+    monkeypatch.setattr(publish_module, "_load_golden_set", _fake_load_golden_set)
+    monkeypatch.setattr(publish_module, "_tenant_name", _fake_tenant_name)
+    monkeypatch.setattr(publish_module, "EvalHarness", _StubEvalHarness)
+    monkeypatch.setattr(publish_module, "get_settings", lambda: _settings(tmp_path))
+    monkeypatch.setattr(publish_module, "build_llm", lambda: object())
+    monkeypatch.setattr(publish_module, "build_embedding", lambda: object())
+    monkeypatch.setattr(publish_module, "LLMJudge", lambda *a, **k: object())
+    monkeypatch.setattr(publish_module, "get_request_session", lambda: session)
+    monkeypatch.setattr(publish_module, "get_request_connection", lambda: object())
+    monkeypatch.setattr(publish_module, "fetch_fresh_identity", _fake_identity)
+    monkeypatch.setattr(publish_module, "require_admin", lambda roles: None)
+    monkeypatch.setattr(publish_module, "write_pending_scorecard", _fake_write)
+
+    body = PublishRequest(
+        agent_id="agent-no-kb",
+        system_prompt="p",
+        tool_whitelist=[],
+        nodes=[{"id": "n2", "type": "llm-step", "params": {}}],
+        edges=[],
+    )
+    response = await evaluate_agent("agent-no-kb", body)
+
+    assert len(written) == 1, "/evaluate không ghi điểm tạm"
+    scorecard, tenant_id = written[0]
+    assert tenant_id == ANKOR_ID
+    assert scorecard.model_dump(mode="json") == response["scorecard"], (
+        "phải ghi đúng Scorecard vừa trả về, không phải một bản dựng lại"
+    )
