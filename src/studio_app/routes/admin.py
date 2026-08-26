@@ -432,6 +432,14 @@ async def update_user_roles(user_id: str, body: UpdateUserRolesRequest) -> UserS
         # gỡ được (superadmin phải cấp tài khoản admin mới).
         raise HTTPException(status_code=400, detail="Không thể tự đổi email của chính tài khoản đang đăng nhập.")
 
+    # Validate TRƯỚC, ghi SAU — và cả ba lệnh ghi nằm trong CÙNG một savepoint.
+    #
+    # `PATCH` là một thao tác, nên nó phải đổi cả ba field hoặc không field nào (review app#83,
+    # Dozyboy). Bản trước ghi `system_roles`/`display_name` rồi mới thử `email`; email trùng ⇒ 409,
+    # nhưng hai field kia đã commit thật — `HTTPException` bị FastAPI biến thành response ngay
+    # trong `call_next()` nên không bao giờ tới `async with pool.connection()` của middleware, và
+    # khối đó thoát không exception rồi COMMIT. Client nhận "lỗi toàn phần" trong khi server đã đổi
+    # một nửa, và giao diện không có cách nào biết để tải lại.
     if body.system_roles is not None:
         valid_role_vocab = await _valid_role_vocab(conn, identity.tenant_id)
         invalid_roles = set(body.system_roles) - valid_role_vocab
@@ -442,22 +450,24 @@ async def update_user_roles(user_id: str, body: UpdateUserRolesRequest) -> UserS
             )
         if not body.system_roles:
             raise HTTPException(status_code=400, detail="roles không được rỗng.")
-        await conn.execute("UPDATE core.users SET system_roles = %s WHERE id = %s", (body.system_roles, user_id))
 
-    if body.display_name is not None:
-        # Chuỗi rỗng = XOÁ tên, hiển thị lùi về email. Ca thật (gõ nhầm tên rồi muốn bỏ hẳn), và
-        # không có nó thì tên đã đặt là vĩnh viễn.
-        await conn.execute(
-            "UPDATE core.users SET display_name = %s WHERE id = %s",
-            (body.display_name.strip() or None, user_id),
-        )
-
-    if body.email is not None:
-        try:
-            async with conn.transaction():
+    try:
+        async with conn.transaction():
+            if body.system_roles is not None:
+                await conn.execute(
+                    "UPDATE core.users SET system_roles = %s WHERE id = %s", (body.system_roles, user_id)
+                )
+            if body.display_name is not None:
+                # Chuỗi rỗng = XOÁ tên, hiển thị lùi về email. Ca thật (gõ nhầm tên rồi muốn bỏ
+                # hẳn), và không có nó thì tên đã đặt là vĩnh viễn.
+                await conn.execute(
+                    "UPDATE core.users SET display_name = %s WHERE id = %s",
+                    (body.display_name.strip() or None, user_id),
+                )
+            if body.email is not None:
                 await conn.execute("UPDATE core.users SET email = %s WHERE id = %s", (body.email, user_id))
-        except psycopg.errors.UniqueViolation as exc:
-            raise HTTPException(status_code=409, detail=f"email {body.email!r} đã tồn tại") from exc
+    except psycopg.errors.UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail=f"email {body.email!r} đã tồn tại") from exc
 
     cur = await conn.execute("SELECT " + _USER_COLUMNS + " FROM core.users WHERE id = %s", (user_id,))
     row = await cur.fetchone()
@@ -648,6 +658,23 @@ async def revoke_admin(user_id: str) -> UserSummary:
             "cứng mọi thao tác quản trị. Phong cho người khác trước.",
         )
 
+    # Kiểm TRƯỚC khi ghi, không phải ghi rồi kiểm (review app#83, Dozyboy). `HTTPException` bị
+    # FastAPI biến thành response ngay trong `call_next()`, nên nó KHÔNG BAO GIỜ propagate tới
+    # `async with pool.connection()` của middleware — khối đó thoát không exception và **COMMIT**.
+    # Ghi-rồi-kiểm nghĩa là client nhận 409 trong khi tài khoản đã bị ghi `system_roles = {}` thật:
+    # mất mọi quyền, không giao diện nào có đường phục hồi.
+    #
+    # Đúng hazard mà `create_company` đã viết hẳn 10 dòng giải thích, và chính hàm này đã áp dụng
+    # đúng cho chốt đếm-admin ngay phía trên — chỉ nhánh này làm ngược thứ tự.
+    cur = await conn.execute("SELECT system_roles FROM core.users WHERE id = %s", (user_id,))
+    current = await cur.fetchone()
+    assert current is not None
+    if [r for r in list(current[0]) if r != "admin"] == []:
+        raise HTTPException(
+            status_code=409,
+            detail="Thu quyền sẽ để tài khoản không còn role nào — gán ít nhất một phòng ban trước.",
+        )
+
     cur = await conn.execute(
         "UPDATE core.users SET system_roles = array_remove(system_roles, 'admin') WHERE id = %s "
         "RETURNING " + _USER_COLUMNS + "",
@@ -655,11 +682,6 @@ async def revoke_admin(user_id: str) -> UserSummary:
     )
     row = await cur.fetchone()
     assert row is not None
-    if not list(row[2]):
-        raise HTTPException(
-            status_code=409,
-            detail="Thu quyền sẽ để tài khoản không còn role nào — gán ít nhất một phòng ban trước.",
-        )
     return _to_user_summary(row)
 
 

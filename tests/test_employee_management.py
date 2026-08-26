@@ -14,7 +14,7 @@ chống-tự-khoá (tự reset mật khẩu mình, tự sửa role mình, tự �
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from uuid import UUID
 
@@ -69,6 +69,28 @@ async def _simulate_request_connection() -> AsyncIterator[None]:
             yield
         finally:
             middleware._request_conn.reset(token)
+
+
+async def _call_like_fastapi(call: Callable[[], Awaitable[object]]) -> int | None:
+    """Gọi route rồi **nuốt** `HTTPException` NGAY TRONG khối connection — mô phỏng đúng production.
+
+    Đây là điểm mấu chốt để bài test dưới có nghĩa. `_simulate_request_connection()` thường để
+    exception thoát khỏi `async with pool.connection()`, và psycopg **rollback** — nhưng production
+    KHÔNG chạy như vậy: `HTTPException` bị FastAPI's `ExceptionMiddleware` bắt và biến thành response
+    ngay trong `call_next()`, nên nó không bao giờ tới `async with` của
+    `tenant_context_middleware`; khối đó thoát **không có exception** và **COMMIT**.
+
+    Nghĩa là mọi bài test bắt `HTTPException` theo cách thông thường sẽ **xanh giả** cho lớp lỗi
+    "ghi trước, validate sau": rollback của khung test dọn hộ đúng thứ production giữ lại. Bắt ở
+    đây, bên trong khối, là cách duy nhất khiến khung test cư xử như thật.
+
+    Trả `status_code` nếu route ném `HTTPException`, `None` nếu chạy trót lọt."""
+    async with _simulate_request_connection():
+        try:
+            await call()
+        except HTTPException as exc:
+            return exc.status_code
+    return None
 
 
 async def _seed_tenant(admin_pool: Pool, name: str) -> UUID:
@@ -473,3 +495,83 @@ async def test_reset_password_kills_sessions_issued_before_it(admin_pool: Pool) 
     assert row is not None
     assert row[0] != "mat-khau-moi"
     assert verify_password("mat-khau-moi", row[0])
+
+
+async def test_revoke_admin_refused_for_role_only_admin_leaves_the_account_untouched(admin_pool: Pool) -> None:
+    """Review app#83 (Dozyboy): 409 KHÔNG được để lại tài khoản đã bị ghi.
+
+    `revoke_admin` từng `UPDATE` rồi mới kiểm "còn role nào không". `HTTPException` bị FastAPI biến
+    thành response ngay trong `call_next()`, nên nó **không bao giờ** propagate tới
+    `async with pool.connection()` của middleware — middleware thoát khối không exception và
+    **COMMIT**. Tức client nhận 409 "gán ít nhất một phòng ban trước", còn nhân viên đó đã bị ghi
+    `system_roles = {}` thật: mất mọi quyền, và không giao diện nào có đường phục hồi.
+
+    Đúng hazard mà `create_company` đã viết hẳn 10 dòng comment giải thích, và chính hàm này đã áp
+    dụng đúng cho chốt đếm-admin ngay phía trên (đếm TRƯỚC khi ghi).
+
+    Bài này ghim **trạng thái DB sau 409**, không chỉ ghim status code — status code đúng mà dữ liệu
+    đã hỏng là đúng hình dạng của bug."""
+    tenant_id = await _seed_tenant(admin_pool, "ankor-revoke-empty")
+    await _seed_user(admin_pool, tenant_id, "boss@ankor-re.test", ["admin"])
+    # Nhân viên chỉ có đúng role "admin", không phòng ban nào — `create_user`/`update_user_roles`
+    # đều cho phép hình dạng này ("admin" nằm trong `valid_role_vocab`).
+    only_admin = await _seed_user(admin_pool, tenant_id, "chi-admin@ankor-re.test", ["admin"])
+
+    token = _set_session(tenant_id=tenant_id, user="boss@ankor-re.test", system_roles=["admin"])
+    try:
+        status = await _call_like_fastapi(lambda: revoke_admin(str(only_admin)))
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert status == 409
+
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute("SELECT system_roles FROM core.users WHERE id = %s", (str(only_admin),))
+        row = await cur.fetchone()
+    assert row is not None
+    assert list(row[0]) == ["admin"], (
+        f"409 rồi mà tài khoản vẫn bị ghi — roles còn {list(row[0])!r}, đáng lẽ nguyên vẹn ['admin']"
+    )
+
+
+async def test_patch_is_atomic_across_its_three_fields(admin_pool: Pool) -> None:
+    """Review app#83 mục 2: `PATCH` gộp 3 field phải là MỘT thao tác.
+
+    Bản trước ghi `system_roles`/`display_name` trước rồi mới thử `email`; email trùng ⇒ 409, nhưng
+    hai field kia đã commit thật. Client nhận "lỗi toàn phần" trong khi server đã đổi một nửa — và
+    giao diện không có cách nào biết để tải lại.
+
+    Ghim cả ba field cùng lúc: sau 409, **không** field nào được đổi."""
+    tenant_id = await _seed_tenant(admin_pool, "ankor-atomic")
+    admin_id = await _seed_user(admin_pool, tenant_id, "boss@ankor-atomic.test", ["admin"])
+    await _seed_section(admin_pool, tenant_id, "hr", admin_id)
+    await _seed_section(admin_pool, tenant_id, "finance", admin_id)
+    await _seed_user(admin_pool, tenant_id, "da-co@ankor-atomic.test", ["hr"])
+    target = await _seed_user(admin_pool, tenant_id, "nv@ankor-atomic.test", ["hr"])
+
+    token = _set_session(tenant_id=tenant_id, user="boss@ankor-atomic.test", system_roles=["admin"])
+    try:
+        status = await _call_like_fastapi(
+            lambda: update_user_roles(
+                str(target),
+                UpdateUserRolesRequest(
+                    system_roles=["finance"],
+                    display_name="Tên mới",
+                    email="da-co@ankor-atomic.test",  # trùng ⇒ 409
+                ),
+            )
+        )
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert status == 409
+
+    async with admin_pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT system_roles, display_name, email FROM core.users WHERE id = %s", (str(target),)
+        )
+        row = await cur.fetchone()
+    assert row is not None
+    assert list(row[0]) == ["hr"], f"roles bị ghi dù 409 — còn {list(row[0])!r}"
+    assert row[1] is None, f"display_name bị ghi dù 409 — còn {row[1]!r}"
+    assert row[2] == "nv@ankor-atomic.test"
