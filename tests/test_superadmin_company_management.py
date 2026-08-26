@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID, uuid4
 
 import psycopg
@@ -30,6 +31,7 @@ from studio_app import middleware, rate_limit
 from studio_app.authz import fetch_fresh_identity
 from studio_app.core._db import Pool, close_pools, get_pool
 from studio_app.jwt_auth import hash_password, verify_password
+from studio_app.routes import admin as admin_module
 from studio_app.routes.admin import (
     AddCompanyAdminRequest,
     ResetPasswordRequest,
@@ -730,3 +732,59 @@ async def test_the_lock_does_not_block_a_DIFFERENT_company(admin_pool: Pool) -> 
 
         await conn_b.rollback()
         await conn_a.rollback()
+
+
+async def test_deactivate_route_actually_takes_the_lock_before_counting(
+    admin_pool: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Route có THẬT SỰ gọi `_lock_tenant_admins` không — và gọi với đúng tenant, TRƯỚC khi đếm.
+
+    Khoảng trống này do chính tôi tạo ra khi bỏ bài race e2e (review app#82, TranBaDat2607): hai
+    bài khoá mới gọi thẳng `_lock_tenant_admins`, nên chúng chứng minh **cái khoá** đúng chứ không
+    chứng minh **route dùng nó**. Còn các bài 409 chạy đơn luồng thì cho kết quả y hệt dù có khoá
+    hay không — đơn luồng không có race để khoá ngăn. Nên mutant "xoá dòng gọi khoá khỏi route"
+    sống sót toàn bộ file.
+
+    Spy thay vì dựng lại race: rẻ, đơn luồng, và bắt đúng thứ cần bắt. Ghi lại `tenant_id` chứ
+    không chỉ đếm số lần gọi — gọi đúng hàm với **sai** tenant thì khoá cũng vô dụng.
+
+    Ghim luôn THỨ TỰ: `calls` phải rỗng ở lượt đếm đầu tiên, nghĩa là khoá đứng trước. Khoá sau khi
+    đếm là đúng cú pháp và vô nghĩa về ngữ nghĩa — đó chính là hình dạng của bug gốc."""
+    system_tenant_id = await _seed_superadmin(admin_pool, "spy")
+    company_id = await _seed_tenant(admin_pool, "ankor-spy-lock")
+    await _seed_user(admin_pool, company_id, "boss@ankor-spy.test", ["admin"])
+    victim_id = await _seed_user(admin_pool, company_id, "nv@ankor-spy.test", ["hr"])
+
+    calls: list[str] = []
+    real_lock = admin_module._lock_tenant_admins
+
+    async def spy(conn: Any, tenant_id: Any) -> None:
+        calls.append(str(tenant_id))
+        await real_lock(conn, tenant_id)
+
+    monkeypatch.setattr(admin_module, "_lock_tenant_admins", spy)
+
+    counted_before_lock: list[bool] = []
+
+    token = _set_session(tenant_id=system_tenant_id, user=f"spy-{SUPERADMIN_EMAIL}", system_roles=["superadmin"])
+    try:
+        async with _simulate_request_connection():
+            conn = middleware.get_request_connection()
+            real_execute = conn.execute
+
+            async def probing_execute(query: Any, *args: Any, **kwargs: Any) -> Any:
+                # Lượt đếm admin là câu `SELECT count(*)` chạm `'admin' = ANY(system_roles)`.
+                if "count(*)" in str(query) and "ANY(system_roles)" in str(query):
+                    counted_before_lock.append(len(calls) == 0)
+                return await real_execute(query, *args, **kwargs)
+
+            monkeypatch.setattr(conn, "execute", probing_execute)
+            await deactivate_company_user(str(company_id), str(victim_id))
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert calls == [str(company_id)], f"route phải khoá đúng 1 lần, đúng tenant — thấy {calls}"
+    assert counted_before_lock == [False], (
+        "lượt đếm admin chạy TRƯỚC khi lấy khoá — khoá sau khi đếm là đúng cú pháp và vô nghĩa, "
+        "đúng hình dạng của bug gốc"
+    )
