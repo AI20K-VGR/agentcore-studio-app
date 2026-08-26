@@ -16,12 +16,13 @@ Nhóm 2 là nhóm dễ xanh giả nhất — cùng lớp lỗ đã phải vá 2 
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID, uuid4
 
+import psycopg
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
@@ -30,10 +31,12 @@ from studio_app import middleware, rate_limit
 from studio_app.authz import fetch_fresh_identity
 from studio_app.core._db import Pool, close_pools, get_pool
 from studio_app.jwt_auth import hash_password, verify_password
+from studio_app.routes import admin as admin_module
 from studio_app.routes.admin import (
     AddCompanyAdminRequest,
     ResetPasswordRequest,
     UpdateCompanyRequest,
+    _lock_tenant_admins,
     add_company_admin,
     deactivate_company_user,
     list_companies,
@@ -674,87 +677,114 @@ async def test_an_already_inactive_admin_does_not_count_as_the_last_one(admin_po
     assert exc_info.value.status_code == 409
 
 
-async def _deactivate_on_its_own_connection(
-    *, system_tenant_id: UUID, caller_email: str, company_id: UUID, user_id: UUID, barrier: asyncio.Barrier
-) -> object:
-    """Chạy `deactivate_company_user` trên MỘT connection riêng, mô phỏng một request độc lập.
+async def test_lock_tenant_admins_actually_serializes_two_sessions(admin_pool: Pool) -> None:
+    """Chốt "không để công ty còn 0 admin" là check-rồi-ghi, nên nó chỉ đúng nếu hai phiên **không
+    đếm đồng thời**. Bài này chứng minh `_lock_tenant_admins` làm được đúng việc đó.
 
-    `ContextVar` được sao chép theo từng `Task` trong asyncio, nên hai task đặt `_request_conn`/
-    `_request_session` riêng mà không giẫm lên nhau — đúng cách middleware làm thật.
+    Cách kiểm là **tất định**, không đua: phiên B đặt `lock_timeout` ngắn rồi cố lấy cùng tập khoá
+    mà phiên A đang giữ. Đúng thì B ném `LockNotAvailable`; sai (thiếu `FOR UPDATE`) thì B đi qua
+    và hai bên cùng đếm ra "vẫn còn người kia".
 
-    `barrier` để hai bên vào route gần như cùng lúc; không có nó, `gather` vẫn có thể chạy tuần tự
-    và bài test xanh giả."""
-    pool = await get_pool()
-    async with pool.connection() as conn:
-        conn_token = middleware._request_conn.set(conn)
-        session_token = _set_session(tenant_id=system_tenant_id, user=caller_email, system_roles=["superadmin"])
-        try:
-            # Mở transaction TRƯỚC hàng rào. `psycopg` mở lazily ở câu lệnh đầu tiên, nên nếu để
-            # bước đó rơi vào sau hàng rào thì một task có thể còn đang dựng transaction trong khi
-            # task kia đã đếm xong — hai bên không thật sự chồng nhau, và bài test dễ xanh giả.
-            # Đo được: mutant bỏ khoá chết 5/5 khi chạy riêng nhưng sống sót một lần trong lượt
-            # chạy cả file, đúng do chênh lệch thời điểm này.
-            await conn.execute("SELECT 1")
-            await barrier.wait()
-            return await deactivate_company_user(str(company_id), str(user_id))
-        except HTTPException as exc:
-            return exc
-        finally:
-            middleware._request_session.reset(session_token)  # type: ignore[arg-type]
-            middleware._request_conn.reset(conn_token)
+    Bản đầu của bài này dựng hai request thật chạy song song bằng `asyncio.Barrier` + `gather`. Nó
+    **xanh khi chạy riêng file và hỏng khi chạy chung** — ba lượt cho ba kết quả khác nhau, và có
+    lượt làm treo hẳn phiên pytest ở bước teardown (`close_pools()` chờ một connection không bao
+    giờ được trả về). Một bài test làm suite đứng im thì tệ hơn không có bài đó: CI không đỏ mà
+    treo tới hết giờ, và người gặp sẽ đi tìm lỗi hạ tầng chứ không nghĩ tới test.
+
+    Ở đây không có `gather`, không có barrier, không mượn pool singleton của ứng dụng — nên không
+    có gì để rò rỉ sang bài sau."""
+    company_id = await _seed_tenant(admin_pool, "ankor-lock-serialize")
+    await _seed_user(admin_pool, company_id, "a@ankor-lock.test", ["admin"])
+    await _seed_user(admin_pool, company_id, "b@ankor-lock.test", ["admin"])
+
+    async with admin_pool.connection() as conn_a, admin_pool.connection() as conn_b:
+        await conn_a.set_autocommit(False)
+        await conn_b.set_autocommit(False)
+
+        # Phiên A giữ khoá trên tập admin đang hoạt động của tenant.
+        await _lock_tenant_admins(conn_a, company_id)
+
+        # Phiên B cố lấy cùng tập đó. `lock_timeout` ngắn biến "chờ vô hạn" thành một lỗi đo được.
+        await conn_b.execute("SET LOCAL lock_timeout = '400ms'")
+        with pytest.raises(psycopg.errors.LockNotAvailable):
+            await _lock_tenant_admins(conn_b, company_id)
+
+        await conn_b.rollback()
+        await conn_a.rollback()
 
 
-async def test_two_concurrent_deactivations_cannot_empty_a_company_of_admins(admin_pool: Pool) -> None:
-    """Review app#77 (TranBaDat2607) — chốt "không để công ty còn 0 admin" là check-rồi-ghi.
+async def test_the_lock_does_not_block_a_DIFFERENT_company(admin_pool: Pool) -> None:
+    """Đối chứng bắt buộc. Thiếu bài này, một bản cài đặt khoá NGUYÊN BẢNG `core.users` vẫn xanh
+    bài trên — và nó sẽ biến mọi thao tác admin của mọi công ty thành hàng đợi một-làn."""
+    company_a = await _seed_tenant(admin_pool, "ankor-lock-scope-a")
+    company_b = await _seed_tenant(admin_pool, "borea-lock-scope-b")
+    await _seed_user(admin_pool, company_a, "a@ankor-scope.test", ["admin"])
+    await _seed_user(admin_pool, company_b, "b@borea-scope.test", ["admin"])
 
-    Công ty có admin A và B. Hai request đồng thời vô hiệu hoá A và B: mỗi bên đếm "admin khác
-    người mình đang tắt" và **đều** thấy người kia ⇒ cả hai đi qua. Hai `UPDATE` chạm hai dòng khác
-    nhau nên không đụng row-lock nào ⇒ cả hai commit ⇒ công ty còn 0 admin.
+    async with admin_pool.connection() as conn_a, admin_pool.connection() as conn_b:
+        await conn_a.set_autocommit(False)
+        await conn_b.set_autocommit(False)
 
-    `test_cannot_deactivate_the_LAST_active_admin_of_a_company` chạy MỘT luồng nên không chạm tới
-    được lớp lỗi này — đó là giới hạn của mọi bài đơn luồng, không phải sơ suất của bài đó. Bài này
-    dựng đúng hai request song song, mỗi request một connection riêng như thật.
+        await _lock_tenant_admins(conn_a, company_a)
+        await conn_b.execute("SET LOCAL lock_timeout = '400ms'")
+        # Công ty khác ⇒ tập dòng khác ⇒ không đụng nhau.
+        await _lock_tenant_admins(conn_b, company_b)
 
-    `wait_for` bọc ngoài: nếu khoá đặt sai thứ tự và hai bên deadlock, bài phải ĐỎ trong 20 giây
-    chứ không treo cả suite."""
-    system_tenant_id = await _seed_superadmin(admin_pool, "race")
-    company_id = await _seed_tenant(admin_pool, "ankor-race")
-    admin_a = await _seed_user(admin_pool, company_id, "a@ankor-race.test", ["admin"])
-    admin_b = await _seed_user(admin_pool, company_id, "b@ankor-race.test", ["admin"])
+        await conn_b.rollback()
+        await conn_a.rollback()
 
-    barrier = asyncio.Barrier(2)
-    caller = f"race-{SUPERADMIN_EMAIL}"
-    results = await asyncio.wait_for(
-        asyncio.gather(
-            _deactivate_on_its_own_connection(
-                system_tenant_id=system_tenant_id,
-                caller_email=caller,
-                company_id=company_id,
-                user_id=admin_a,
-                barrier=barrier,
-            ),
-            _deactivate_on_its_own_connection(
-                system_tenant_id=system_tenant_id,
-                caller_email=caller,
-                company_id=company_id,
-                user_id=admin_b,
-                barrier=barrier,
-            ),
-        ),
-        timeout=20,
+
+async def test_deactivate_route_actually_takes_the_lock_before_counting(
+    admin_pool: Pool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Route có THẬT SỰ gọi `_lock_tenant_admins` không — và gọi với đúng tenant, TRƯỚC khi đếm.
+
+    Khoảng trống này do chính tôi tạo ra khi bỏ bài race e2e (review app#82, TranBaDat2607): hai
+    bài khoá mới gọi thẳng `_lock_tenant_admins`, nên chúng chứng minh **cái khoá** đúng chứ không
+    chứng minh **route dùng nó**. Còn các bài 409 chạy đơn luồng thì cho kết quả y hệt dù có khoá
+    hay không — đơn luồng không có race để khoá ngăn. Nên mutant "xoá dòng gọi khoá khỏi route"
+    sống sót toàn bộ file.
+
+    Spy thay vì dựng lại race: rẻ, đơn luồng, và bắt đúng thứ cần bắt. Ghi lại `tenant_id` chứ
+    không chỉ đếm số lần gọi — gọi đúng hàm với **sai** tenant thì khoá cũng vô dụng.
+
+    Ghim luôn THỨ TỰ: `calls` phải rỗng ở lượt đếm đầu tiên, nghĩa là khoá đứng trước. Khoá sau khi
+    đếm là đúng cú pháp và vô nghĩa về ngữ nghĩa — đó chính là hình dạng của bug gốc."""
+    system_tenant_id = await _seed_superadmin(admin_pool, "spy")
+    company_id = await _seed_tenant(admin_pool, "ankor-spy-lock")
+    await _seed_user(admin_pool, company_id, "boss@ankor-spy.test", ["admin"])
+    victim_id = await _seed_user(admin_pool, company_id, "nv@ankor-spy.test", ["hr"])
+
+    calls: list[str] = []
+    real_lock = admin_module._lock_tenant_admins
+
+    async def spy(conn: Any, tenant_id: Any) -> None:
+        calls.append(str(tenant_id))
+        await real_lock(conn, tenant_id)
+
+    monkeypatch.setattr(admin_module, "_lock_tenant_admins", spy)
+
+    counted_before_lock: list[bool] = []
+
+    token = _set_session(tenant_id=system_tenant_id, user=f"spy-{SUPERADMIN_EMAIL}", system_roles=["superadmin"])
+    try:
+        async with _simulate_request_connection():
+            conn = middleware.get_request_connection()
+            real_execute = conn.execute
+
+            async def probing_execute(query: Any, *args: Any, **kwargs: Any) -> Any:
+                # Lượt đếm admin là câu `SELECT count(*)` chạm `'admin' = ANY(system_roles)`.
+                if "count(*)" in str(query) and "ANY(system_roles)" in str(query):
+                    counted_before_lock.append(len(calls) == 0)
+                return await real_execute(query, *args, **kwargs)
+
+            monkeypatch.setattr(conn, "execute", probing_execute)
+            await deactivate_company_user(str(company_id), str(victim_id))
+    finally:
+        middleware._request_session.reset(token)  # type: ignore[arg-type]
+
+    assert calls == [str(company_id)], f"route phải khoá đúng 1 lần, đúng tenant — thấy {calls}"
+    assert counted_before_lock == [False], (
+        "lượt đếm admin chạy TRƯỚC khi lấy khoá — khoá sau khi đếm là đúng cú pháp và vô nghĩa, "
+        "đúng hình dạng của bug gốc"
     )
-
-    async with admin_pool.connection() as conn:
-        cur = await conn.execute(
-            "SELECT count(*) FROM core.users WHERE tenant_id = %s AND is_active AND 'admin' = ANY(system_roles)",
-            (str(company_id),),
-        )
-        row = await cur.fetchone()
-    assert row is not None
-    assert row[0] >= 1, "hai request đồng thời đã vét sạch admin của công ty — chốt thua race"
-
-    # Và đúng MỘT bên bị từ chối: cả hai cùng qua là đã hỏng ở trên, cả hai cùng trượt thì chốt siết
-    # quá tay và công ty không tắt nổi admin nào.
-    refused = [r for r in results if isinstance(r, HTTPException)]
-    assert len(refused) == 1, f"phải đúng 1 request bị chặn, thấy {len(refused)}"
-    assert refused[0].status_code == 409
