@@ -78,9 +78,30 @@ def _calculate(params: dict[str, object]) -> dict[str, object]:
 
 
 def _current_datetime(params: dict[str, object], clock: Clock) -> dict[str, object]:
-    mode = params.get("mode")
+    # `mode` VẮNG ⇒ `"now"`, không phải lỗi.
+    #
+    # Catalog đưa cho model khai nó là TUỲ CHỌN (`{"mode"?: str, ...}`, `agent_protocol.py`), nên
+    # model có quyền không khai — và nó làm đúng thế. Bản trước raise, và người dùng nhận
+    # `ValueError: current_datetime: mode không hỗ trợ: None` ngay trên ô Phản hồi khi hỏi *"bây giờ
+    # là mấy giờ"*. Một tham số khai là tuỳ chọn mà bắt buộc trên thực tế là hợp đồng nói dối, và nó
+    # nói dối với một model không có cách nào kiểm chứng.
+    #
+    # Chỉ VẮNG mới rơi về mặc định; một `mode` khai SAI vẫn raise ở cuối hàm — nếu không, model gõ
+    # nhầm `"yesterday"` sẽ nhận giờ hiện tại như thể đó là câu trả lời đúng.
+    mode = params.get("mode", "now")
     if mode == "now":
-        return {"mode": "now", "date": clock().date().isoformat()}
+        now = clock()
+        # Trả cả GIỜ, không chỉ ngày: tool tên `current_datetime` mà chỉ đưa `date` thì câu *"bây
+        # giờ là mấy giờ"* không trả lời được — model nhận về một ngày rồi tự bịa giờ.
+        #
+        # `date` giữ nguyên bên cạnh: đó là field mọi consumer hiện có đang đọc, và bỏ nó là một
+        # thay đổi phá vỡ đổi lấy đúng một dòng ngắn hơn.
+        return {
+            "mode": "now",
+            "date": now.date().isoformat(),
+            "time": now.time().isoformat(timespec="seconds"),
+            "datetime": now.isoformat(),
+        }
     if mode == "days_between":
         raw_from = params.get("from_date")
         raw_to = params.get("to_date")
@@ -92,7 +113,10 @@ def _current_datetime(params: dict[str, object], clock: Clock) -> dict[str, obje
         except ValueError as exc:
             raise ValueError(f"current_datetime: from_date/to_date không phải ISO date: {exc}") from exc
         return {"mode": "days_between", "from": raw_from, "to": raw_to, "days": (to_d - from_d).days}
-    raise ValueError(f"current_datetime: mode không hỗ trợ: {mode!r}")
+    # Nêu ĐÚNG tập giá trị hợp lệ trong thông điệp lỗi. Một câu chỉ nói "không hỗ trợ" bắt người
+    # đọc đi tra mã nguồn để biết cái gì thì hỗ trợ — và người đọc ở đây thường là một model đang
+    # thử lại lượt sau.
+    raise ValueError(f"current_datetime: mode không hỗ trợ: {mode!r} (chỉ nhận 'now' hoặc 'days_between')")
 
 
 SUPPORTED_TOOLS: frozenset[str] = frozenset({"calculator", "current_datetime"})
@@ -102,6 +126,34 @@ SUPPORTED_TOOLS: frozenset[str] = frozenset({"calculator", "current_datetime"})
 raise giữa chừng DAG, review app#41). `kb_search` (kind `kb_retrieve`,
 `PROJECT-SCOPE-DEMO-DAY30.md` §1) cố ý KHÔNG có ở đây — nó có executor riêng (`KbRetrieveExecutor`,
 đã real), dùng node `kb-retrieve`, không phải node `tool-call`."""
+
+
+def _tools_of(params: dict[str, object]) -> list[str]:
+    """Mọi tool một node `tool-call` khai — đọc được CẢ HAI hình dạng.
+
+    Canvas gộp nhiều tool vào một node (`tools`, mảng) để agent vừa tính toán vừa xem giờ không phải
+    thả hai node. Nhưng recipe ĐÃ PUBLISH mang `tool` (một chuỗi) mãi mãi, nên bỏ vế cũ nghĩa là mọi
+    agent publish trước thay đổi này đi qua preflight mà không bị kiểm gì.
+
+    Mảng thắng khi cả hai cùng có: đó là ca chuyển tiếp (node vừa sửa mang `tools`, `tool` cũ chưa
+    bị dọn), và đọc `tool` trước sẽ bỏ lọt mọi lựa chọn mới.
+
+    Bản sao của `apps/web::toolsOf` — hai tầng khác nhau nên không dùng chung code được, nhưng luật
+    phải khớp: hai bên đọc lệch nhau nghĩa là preflight kiểm một tập tool khác tập agent thật sự
+    được cấp. Giá trị trả về chỉ dùng để KIỂM, không dùng để cấp quyền (`tool_whitelist` mới là
+    nguồn đó), nên lệch ở đây là bỏ lọt chứ không phải nới quyền — vẫn phải khớp."""
+    raw = params.get("tools")
+    candidates: list[object] = list(raw) if isinstance(raw, list) else [params.get("tool")]
+    tools: list[str] = []
+    for item in candidates:
+        # Không phải chuỗi / rỗng ⇒ node chưa cấu hình. Trả `str(None)` như bản cũ sẽ báo tool tên
+        # `"None"` không dispatch được, che mất nguyên nhân thật là "node chưa chọn gì".
+        if not isinstance(item, str):
+            continue
+        tool = item.strip()
+        if tool and tool not in tools:
+            tools.append(tool)
+    return tools
 
 
 def find_unsupported_tool_call(recipe: Recipe) -> str | None:
@@ -117,9 +169,9 @@ def find_unsupported_tool_call(recipe: Recipe) -> str | None:
     (`routes/chat.py`), cùng cách phân biệt `graph_lint()` đã dùng ở cả hai route đó."""
     for node in recipe.dag.nodes:
         if node.type == NodeType.TOOL_CALL:
-            tool = node.params.get("tool")
-            if tool not in SUPPORTED_TOOLS:
-                return str(tool)
+            for tool in _tools_of(node.params):
+                if tool not in SUPPORTED_TOOLS:
+                    return tool
     return None
 
 

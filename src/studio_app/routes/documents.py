@@ -71,6 +71,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
+from studio_evalhub.golden_store import delete_golden_set
 from studio_evalhub.scorecard_store import drop_pending_scorecards
 from studio_kb.chunk_window import cut_window
 from studio_kb.extract import SUPPORTED_SUFFIXES, UnsupportedFormatError, extract_text
@@ -78,7 +79,7 @@ from studio_kb.pipeline import KbPipeline
 
 from studio_app.authz import fetch_fresh_identity, fetch_tenant_section_names, require_admin
 from studio_app.core._db import get_pool
-from studio_app.core.golden_autogen import regenerate_for_section
+from studio_app.core.golden_autogen import auto_golden_set_ref, regenerate_for_section
 from studio_app.middleware import borrowed_tenant_scope, get_request_connection, get_request_session
 from studio_app.providers.factory import ReadOnlyEmbedding, build_embedding
 
@@ -181,6 +182,19 @@ class DeleteDocumentsRequest(BaseModel):
 class DeleteDocumentsResponse(BaseModel):
     deleted_chunks: int
     deleted_documents: list[str]
+    deleted_golden_sets: list[str] = []
+    """Phòng ban bị XOÁ HẲN bộ golden vì không còn tài liệu nào.
+
+    Tách khỏi `regenerated_sections`: hai chuyện khác nhau về chất. Sinh lại nghĩa là bộ vẫn còn,
+    chỉ mỏng đi; xoá hẳn nghĩa là phòng ban đó **không còn cách nào chấm điểm** cho tới khi nạp tài
+    liệu mới. Gộp chúng lại là giấu đúng phần người dùng cần biết."""
+
+    regenerated_sections: list[str] = []
+    """Phòng ban đã được sinh lại bộ golden sau lần xoá này.
+
+    Khai ra thay vì làm âm thầm: xoá một tài liệu có thể làm bộ chấm của cả phòng ban mỏng đi, và đó
+    là thứ người bấm xoá cần biết ngay — không phải phát hiện ra lúc bấm Chấm điểm."""
+
     not_found: list[str]
     """Id gửi lên mà xoá được 0 đoạn. Khai riêng thay vì im lặng bỏ qua: dòng ghi TRƯỚC khi cột
     `doc_id` tồn tại mang `NULL`, và `delete_by_doc_id` không đụng tới được (xem `schema.py` — chú
@@ -467,6 +481,20 @@ async def list_documents(tenant_id: str | None = None) -> DocumentListResponse:
     return DocumentListResponse(documents=documents, total_chunks=len(chunks))
 
 
+async def _section_roles_of_documents(pipeline: KbPipeline, tenant_id: UUID, doc_ids: list[str]) -> list[str]:
+    """Phòng ban của những tài liệu sắp xoá, không trùng, thứ tự tất định.
+
+    Đọc TRƯỚC khi xoá: sau đó không còn chunk nào để suy ra phòng ban, và sinh lại cho SAI phòng ban
+    là để nguyên đống case mồ côi ở phòng ban thật.
+
+    Suy từ `kb.chunks` chứ không từ tiền tố `doc_id` (`"{vai}-{slug}-{đuôi}"`): tên phòng ban có thể
+    chứa dấu gạch ngang, nên cắt chuỗi ở đây là đoán — còn `section_role` trên chunk là giá trị đã
+    được route upload validate qua `fetch_tenant_section_names`."""
+    wanted = set(doc_ids)
+    roles = {c.section_role for c in await pipeline.chunks_for_tenant(tenant_id) if c.doc_id in wanted}
+    return sorted(roles)
+
+
 @router.post("/delete", response_model=DeleteDocumentsResponse)
 async def delete_documents(body: DeleteDocumentsRequest, tenant_id: str | None = None) -> DeleteDocumentsResponse:
     """Xoá các tài liệu được tích chọn (theo `DocumentSummary.id`), không phải xoá cả tenant.
@@ -490,6 +518,8 @@ async def delete_documents(body: DeleteDocumentsRequest, tenant_id: str | None =
     deleted_chunks = 0
     deleted_documents: list[str] = []
     not_found: list[str] = []
+    # Phòng ban của tài liệu bị xoá — đọc TRƯỚC khi xoá, vì sau đó không còn chunk nào để suy ra.
+    affected_roles = await _section_roles_of_documents(pipeline, tenant_uuid, body.ids)
     # Lặp tuần tự, không gom một câu `IN (...)`: `delete_by_doc_id` là seam của `packages/kb` và nó
     # tự bind `app.tenant_id` cho từng giao dịch (RLS). Tự viết câu gộp ở đây là dựng lại đường ghi
     # thứ hai vào `kb.chunks` nằm ngoài seam đó — đúng thứ hàng rào quadrant tồn tại để chặn.
@@ -501,6 +531,59 @@ async def delete_documents(body: DeleteDocumentsRequest, tenant_id: str | None =
         else:
             not_found.append(doc_id)
 
+    # Xoá tài liệu ⇒ SINH LẠI bộ golden của những phòng ban bị ảnh hưởng, đúng như đường upload.
+    #
+    # Trước bản vá này hai đường bất đối xứng: upload thì `delete_by_doc_id` + `index` +
+    # `regenerate_for_section` + `drop_pending_scorecards`, còn xoá thì chỉ `delete_by_doc_id`. Hệ
+    # quả là case sinh từ tài liệu vừa xoá VẪN Ở LẠI, mang `expected_citation` trỏ vào những
+    # `chunk_id` không còn tồn tại — mỗi case như vậy chấm ra `citation_accuracy = 0` vĩnh viễn, và
+    # nhìn từ bảng điểm thì giống hệt "agent trích sai".
+    #
+    # Đo được trên một DB thật: **12/84 trích dẫn mồ côi** sau vài lần xoá tài liệu.
+    #
+    # Chỉ chạy khi thật sự xoá được gì: một lượt gọi toàn `not_found` không đổi kho, nên sinh lại là
+    # tốn một lượt đọc toàn tenant mà không đổi kết quả.
+    regenerated: list[str] = []
+    deleted_golden_sets: list[str] = []
+    if deleted_documents:
+        tenant_slug = await _tenant_slug(conn, tenant_uuid)
+        # Cùng khối `borrowed_tenant_scope` và cùng lý do như đường upload: `drop_pending_scorecards`
+        # dựa hẳn vào RLS để chọn tenant, nên đặt ngoài khối là superadmin xoá hộ công ty A lại huỷ
+        # điểm tạm của chính mình.
+        remaining = {c.section_role for c in await pipeline.chunks_for_tenant(tenant_uuid)}
+        async with borrowed_tenant_scope(conn, tenant_uuid):
+            for role in affected_roles:
+                if role not in remaining:
+                    # Phòng ban KHÔNG còn tài liệu nào ⇒ XOÁ HẲN bộ, không sinh lại.
+                    #
+                    # `regenerate_for_section` mang guard "rỗng thì không ghi": lượt sinh ra 0 case
+                    # thì nó GIỮ NGUYÊN bộ cũ. Guard đó đúng cho ca *sinh hụt* (một bộ 0 case đi
+                    # tiếp vào `EvalHarness.run()` cho `success_rate` trên mẫu số 0), nhưng sai cho
+                    # ca *không còn gì để chấm*: bộ cũ ở lại với `expected_citation` trỏ vào những
+                    # `chunk_id` đã biến mất, và cổng publish vẫn chấm bằng đúng bộ đó.
+                    #
+                    # Ghi đè bằng bộ RỖNG không thay được: một hàng 0 case vẫn đọc là "có bộ", khác
+                    # hẳn "chưa có bộ nào" — vốn là sự thật sau khi xoá tài liệu cuối.
+                    if await delete_golden_set(conn, auto_golden_set_ref(role), tenant_uuid):
+                        deleted_golden_sets.append(role)
+                    continue
+                await regenerate_for_section(
+                    conn,
+                    pipeline,
+                    tenant_id=tenant_uuid,
+                    tenant_slug=tenant_slug,
+                    section_role=role,
+                )
+                regenerated.append(role)
+            # Kho vừa đổi ⇒ mọi điểm Chấm-điểm-chưa-publish thôi nói về kho hiện tại. `recipe_hash`
+            # KHÔNG bắt được ca này (recipe giữ nguyên, chỉ nội dung kho đổi), nên phải huỷ tường
+            # minh — nếu không, `/publish` tái dùng một điểm đo trên corpus đã bị xoá bớt.
+            await drop_pending_scorecards(conn)
+
     return DeleteDocumentsResponse(
-        deleted_chunks=deleted_chunks, deleted_documents=deleted_documents, not_found=not_found
+        deleted_chunks=deleted_chunks,
+        deleted_documents=deleted_documents,
+        not_found=not_found,
+        regenerated_sections=regenerated,
+        deleted_golden_sets=deleted_golden_sets,
     )
