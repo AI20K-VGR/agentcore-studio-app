@@ -74,7 +74,7 @@ from pydantic import BaseModel
 from studio_evalhub.golden_store import delete_golden_set
 from studio_evalhub.scorecard_store import drop_pending_scorecards
 from studio_kb.chunk_window import cut_window
-from studio_kb.extract import SUPPORTED_SUFFIXES, UnsupportedFormatError, extract_text
+from studio_kb.extract import SUPPORTED_SUFFIXES, DocumentTooLongError, UnsupportedFormatError, extract_text
 from studio_kb.pipeline import KbPipeline
 
 from studio_app.authz import fetch_fresh_identity, fetch_tenant_section_names, require_admin
@@ -85,10 +85,18 @@ from studio_app.providers.factory import ReadOnlyEmbedding, build_embedding
 
 router = APIRouter(prefix="/api/admin/documents", tags=["documents"])
 
-# Chưa có tiền lệ giới hạn kích thước upload nào trong repo — 1 MiB là giá trị mặc định hợp lý cho
-# tài liệu văn bản thuần (`.md`/`.txt`/`.docx`), chỉnh sau nếu cần qua config thay vì hardcode nếu
-# nhu cầu thật.
-_MAX_UPLOAD_BYTES = 1 * 1024 * 1024
+# 10 MiB. Mức 1 MiB cũ chặn cả những tài liệu nội quy bình thường — một `.docx` có ảnh/bảng biểu
+# vượt 1 MiB mà lượng CHỮ vẫn nhỏ, và chữ mới là thứ hệ thống dùng.
+#
+# Nâng được mà không mở lỗ nuốt bộ nhớ là vì `_MAX_WORDS` giờ cưỡng chế NGAY TRONG lúc trích
+# (`extract_text(..., max_words=...)`), không phải sau. `.docx` là file ZIP nén, nên số byte không
+# chặn được lượng chữ: đo trên đúng hạn mức 1 MiB cũ, `.docx` nội dung lặp cho ~14.400.000 từ. Ở
+# 10 MiB con số đó là ~144 triệu từ ≈ ~1 GB chuỗi — và bản trước dựng trọn chuỗi đó trong RAM rồi
+# mới để route đếm.
+#
+# Thứ tự hai bản vá quan trọng: nâng byte TRƯỚC khi chặn được lúc trích là biến một giới hạn thành
+# một vector từ chối dịch vụ.
+_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 # Hạn mức thứ HAI, theo SỐ TỪ sau khi trích. Cần nó vì `_MAX_UPLOAD_BYTES` chỉ chặn được KHỐI
 # LƯỢNG CHỮ chừng nào byte còn tỉ lệ với chữ — đúng với `.md`/`.txt`, SAI với `.docx`: `.docx` là
@@ -101,8 +109,11 @@ _MAX_UPLOAD_BYTES = 1 * 1024 * 1024
 # chunk là ~234 lời gọi TUẦN TỰ nằm trong ĐÚNG MỘT HTTP request, rồi `KbPipeline.index` ghi cả
 # 21.000 dòng trong MỘT transaction. Nên chặn theo đúng đơn vị đó.
 #
-# 200.000 nằm TRÊN mức văn xuôi thật của một file 1 MiB (~168.000 từ) để không siết cửa nào đang
-# mở — `.md`/`.txt` hợp lệ hôm nay upload được thì sau bản vá vẫn upload được.
+# 200.000 GIỮ NGUYÊN khi hạn mức byte lên 10 MiB — và đó là chủ đích, không phải bỏ sót.
+#
+# Số byte không sinh ra chi phí; số CHUNK mới sinh ra. 200.000 từ ≈ 294 chunk (cửa sổ 850/overlap
+# 170) ≈ 4 lô embedding — vẫn nằm gọn trong một HTTP request. Nâng con số này mới là thứ phải đo lại
+# chi phí, còn nâng byte thì không.
 _MAX_WORDS = 200_000
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -297,21 +308,20 @@ async def upload_document(
             raise HTTPException(status_code=422, detail=f"file vượt quá giới hạn {_MAX_UPLOAD_BYTES} byte")
         pieces.append(piece)
     raw = b"".join(pieces)
+    # `max_words` truyền XUỐNG chứ không đếm ở đây sau khi trích xong.
+    #
+    # Với `.docx` thì `len(raw)` không nói gì về lượng chữ (file ZIP nén), nên tới lúc route đếm
+    # được thì chuỗi đã nằm trọn trong RAM — ở hạn mức 10 MiB, ca xấu nhất là ~144 triệu từ. Chặn
+    # phải xảy ra TRONG vòng lặp trích, và chỗ duy nhất làm được điều đó là `extract_text`.
     try:
-        text = extract_text(file.filename, raw)
-    except UnsupportedFormatError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    # Đếm SAU khi trích, không phải trên `raw`: với `.docx` thì `len(raw)` không nói gì về lượng
-    # chữ (xem `_MAX_WORDS`). `cut_window` split lại lần nữa ở dưới — thừa một lần `split()` trên
-    # tối đa 200k từ (~10ms), rẻ hơn nhiều so với đổi chữ ký `cut_window` ở packages/kb chỉ để
-    # chuyền sẵn list từ qua.
-    word_count = len(text.split())
-    if word_count > _MAX_WORDS:
+        text = extract_text(file.filename, raw, max_words=_MAX_WORDS)
+    except DocumentTooLongError as exc:
         raise HTTPException(
             status_code=422,
-            detail=f"tài liệu quá dài: {word_count} từ, tối đa {_MAX_WORDS}",
-        )
+            detail=f"tài liệu quá dài: vượt {_MAX_WORDS} từ",
+        ) from exc
+    except UnsupportedFormatError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # `chunk_id_prefix` — tiền tố `tenant_uuid.hex` bắt buộc: `chunk_id` (`{chunk_id_prefix}#c{n}`)
     # là PRIMARY KEY toàn bảng `kb.chunks`, KHÔNG tenant-scoped — 2 tenant cùng tên file sẽ
