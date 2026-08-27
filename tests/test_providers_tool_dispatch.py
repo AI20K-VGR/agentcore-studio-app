@@ -4,6 +4,7 @@ Real teeth: mỗi assertion khoá 1 giá trị cụ thể, không bare `pytest.r
 from __future__ import annotations
 
 from datetime import datetime
+from typing import cast
 
 import pytest
 from studio_app.providers.tool_dispatch import SUPPORTED_TOOLS, RealToolDispatch, find_unsupported_tool_call
@@ -114,9 +115,16 @@ async def test_calculator_deeply_nested_expression_raises_value_error_not_recurs
 
 
 async def test_current_datetime_mode_now_uses_injected_clock() -> None:
+    """Đồng hồ tiêm vào phải là nguồn DUY NHẤT của mọi field thời gian.
+
+    So từng field thay vì so nguyên dict: bài này đo *"đồng hồ nào được dùng"*, và một `assert
+    result == {...}` sẽ đỏ mỗi lần thêm một field mới dù đồng hồ vẫn đúng — biến một bài về nguồn
+    thời gian thành một bài về hình dạng dict."""
     dispatcher = _dispatch(["current_datetime"])
-    result = await dispatcher.dispatch("current_datetime", {"mode": "now"})
-    assert result == {"mode": "now", "date": "2026-08-22"}
+    result = cast("dict[str, str]", await dispatcher.dispatch("current_datetime", {"mode": "now"}))
+    assert result["mode"] == "now"
+    assert result["date"] == "2026-08-22"
+    assert result["datetime"].startswith("2026-08-22T12:00:00")
 
 
 async def test_current_datetime_mode_days_between() -> None:
@@ -193,4 +201,77 @@ def test_find_unsupported_tool_call_returns_none_when_recipe_has_no_tool_call_no
         ],
         edges=[Edge(from_="n1", to="n2"), Edge(from_="n2", to="n4")],
     )
+    assert find_unsupported_tool_call(recipe) is None
+
+
+async def test_current_datetime_without_a_mode_defaults_to_now() -> None:
+    """`mode` VẮNG ⇒ `"now"`, không phải lỗi.
+
+    Catalog đưa cho model khai `mode` là **tuỳ chọn**:
+
+        current_datetime  params: {"mode"?: str, "from_date"?: str, "to_date"?: str}
+
+    Nên model có quyền không khai — và nó làm đúng thế. Nhưng hàm lại raise, và người dùng nhận
+    `ValueError: current_datetime: mode không hỗ trợ: None` ngay trên ô Phản hồi. Đo được với câu
+    hỏi *"bây giờ là mấy giờ"*.
+
+    Một tham số khai là tuỳ chọn mà bắt buộc trên thực tế là hợp đồng nói dối — và nó nói dối với
+    một model không có cách nào kiểm chứng."""
+    dispatch = _dispatch(["current_datetime"])
+    result = cast("dict[str, str]", await dispatch.dispatch("current_datetime", {}))
+    assert result["mode"] == "now"
+
+
+async def test_current_datetime_now_reports_the_time_not_just_the_date() -> None:
+    """`mode="now"` phải trả cả GIỜ, không chỉ ngày.
+
+    Tool tên `current_datetime` mà chỉ đưa `date` thì câu *"bây giờ là mấy giờ"* không trả lời được
+    — model nhận về một ngày rồi tự bịa giờ, hoặc nói không biết.
+
+    `date` giữ nguyên bên cạnh `datetime`: đó là field mọi consumer hiện có đang đọc, và bỏ nó là
+    một thay đổi phá vỡ đổi lấy đúng một dòng ngắn hơn."""
+    dispatch = _dispatch(["current_datetime"])
+    result = cast("dict[str, str]", await dispatch.dispatch("current_datetime", {"mode": "now"}))
+    assert result["date"] == _FIXED_NOW.date().isoformat()
+    assert result["datetime"] == _FIXED_NOW.isoformat()
+    assert result["time"] == _FIXED_NOW.time().isoformat(timespec="seconds")
+
+
+async def test_current_datetime_still_rejects_a_mode_it_does_not_know() -> None:
+    """Đối trọng: `mode` khai SAI vẫn phải raise.
+
+    Thiếu vế này thì "vắng thì mặc định" dễ bị nới thành "cái gì cũng thành now", và một model gõ
+    nhầm `mode="yesterday"` sẽ nhận về giờ hiện tại như thể đó là câu trả lời đúng."""
+    dispatch = _dispatch(["current_datetime"])
+    with pytest.raises(ValueError, match="mode không hỗ trợ"):
+        await dispatch.dispatch("current_datetime", {"mode": "yesterday"})
+
+
+def test_preflight_reads_every_tool_on_a_multi_tool_node() -> None:
+    """Một node `tool-call` mang NHIỀU tool ⇒ preflight phải soi hết, không chỉ cái đầu.
+
+    Canvas gộp nhiều tool vào một node (`tools`, mảng) để agent vừa tính toán vừa xem giờ không phải
+    thả hai node. Preflight chỉ đọc `params["tool"]` sẽ **bỏ lọt** mọi tool từ thứ hai trở đi — và
+    một tool không dispatch được lọt qua đây sẽ raise giữa chừng DAG, đúng thứ hàm này tồn tại để
+    chặn (review app#41)."""
+    recipe = _recipe_with_tool_call("calculator", ["calculator", "current_datetime"])
+    recipe.dag.nodes[0].params["tools"] = ["calculator", "khong_ton_tai"]
+
+    assert find_unsupported_tool_call(recipe) == "khong_ton_tai"
+
+
+def test_preflight_still_reads_the_old_single_tool_shape() -> None:
+    """Recipe ĐÃ PUBLISH mang `tool` (một chuỗi) mãi mãi — preflight vẫn phải soi được.
+
+    Bỏ vế cũ nghĩa là mọi agent publish trước thay đổi này đi qua preflight mà không bị kiểm gì."""
+    recipe = _recipe_with_tool_call("khong_ton_tai", ["khong_ton_tai"])
+
+    assert find_unsupported_tool_call(recipe) == "khong_ton_tai"
+
+
+def test_preflight_passes_a_node_with_every_tool_supported() -> None:
+    """Đối trọng: node khai đủ hai tool hợp lệ thì KHÔNG bị chặn."""
+    recipe = _recipe_with_tool_call("calculator", ["calculator", "current_datetime"])
+    recipe.dag.nodes[0].params["tools"] = ["calculator", "current_datetime"]
+
     assert find_unsupported_tool_call(recipe) is None

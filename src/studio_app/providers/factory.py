@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 import importlib.util
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import assert_never
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 from studio_contracts.protocols import LLM, EmbeddingService
@@ -119,6 +120,10 @@ def build_embedding() -> EmbeddingService:
     return GatewayEmbedding(api_key=settings.openrouter_api_key)
 
 
+# Múi giờ của giá trị `current_datetime` trả về. Xem `build_tool_dispatch` vì sao là hằng số.
+_APP_TIMEZONE = ZoneInfo("Asia/Ho_Chi_Minh")
+
+
 def build_tool_dispatch(whitelist: list[str]) -> ToolDispatch:
     """Composition root thật cho `ToolDispatch` (engine#32) — thay
     `studio_engine.demo_stubs.WhitelistToolDispatch` (stub) tại 2 call site `interpreter.run()`
@@ -127,11 +132,18 @@ def build_tool_dispatch(whitelist: list[str]) -> ToolDispatch:
     docstring `RealToolDispatch` (`providers/tool_dispatch.py`) vì sao: 2 tool này tự thân đã là
     "bản thật", không gọi API ngoài để cần fake khi test/CI.
 
-    `clock=lambda: datetime.now(UTC)`: đường DUY NHẤT trong `apps/studio` được phép gọi
-    `datetime.now()` cho `current_datetime` — `RealToolDispatch`/`_current_datetime()` chỉ nhận nó
-    qua constructor-DI, không tự gọi bên trong (bắt buộc để CI/golden-set reproducible, `kit#67`
-    Z4/D03)."""
-    return RealToolDispatch(whitelist, clock=lambda: datetime.now(UTC))
+    `clock`: đường DUY NHẤT trong `apps/studio` được phép gọi `datetime.now()` cho
+    `current_datetime` — `RealToolDispatch`/`_current_datetime()` chỉ nhận nó qua constructor-DI,
+    không tự gọi bên trong (bắt buộc để CI/golden-set reproducible, `kit#67` Z4/D03).
+
+    Giờ **Việt Nam**, không phải UTC. Người dùng hỏi *"bây giờ là mấy giờ"* và nhận `04:19` trong
+    khi đồng hồ của họ chỉ `11:19` — lệch đúng 7 tiếng. Câu trả lời không sai về kỹ thuật (UTC là
+    một giờ có thật) nhưng sai với thứ duy nhất người hỏi muốn biết.
+
+    Hằng số, chưa phải setting: sản phẩm đang phục vụ công ty Việt Nam, và một field cấu hình chưa ai
+    đặt giá trị khác đi là một mặt phẳng phải bảo trì mà không mua thêm gì. Khi có tenant ở múi giờ
+    khác thì đây là chỗ nó chuyển thành `settings.timezone` — một dòng."""
+    return RealToolDispatch(whitelist, clock=lambda: datetime.now(_APP_TIMEZONE))
 
 
 class ReadOnlyEmbedding:

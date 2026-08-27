@@ -83,7 +83,7 @@ from studio_evalhub.golden_case import GoldenCase as RuntimeCase
 from studio_evalhub.golden_case import GoldenSet
 from studio_evalhub.golden_merge import case_key, merge_golden_sets
 from studio_evalhub.golden_store import GoldenSetNotFound, read_golden_set, write_golden_set
-from studio_kb.golden_from_kb import SourceChunk, build_cases, sample_report
+from studio_kb.golden_from_kb import SourceChunk, SourceDocument, build_cases, sample_report
 from studio_kb.golden_set_core import GoldenCase as AuthoringCase
 from studio_kb.pipeline import KbPipeline
 
@@ -213,9 +213,26 @@ async def regenerate_for_section(
     # tước mất khả năng ghép chéo vai của `build_cases`, và bộ ra có 0 case hàng rào.
     chunks = await pipeline.chunks_for_tenant(tenant_id)
     sources = tuple(
-        SourceChunk(chunk_id=c.chunk_id, text=c.text, tenant=tenant_slug, section_role=c.section_role) for c in chunks
+        SourceChunk(
+            chunk_id=c.chunk_id,
+            text=c.text,
+            tenant=tenant_slug,
+            section_role=c.section_role,
+            # `doc_id` là khoá ghép với `kb.document_texts`. Bỏ nó đi thì phép ghép im lặng trượt —
+            # tiền tố `chunk_id` mang tenant hex + hash, khác hẳn `doc_id`, nên mọi tài liệu rơi về
+            # nhánh soạn ở tầng chunk mà không lỗi nào nổi lên.
+            doc_id=c.doc_id,
+        )
+        for c in chunks
     )
-    sinh_ca_tenant = build_cases(sources)
+    # Toàn văn tài liệu — tầng ĐÚNG để soạn câu hỏi. `build_cases` soạn trên toàn văn khi có, và rơi
+    # về cửa sổ chunk cho những tài liệu chưa lưu (nạp trước khi hệ thống bắt đầu giữ lại toàn văn).
+    # Nhánh rơi-về không phải phòng hờ: mọi KB đang dùng đều đi đường đó cho tới lần nạp lại kế tiếp.
+    documents = tuple(
+        SourceDocument(doc_id=doc_id, text=text, tenant=tenant_slug, section_role=role)
+        for doc_id, role, text in await pipeline.document_texts_for_tenant(tenant_id)
+    )
+    sinh_ca_tenant = build_cases(sources, documents=documents)
     # Lọc SAU khi sinh. Mọi case — cả trả-lời lẫn bẫy — mang `section_roles=(vai_hỏi,)` đúng một
     # phần tử (`golden_from_kb`), nên phép lọc này phủ hết và không case nào thuộc hai bộ.
     # Case bẫy của phòng ban này là case HỎI dưới vai này mà đáp án nằm ở vai khác — đúng thứ bộ

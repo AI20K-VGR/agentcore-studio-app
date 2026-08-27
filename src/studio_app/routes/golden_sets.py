@@ -29,7 +29,13 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, ValidationError
 from studio_evalhub.golden_case import GoldenCase, GoldenSet
 from studio_evalhub.golden_merge import case_key
-from studio_evalhub.golden_store import GoldenSetNotFound, GoldenSetScopeError, read_golden_set, write_golden_set
+from studio_evalhub.golden_store import (
+    GoldenSetNotFound,
+    GoldenSetScopeError,
+    list_golden_sets,
+    read_golden_set,
+    write_golden_set,
+)
 from studio_kb.pipeline import KbPipeline
 
 from studio_app.authz import fetch_fresh_identity, fetch_tenant_section_names, require_admin
@@ -279,4 +285,127 @@ async def regenerate_golden_set(body: RegenerateRequest) -> RegenerateResponse:
         n_ai=report.n_ai,
         n_human=report.n_human,
         written=report.written,
+    )
+
+
+class GoldenSetSummaryResponse(BaseModel):
+    golden_set_ref: str
+    n_cases: int
+    n_ai: int
+    n_human: int
+    n_trap: int
+    created_at: str
+
+
+class GoldenCaseView(BaseModel):
+    """Một case như người dùng NHÌN, không phải như bộ chấm đọc.
+
+    Khác `GoldenCase` ở hai chỗ, và cả hai là cố ý:
+
+    - `expected_citation` rút thành `n_citation` + `citations`: danh sách `chunk_id` đầy đủ có thể
+      dài vài chục dòng cho một case, và người đang xem *bộ này hỏi những gì* cần con số trước, chi
+      tiết sau.
+    - thêm `is_trap` — suy tại đây từ `expected_citation` rỗng, cùng đường suy với `list_golden_sets`
+      và `GoldenCase.is_refusal`. Đưa vào payload vì đó là thứ người đọc cần phân biệt ngay: một
+      case bẫy KỲ VỌNG agent từ chối, nên "trả lời sai" ở đó lại là đúng.
+    """
+
+    case_id: str
+    query: str
+    expected: str
+    section_roles: list[str]
+    expected_section_role: str
+    source: str | None
+    is_trap: bool
+    n_citation: int
+    citations: list[str]
+
+
+class GoldenSetDetailResponse(BaseModel):
+    golden_set_ref: str
+    n_cases: int
+    cases: list[GoldenCaseView]
+
+
+@router.get("", response_model=list[GoldenSetSummaryResponse])
+async def list_golden_sets_route() -> list[GoldenSetSummaryResponse]:
+    """Danh sách bộ golden của tenant — màn hình mở đầu, chưa mang nội dung case nào.
+
+    Trước route này `eval.golden_sets` chỉ có đường GHI (`POST ""`, `POST /regenerate`) và đường
+    đọc-lúc-chấm; **không có đường nào để người dùng nhìn thấy bộ của họ**. Hệ quả không phải là
+    thiếu tiện nghi mà là mất khả năng chẩn đoán: bấm Chấm điểm ra `FAIL 0.35` thì không có cách
+    nào phân biệt *"agent trả lời kém"* với *"bộ câu hỏi tự sinh đang hỏi những thứ vô nghĩa"* —
+    hai kết luận dẫn tới hai việc phải làm hoàn toàn khác nhau.
+    """
+    session = get_request_session()
+    conn = get_request_connection()
+    identity = await fetch_fresh_identity(conn, session.user)
+    require_admin(identity.system_roles)
+
+    # Superadmin không có tenant riêng (JWT trỏ `__system__`) nên không có bộ nào để liệt kê ở đây.
+    # Trả 400 thay vì danh sách rỗng: rỗng đọc như "công ty này chưa có bộ nào", còn sự thật là câu
+    # hỏi không áp dụng cho vai đó — dùng `POST /regenerate` kèm `tenant_id` nếu cần đụng công ty cụ
+    # thể.
+    if "superadmin" in identity.system_roles:
+        raise HTTPException(
+            status_code=400,
+            detail="superadmin không thuộc công ty nào — đăng nhập bằng admin của công ty để xem bộ golden",
+        )
+
+    rows = await list_golden_sets(conn, UUID(str(identity.tenant_id)))
+    return [
+        GoldenSetSummaryResponse(
+            golden_set_ref=row.golden_set_ref,
+            n_cases=row.n_cases,
+            n_ai=row.n_ai,
+            n_human=row.n_human,
+            n_trap=row.n_trap,
+            created_at=row.created_at.isoformat(),
+        )
+        for row in rows
+    ]
+
+
+@router.get("/{golden_set_ref}", response_model=GoldenSetDetailResponse)
+async def read_golden_set_route(golden_set_ref: str) -> GoldenSetDetailResponse:
+    """Nội dung một bộ — câu hỏi, đáp án kỳ vọng, và case nào là bẫy.
+
+    Đây là chỗ trả lời câu *"vì sao điểm thấp"*. Bộ sinh máy đặt `query` từ chính văn bản chunk
+    (`ExtractiveQuestionWriter`) và `expected_citation` là **toàn bộ** chunk của lô đã sinh ra câu
+    đó — nên một agent lấy top-k vài chunk sẽ không bao giờ trích đủ, và `citation_accuracy` tụt
+    thấp mà không phải vì agent sai. Không nhìn được bộ thì không thấy được điều đó.
+    """
+    session = get_request_session()
+    conn = get_request_connection()
+    identity = await fetch_fresh_identity(conn, session.user)
+    require_admin(identity.system_roles)
+
+    if "superadmin" in identity.system_roles:
+        raise HTTPException(
+            status_code=400,
+            detail="superadmin không thuộc công ty nào — đăng nhập bằng admin của công ty để xem bộ golden",
+        )
+
+    try:
+        golden = await read_golden_set(conn, golden_set_ref, UUID(str(identity.tenant_id)))
+    except GoldenSetNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    return GoldenSetDetailResponse(
+        golden_set_ref=golden.golden_set_ref,
+        n_cases=len(golden.cases),
+        cases=[
+            GoldenCaseView(
+                case_id=case.case_id,
+                query=case.query,
+                expected=case.expected,
+                section_roles=list(case.section_roles),
+                expected_section_role=case.expected_section_role,
+                source=case.source,
+                is_trap=len(case.expected_citation) == 0,
+                n_citation=len(case.expected_citation),
+                citations=list(case.expected_citation),
+            )
+            for case in golden.cases
+        ],
     )

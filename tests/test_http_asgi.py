@@ -542,3 +542,28 @@ async def test_login_rate_limit_is_per_ip_not_global(monkeypatch: pytest.MonkeyP
     ) as bystander:
         ok_res = await bystander.post("/api/auth/login", json=body)
         assert ok_res.status_code == 401, "IP khác không liên quan không được ăn 429 lây"
+
+
+async def test_eval_jobs_route_is_mounted(client: AsyncClient, admin_pool: Pool) -> None:
+    """`GET /api/eval-jobs/{id}` KHÔNG kèm `Authorization` -> **401**, không phải 404.
+
+    Bài này khoá lại một lỗ đã xảy ra thật (app#91): `routes/publish.py` xuất HAI router, mà
+    `create_app()` chỉ lắp `router`, quên `jobs_router`. Hậu quả nhìn từ ngoài rất lệch với nguyên
+    nhân — `POST /evaluate-async` vẫn trả 202 kèm `job_id`, task nền vẫn chạy trọn 20/20 case và
+    vẫn ghi Scorecard đúng, chỉ có đường TRA trạng thái là không tồn tại. Giao diện bấm Chấm điểm
+    xong hiện ngay "Not Found", trông y như bộ golden bị thiếu.
+
+    Phân biệt 401/404 chính là phép đo: route CÓ lắp thì `tenant_context_middleware` chặn trước ở
+    401; route KHÔNG lắp thì FastAPI trả 404 mặc định. Không bài nào trong suite bắt được lỗ này vì
+    tất cả đều gọi thẳng hàm route hoặc test riêng `eval_job_store` — không cái nào đi qua bảng
+    route thật của `create_app()`.
+
+    `admin_pool` chỉ để chắc schema đã ensure trước khi request chạm middleware (cùng lý do các bài
+    401 ở trên); bài này không cần dữ liệu gì.
+    """
+    del admin_pool
+    res = await client.get("/api/eval-jobs/00000000-0000-0000-0000-000000000000")
+    assert res.status_code == 401, (
+        f"phải 401 (route có lắp, middleware chặn) — thấy {res.status_code}; "
+        "404 ở đây nghĩa là create_app() quên include_router(publish_routes.jobs_router)"
+    )
