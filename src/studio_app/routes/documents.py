@@ -353,6 +353,16 @@ async def upload_document(
     # tạm thời mất doc này, biết và chấp nhận cho phạm vi hiện tại.
     await pipeline.delete_by_doc_id(tenant_uuid, doc_id)
     await pipeline.index(chunks, embeddings)
+    # Giữ lại TOÀN VĂN — thứ `extract_text` vừa trích ra ở trên và `cut_window` vứt đi.
+    #
+    # `kb.chunks` là tầng TRUY XUẤT: cửa sổ 850 từ cắt theo số từ, nên mỗi chunk bắt đầu và kết thúc
+    # giữa câu. Bộ sinh golden đọc từng chunk như thể đó là một tài liệu và dựng câu hỏi từ mảnh vụn
+    # — đo được: tài liệu 179 từ (trọn 1 chunk) ra bộ 10 câu sạch, tài liệu 31 chunk × 835 từ ra
+    # "Xuất bản: Hà Nội & TP. Hồ Chí Minh là bao nhiêu năm?".
+    #
+    # Đặt SAU `index`: toàn văn chỉ có nghĩa khi chunk của nó đã nằm trong KB, vì `expected_citation`
+    # phải trỏ một `chunk_id` truy xuất được.
+    await pipeline.save_document_text(tenant_uuid, doc_id, section_role, text)
 
     # Golden set SINH RA Ở ĐÂY, không còn phải có sẵn. Sinh lại cho CẢ phòng ban (không chỉ tài
     # liệu vừa nạp) và giữ nguyên mọi case `source="human"` — xem `core/golden_autogen.py`.

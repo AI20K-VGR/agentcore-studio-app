@@ -54,13 +54,22 @@ async def _close_singleton_pools_after_test() -> AsyncIterator[None]:
     await close_pools()
 
 
+# Hình dạng Markdown THẬT — tiêu đề nêu chủ đề, thân bài mang đại lượng. Đây là thứ bộ soạn mặc
+# định (`TemplateQuestionWriter`) đọc được: nó CỐ Ý từ chối văn xuôi phẳng không tiêu đề, vì dựng câu
+# hỏi từ một đoạn văn chỉ ra được câu bắt agent chép lại nguyên văn tài liệu. Fixture cũ ở đây là
+# văn xuôi phẳng, nên sau khi đổi bộ soạn nó sinh ra 0 case — bài đỏ là ĐÚNG, và cách sửa là cho
+# fixture giống tài liệu thật chứ không phải nới bộ soạn.
 _DOC_HR = (
-    "Nhân viên chính thức được nghỉ phép 12 ngày mỗi năm. Đơn xin nghỉ phải nộp trước ba ngày "
-    "làm việc. Trưởng nhóm duyệt đơn dưới năm ngày; trên năm ngày cần giám đốc duyệt."
+    "## Nghỉ phép năm\n"
+    "Nhân viên chính thức được nghỉ phép 12 ngày mỗi năm.\n\n"
+    "## Thời hạn nộp đơn\n"
+    "Đơn xin nghỉ phải nộp trước 3 ngày làm việc.\n"
 ).encode()
 _DOC_FINANCE = (
-    "Phụ cấp ăn trưa là 40.000 đồng mỗi ngày công. Phụ cấp đi lại 500.000 đồng mỗi tháng, "
-    "trả cùng kỳ lương. Nhân viên làm thêm giờ được tính 150 phần trăm lương cơ bản."
+    "## Phụ cấp ăn trưa\n"
+    "Mức chi là 40.000 đồng mỗi ngày công.\n\n"
+    "## Phụ cấp đi lại\n"
+    "Công ty trả 500.000 đồng mỗi tháng, cùng kỳ lương.\n"
 ).encode()
 
 
@@ -307,3 +316,39 @@ async def test_generated_set_contains_fence_cases_when_tenant_has_two_sections(a
 
     # Chống rỗng-nghĩa: bộ phải có CẢ hai loại, không phải toàn bẫy.
     assert [c for c in moi if not c.expects_refusal], "bộ chỉ có bẫy thì cũng là bộ hỏng"
+
+
+# MỘT mục dài hơn một cửa sổ chunk (850 từ/overlap 170): tiêu đề ở đầu, con số ở cuối. Đo được:
+# cắt ra 2 chunk, chunk 1 có tiêu đề mà không có đáp án, chunk 2 ngược lại — KHÔNG chunk nào có cả
+# hai, kể cả sau overlap.
+#
+# Cỡ này không phải dựng cho vừa bài test: tài liệu nội quy thật đo được ~26.000 từ chia ~30 mục,
+# tức trung bình ~870 từ một mục — đúng ngay ngưỡng cửa sổ.
+_DOC_LONG = (
+    "## Nghỉ phép năm\n"
+    + " ".join(["Nội dung diễn giải chi tiết về chính sách nghỉ phép của công ty."] * 90)
+    + "\nNhân viên chính thức được nghỉ 12 ngày phép có lương.\n"
+).encode()
+
+
+async def test_a_long_document_generates_from_its_full_text_not_from_windows(admin_pool: Pool) -> None:
+    """**Bài trung tâm của tầng tài liệu.** Tài liệu dài hơn một cửa sổ chunk vẫn ra câu hỏi của mục
+    cuối — mục nằm sau ranh giới chunk.
+
+    `cut_window` cắt theo SỐ TỪ (850/overlap 170), không theo mục. Trước bản vá này bộ sinh đọc từng
+    chunk như thể đó là một tài liệu, nên nó dựng câu hỏi từ mảnh vụn: đo được trên hệ thật, tài
+    liệu 31 chunk × 835 từ cho ra *"Xuất bản: Hà Nội & TP. Hồ Chí Minh là bao nhiêu năm?"*.
+
+    Bài này khẳng định đường ghi (`save_document_text` lúc upload) và đường đọc
+    (`document_texts_for_tenant` lúc sinh) NỐI được với nhau — hai nửa đó ở hai repo khác nhau, và
+    mỗi nửa chạy đúng một mình vẫn không đảm bảo chúng gặp nhau."""
+    tenant_id = await _make_tenant(admin_pool, "autogen-long", "hr")
+    result = await _upload(tenant_id, "noi-quy-dai.md", _DOC_LONG, "hr")
+
+    assert result.chunk_count > 1, "fixture phải dài hơn một cửa sổ chunk thì bài mới đo được"
+
+    golden = await _read_set(admin_pool, tenant_id, result.golden_set_ref)
+    queries = [c.query for c in golden.cases]
+    assert any("Nghỉ phép năm" in q for q in queries), (
+        f"mục nằm sau ranh giới chunk không ra câu hỏi — bộ sinh vẫn đọc ở tầng chunk: {queries}"
+    )

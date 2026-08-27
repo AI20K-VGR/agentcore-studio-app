@@ -241,6 +241,12 @@ def create_app() -> FastAPI:
     app.include_router(agents_routes.router)
     app.include_router(runs_routes.router)
     app.include_router(publish_routes.router)
+    # `publish_routes` xuất HAI router, không phải một: `router` (`/api/agents/{id}/…`) và
+    # `jobs_router` (`/api/eval-jobs/{job_id}`, đường đọc tiến độ lượt chấm nền). Quên dòng dưới thì
+    # `POST /evaluate-async` vẫn trả 202 kèm `job_id` và task nền vẫn chạy trọn vẹn — chỉ có đường
+    # TRA trạng thái là không tồn tại, nên giao diện nhận 404 mặc định của FastAPI và hiện "Not
+    # Found" ngay khi vừa bấm Chấm điểm. Đã xảy ra thật một lần (app#91).
+    app.include_router(publish_routes.jobs_router)
     app.include_router(chat_routes.router)
     app.include_router(test_chat_routes.router)
     return app
